@@ -1,0 +1,15 @@
+{
+  "id": "trader",
+  "name": "Paw Trader",
+  "slug": "trader",
+  "description": "Autonomous agentic trading system - stocks and crypto",
+  "telegram_bot": "@YourTraderBot",
+  "theme": "claudepaw",
+  "agents": [
+    {
+      "id": "trader--orchestrator",
+      "template": "orchestrator",
+      "name": "Orchestrator"
+    }
+  ]
+}

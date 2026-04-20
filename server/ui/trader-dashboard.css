@@ -1,0 +1,47 @@
+/* =============================================================
+ * Extracted from ClaudePaw server/public/style.css
+ *
+ * Phase 1 code mirror of the Paw Trader dashboard styles.
+ * Phase 3 will inline these via the plugin dashboard-extension hook.
+ * ============================================================= */
+
+/* ========== PAW TRADER - COMMITTEE TRANSCRIPT (Phase 2 Task 8) ========== */
+.trader-decision-row { cursor: pointer; transition: background 120ms ease; }
+.trader-decision-row:hover { background: var(--surface-hover, rgba(255,255,255,0.04)); }
+.trader-decision-row--no-transcript { cursor: default; opacity: 0.6; }
+.trader-decision-row--no-transcript:hover { background: transparent; }
+
+.trader-transcript-box { display: flex; flex-direction: column; gap: 0; }
+.trader-transcript-section {
+  padding: 14px 0;
+  border-top: 1px solid var(--border-subtle, rgba(255,255,255,0.08));
+}
+.trader-transcript-section:first-of-type { border-top: none; padding-top: 0; }
+.trader-transcript-section-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+  opacity: 0.8;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+.trader-transcript-kv {
+  display: flex;
+  gap: 10px;
+  margin: 4px 0;
+  font-size: 0.9rem;
+}
+.trader-transcript-kv-label { flex: 0 0 140px; opacity: 0.65; }
+.trader-transcript-kv-value { flex: 1; word-break: break-word; }
+.trader-transcript-specialist {
+  padding: 8px 10px;
+  margin: 6px 0;
+  border-radius: 6px;
+  background: var(--surface-alt, rgba(255,255,255,0.04));
+  font-size: 0.9rem;
+}
+.trader-transcript-specialist-role {
+  font-weight: 600;
+  margin-bottom: 4px;
+  opacity: 0.85;
+}

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+
+# Local stores
+store/
+*.db
+*.db-wal
+*.db-shm
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test / tooling caches
+.vitest-cache/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Claude / workflow artifacts
+.claude/
+.superpowers/
+.worktrees/
+graphify-out/
+plans/
+specs/

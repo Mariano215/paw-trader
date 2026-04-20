@@ -651,8 +651,8 @@ describe('scheduler gate', () => {
   })
 
   it('writeLastFireMs + readLastFireMs roundtrip', () => {
-    writeLastFireMs(db, 1234567890)
-    expect(readLastFireMs(db)).toBe(1234567890)
+    writeLastFireMs(db, 3333333330)
+    expect(readLastFireMs(db)).toBe(3333333330)
   })
 
   it('maybeFireWeeklyReport is a no-op on Saturday (outside grace)', async () => {

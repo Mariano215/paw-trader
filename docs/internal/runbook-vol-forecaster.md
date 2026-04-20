@@ -74,7 +74,7 @@ Served by the trader engine at port 8200 (default). Requires `Authorization: Bea
 {
   "asset": "SPY",
   "annualized_vol": 0.187,
-  "as_of_ms": 1745123456789
+  "as_of_ms": 1745333333333
 }
 ```
 

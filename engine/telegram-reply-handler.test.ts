@@ -85,9 +85,9 @@ describe('telegram-reply-handler', () => {
 
   it('stores fromUserId on parsed reply', () => {
     insertPendingApproval(db)
-    const result = tryHandleApprovalReply(db, 'APPROVE', 987654321)
+    const result = tryHandleApprovalReply(db, 'APPROVE', 222222222)
     expect(result).not.toBeNull()
-    expect(result!.fromUserId).toBe(987654321)
+    expect(result!.fromUserId).toBe(222222222)
   })
 
   it('concurrent claim: only one caller wins when two fire simultaneously', () => {
@@ -120,13 +120,13 @@ describe('handleTraderButtonCallback', () => {
 
   it('claims approve action by approvalId', () => {
     insertApproval('ap-1')
-    const result = handleTraderButtonCallback(db, 'ap-1', 'approve', 531665124)
+    const result = handleTraderButtonCallback(db, 'ap-1', 'approve', 111111111)
     expect(result).not.toBeNull()
     expect(result!.action).toBe('approve')
     expect(result!.approvalId).toBe('ap-1')
     expect(result!.decisionId).toBe('sig-1')
     expect(result!.override_size).toBeUndefined()
-    expect(result!.fromUserId).toBe(531665124)
+    expect(result!.fromUserId).toBe(111111111)
   })
 
   it('claims skip action', () => {

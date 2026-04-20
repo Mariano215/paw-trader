@@ -56,7 +56,7 @@ describe('parseOperatorChatIds', () => {
 
 describe('maskChatId', () => {
   it('masks a typical Telegram chat id to last 4 chars', () => {
-    expect(maskChatId('531665124')).toBe('***5124')
+    expect(maskChatId('111111111')).toBe('***1111')
   })
 
   it('returns short ids unchanged to avoid revealing more than the real id', () => {
@@ -66,7 +66,7 @@ describe('maskChatId', () => {
   })
 
   it('masks negative group chat ids (Telegram groups use negative ids)', () => {
-    expect(maskChatId('-100123456789')).toBe('***6789')
+    expect(maskChatId('-100333333333')).toBe('***3333')
   })
 })
 
@@ -200,15 +200,15 @@ describe('makeOperatorSend', () => {
 
   it('single-operator broadcast behaves identically to the legacy single-id send', async () => {
     const { send, sendWithKeyboard } = makeOperatorSend(channelManager, 'telegram:trader', [
-      '531665124',
+      '111111111',
     ])
     await send('halt alert')
     await sendWithKeyboard('approval card', keyboard)
 
-    expect(sendMock).toHaveBeenCalledWith('telegram:trader', '531665124', 'halt alert')
+    expect(sendMock).toHaveBeenCalledWith('telegram:trader', '111111111', 'halt alert')
     expect(sendWithKeyboardMock).toHaveBeenCalledWith(
       'telegram:trader',
-      '531665124',
+      '111111111',
       'approval card',
       keyboard,
     )

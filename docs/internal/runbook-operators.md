@@ -49,7 +49,7 @@ Pick whichever surface is handier. Both require a bot restart to pick up.
    grep "Trader scheduler wired" /tmp/claudepaw-*.log | tail -1
    ```
 
-   Expect `operatorCount: 3, maskedIds: ["***5124","***4321","***6789"]`
+   Expect `operatorCount: 3, maskedIds: ["***1111","***4321","***3333"]`
    and `source: "OPERATOR_CHAT_IDS"`.
 
 ### Option B -- credential edit
@@ -114,7 +114,7 @@ Consequences worth naming:
 ## Log masking convention
 
 Chat ids are masked to the last four characters in logs, prefixed with
-`***`. Example: `531665124` becomes `***5124`. Short ids (four or fewer
+`***`. Example: `111111111` becomes `***1111`. Short ids (four or fewer
 chars) are logged unchanged because masking them would still reveal the
 whole id. Use the masked forms when grepping live logs; only the bot
 owner with DB access can map them back to real ids.

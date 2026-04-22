@@ -11,6 +11,7 @@ import type {
   NavSnapshot,
   NavPeriod,
   PricePoint,
+  SignalTelemetrySummary,
 } from "./types.js";
 import { getCredential } from "../credentials.js";
 
@@ -250,6 +251,23 @@ export class EngineClient {
       );
     }
     return (await resp.json()) as PricePoint[];
+  }
+
+  /**
+   * Phase 8C -- fetch pre-aggregated signal telemetry for the Analyst Paw.
+   * Calls GET /signals/telemetry?days=N on the engine and returns the
+   * summary JSON: regime distribution, per-strategy fire/suppress stats,
+   * and consecutive near-miss sequences.
+   *
+   * Returns null when the engine is unreachable or returns 404 (older
+   * engine builds that predate the telemetry route).  The collector
+   * treats null as a non-fatal collection error so the paw cycle still
+   * runs and the LLM can flag the data gap in its report.
+   */
+  async getSignalTelemetry(days = 7): Promise<SignalTelemetrySummary | null> {
+    return this.requestNullable<SignalTelemetrySummary>(
+      `/signals/telemetry?days=${days}`,
+    )
   }
 }
 

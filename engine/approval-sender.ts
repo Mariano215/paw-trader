@@ -1,5 +1,7 @@
 import type Database from 'better-sqlite3'
 import { buildApprovalCard, buildApprovalKeyboard, createPendingApproval, DEFAULT_SIZE_USD, type TraderApprovalKeyboard } from './approval-manager.js'
+import { TRADER_BLIND_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { shouldSuppressSignalRealert } from './suppression-state.js'
 import { logger } from '../logger.js'
 
 // Trade count target for the promo ladder banner. Mirrors the autonomy
@@ -7,6 +9,11 @@ import { logger } from '../logger.js'
 // banner countdown matches the moment cold-start scaling lifts.
 // Paired cap constant DEFAULT_SIZE_USD lives in approval-manager.ts.
 const TIER1_TRADE_COUNT_TARGET = 30
+
+function isBlindLowConvictionSignal(signal: PendingSignalRow): boolean {
+  return !signal.enrichment_json &&
+    Math.abs(signal.raw_score) < TRADER_BLIND_SIGNAL_SCORE_THRESHOLD
+}
 
 export interface SendPendingApprovalsDeps {
   /** Called once per pending signal with the card text and inline keyboard. */
@@ -83,6 +90,36 @@ export async function sendPendingApprovals(
     }
     if (strategy.status === 'paused') {
       logger.info({ signalId: signal.id, strategyId: strategy.id }, 'Skipping signal: strategy paused')
+      continue
+    }
+
+    if (shouldSuppressSignalRealert(db, {
+      strategy_id: signal.strategy_id,
+      asset: signal.asset,
+      side: signal.side,
+      raw_score: signal.raw_score,
+      enrichment_json: signal.enrichment_json,
+    })) {
+      logger.info(
+        { signalId: signal.id, strategyId: signal.strategy_id, asset: signal.asset, side: signal.side },
+        'Skipping signal: no material change since recent suppression',
+      )
+      db.prepare("UPDATE trader_signals SET status = 'suppressed_no_material_change' WHERE id = ?").run(signal.id)
+      continue
+    }
+
+    if (isBlindLowConvictionSignal(signal)) {
+      logger.info(
+        {
+          signalId: signal.id,
+          strategyId: signal.strategy_id,
+          asset: signal.asset,
+          rawScore: signal.raw_score,
+          blindThreshold: TRADER_BLIND_SIGNAL_SCORE_THRESHOLD,
+        },
+        'Suppressing blind low-conviction signal before operator alert',
+      )
+      db.prepare("UPDATE trader_signals SET status = 'suppressed_blind_low_score' WHERE id = ?").run(signal.id)
       continue
     }
 

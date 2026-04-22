@@ -16,6 +16,7 @@ import { checkKillSwitch } from '../cost/kill-switch-client.js'
 import { BOT_API_TOKEN, DASHBOARD_API_TOKEN, DASHBOARD_URL } from '../config.js'
 import { logger } from '../logger.js'
 import type { KillSwitchLogEntry } from './weekly-report.js'
+import { syncTraderTablesToServer } from './server-sync.js'
 
 /**
  * Interval between trader ticks. 5 minutes is the sweet spot:
@@ -61,6 +62,16 @@ let _haltAlertSent = false
  * any phase still releases it for the next tick.
  */
 let _tickInProgress = false
+
+/**
+ * Consecutive health-check failure counter. Reset to zero on any successful
+ * health response. When it reaches ENGINE_UNREACHABLE_THRESHOLD the operator
+ * gets a single Telegram alert; _engineUnreachableAlertSent gates further
+ * sends so only one alert fires per outage event.
+ */
+let _healthCheckConsecutiveFailures = 0
+let _engineUnreachableAlertSent = false
+const ENGINE_UNREACHABLE_THRESHOLD = 3  // 3 × 5-min ticks = 15 min before alerting
 
 /**
  * Start the trader tick. Each tick:
@@ -158,6 +169,15 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   try {
     const client = deps.getEngineClient()
     const health = await client.getHealth()
+    // Engine reachable -- reset unreachable counter and send recovery notice if needed.
+    if (_healthCheckConsecutiveFailures > 0) {
+      logger.info({ was: _healthCheckConsecutiveFailures }, 'Trader engine reachable again')
+    }
+    _healthCheckConsecutiveFailures = 0
+    if (_engineUnreachableAlertSent) {
+      _engineUnreachableAlertSent = false
+      await deps.send('TRADER: Engine back online. Signal polling resumed.')
+    }
     if (health && health.reconciler_halted === true) {
       reconcilerHalted = true
       if (!_haltAlertSent) {
@@ -174,7 +194,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       }
     }
   } catch (err) {
-    logger.warn({ err }, 'Trader tick: health check failed')
+    _healthCheckConsecutiveFailures++
+    logger.warn({ err, consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader tick: health check failed')
+    if (_healthCheckConsecutiveFailures >= ENGINE_UNREACHABLE_THRESHOLD && !_engineUnreachableAlertSent) {
+      _engineUnreachableAlertSent = true
+      logger.error({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: sending alert')
+      await deps.send(`TRADER ALERT: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} minutes. Win11 may be offline or Tailscale disconnected. Signal generation is stopped.`)
+    }
   }
 
   // 1. Poll engine for fresh signals.
@@ -285,6 +311,12 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //    nav_drop_alert) get a recordAlertFired call here; sharpe-flip
   //    self-records its own +1/-1 sign every tick inside the check.
   await runMonitorPhase(deps)
+
+  // 7. Push a snapshot of all trader tables to the dashboard server so
+  //    the Signal Queue and other cards always show current data. This runs
+  //    after every phase so the server sees the latest state. Fire-and-forget
+  //    -- a sync failure never stalls the tick or surfaces to the operator.
+  void syncTraderTablesToServer(deps.db)
 
   return { polled, sent, timedOut, reconcilerHalted, closedOut, weeklyReportFired }
   } finally {

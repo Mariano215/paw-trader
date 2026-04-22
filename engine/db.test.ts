@@ -93,4 +93,70 @@ describe("trader DB tables", () => {
     const alertIdCol = cols.find(c => c.name === 'alert_id')
     expect(alertIdCol.pk).toBe(1)
   })
+
+  // trader_approvals FK must point at trader_signals(id), NOT
+  // trader_decisions(id). The column is historically named decision_id
+  // but stores a signal id (approval cards are raised BEFORE the
+  // committee produces a decision, so no trader_decisions row exists
+  // when createPendingApproval runs). Trader unit tests disable FK
+  // enforcement, so a wrong FK would pass every test and still fail
+  // every production insert because src/db.ts enables FKs globally.
+  it('trader_approvals.decision_id references trader_signals, not trader_decisions', () => {
+    const db = new Database(':memory:')
+    initTraderTables(db)
+    const fks = db.prepare('PRAGMA foreign_key_list(trader_approvals)').all() as any[]
+    const decisionFk = fks.find(r => r.from === 'decision_id')
+    expect(decisionFk).toBeDefined()
+    expect(decisionFk.table).toBe('trader_signals')
+    expect(decisionFk.to).toBe('id')
+  })
+
+  it('migrates a legacy trader_approvals FK from trader_decisions to trader_signals', () => {
+    const db = new Database(':memory:')
+    // Simulate the pre-fix schema by hand: create the dependency tables,
+    // then the legacy trader_approvals with the wrong FK, and seed a
+    // realistic row (FKs OFF so the seed itself is not rejected).
+    db.pragma('foreign_keys = OFF')
+    db.exec(`
+      CREATE TABLE trader_strategies (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, asset_class TEXT NOT NULL,
+        tier INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+        params_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE trader_signals (
+        id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL REFERENCES trader_strategies(id),
+        asset TEXT NOT NULL, side TEXT NOT NULL, raw_score REAL NOT NULL,
+        horizon_days INTEGER NOT NULL, enrichment_json TEXT,
+        generated_at INTEGER NOT NULL, status TEXT NOT NULL
+      );
+      CREATE TABLE trader_decisions (
+        id TEXT PRIMARY KEY, signal_id TEXT NOT NULL REFERENCES trader_signals(id),
+        action TEXT NOT NULL, asset TEXT NOT NULL, size_usd REAL,
+        entry_type TEXT, entry_price REAL, stop_loss REAL, take_profit REAL,
+        thesis TEXT NOT NULL, confidence REAL NOT NULL,
+        committee_transcript_id TEXT, decided_at INTEGER NOT NULL, status TEXT NOT NULL
+      );
+      -- Legacy wrong FK: points at trader_decisions(id).
+      CREATE TABLE trader_approvals (
+        id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL REFERENCES trader_decisions(id),
+        sent_at INTEGER NOT NULL, responded_at INTEGER, response TEXT,
+        override_size REAL
+      );
+      INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES ('apx-1', 'sig-1', 1776000000000);
+    `)
+
+    // initTraderTables runs the migration. It should swap the FK without
+    // losing the seeded row.
+    initTraderTables(db)
+
+    const fks = db.prepare('PRAGMA foreign_key_list(trader_approvals)').all() as any[]
+    const decisionFk = fks.find(r => r.from === 'decision_id')
+    expect(decisionFk.table).toBe('trader_signals')
+
+    const row = db.prepare('SELECT id, decision_id, sent_at FROM trader_approvals WHERE id=?').get('apx-1') as any
+    expect(row).toBeTruthy()
+    expect(row.decision_id).toBe('sig-1')
+    expect(row.sent_at).toBe(1776000000000)
+  })
 });

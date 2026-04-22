@@ -15,6 +15,10 @@ function makeDb() {
 
 function insertPendingApproval(db: Database.Database): string {
   const id = 'ap-test-1'
+  db.prepare(`
+    INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+    VALUES ('sig-1', 'momentum-stocks', 'AAPL', 'buy', 0.72, 20, ?, 'pending')
+  `).run(Date.now())
   db.prepare('INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES (?, ?, ?)').run(id, 'sig-1', Date.now())
   return id
 }
@@ -35,6 +39,11 @@ describe('telegram-reply-handler', () => {
     insertPendingApproval(db)
     const result = tryHandleApprovalReply(db, 'SKIP')
     expect(result!.action).toBe('skip')
+    const row = db.prepare(`
+      SELECT reason FROM trader_signal_suppressions
+      WHERE strategy_id = 'momentum-stocks' AND asset = 'AAPL' AND side = 'buy'
+    `).get() as any
+    expect(row.reason).toBe('skip')
   })
 
   it('parses APPROVE BIGGER 250', () => {
@@ -130,9 +139,15 @@ describe('handleTraderButtonCallback', () => {
   })
 
   it('claims skip action', () => {
-    insertApproval('ap-1')
+    insertPendingApproval(db)
+    db.prepare("UPDATE trader_approvals SET id='ap-1' WHERE id='ap-test-1'").run()
     const result = handleTraderButtonCallback(db, 'ap-1', 'skip')
     expect(result!.action).toBe('skip')
+    const row = db.prepare(`
+      SELECT reason FROM trader_signal_suppressions
+      WHERE strategy_id = 'momentum-stocks' AND asset = 'AAPL' AND side = 'buy'
+    `).get() as any
+    expect(row.reason).toBe('skip')
   })
 
   it('claims pause action', () => {

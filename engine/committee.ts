@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url'
 import type Database from 'better-sqlite3'
 import { logger } from '../logger.js'
 import type { AgentResult } from '../agent.js'
+import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
 
 // Dynamically import runAgent lazily so tests can mock it without forcing
 // a full agent subsystem boot.
@@ -171,11 +172,18 @@ export function parseAgentJson<T>(raw: string | null | undefined): T | null {
 
 export function buildSignalContext(signal: CommitteeSignalInput): string {
   const enrichment = signal.enrichment_json ?? '(none)'
+  const absRawScore = Math.abs(signal.raw_score)
+  const scoreMultiple = TRADER_SIGNAL_SCORE_THRESHOLD > 0
+    ? absRawScore / TRADER_SIGNAL_SCORE_THRESHOLD
+    : 0
   return [
     `SIGNAL CANDIDATE:`,
     `asset: ${signal.asset}`,
     `side: ${signal.side}`,
     `raw_score: ${signal.raw_score}`,
+    `abs_raw_score: ${absRawScore}`,
+    `score_threshold: ${TRADER_SIGNAL_SCORE_THRESHOLD}`,
+    `score_multiple_of_threshold: ${scoreMultiple.toFixed(2)}`,
     `horizon_days: ${signal.horizon_days}`,
     `enrichment: ${enrichment}`,
   ].join('\n')

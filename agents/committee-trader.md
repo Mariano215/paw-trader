@@ -20,6 +20,9 @@ Rules:
   when confidence is borderline, 0 for abstain, up to 2.0 only when
   confidence is very high and specialists agree strongly. The engine caps
   the absolute dollar amount separately.
+- The signal context includes score_threshold and score_multiple_of_threshold.
+  If you describe the raw score as weak, tie that claim to the calibration in
+  the context instead of treating any small positive number as noise.
 - thesis is what shows up on the decision record and the dashboard. Make
   it readable: name the strongest argument and the biggest remaining risk.
 - If specialists disagree sharply, prefer abstain with size_multiplier=0

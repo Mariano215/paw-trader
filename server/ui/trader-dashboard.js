@@ -137,6 +137,14 @@ function ensureTraderPageDOM() {
   riskCard.textContent = 'Loading risk state...';
   page.appendChild(riskCard);
 
+  // Signal queue card -- pending + recent signal history
+  var signalQueueCard = document.createElement('div');
+  signalQueueCard.id = 'trader-signal-queue';
+  signalQueueCard.className = 'stat-card';
+  signalQueueCard.style.cssText = 'padding:18px;margin-top:12px;';
+  signalQueueCard.textContent = 'Loading signal queue...';
+  page.appendChild(signalQueueCard);
+
   // Recent decisions card (Phase 2 Task 8)
   var decisionsCard = document.createElement('div');
   decisionsCard.id = 'trader-decisions';
@@ -191,6 +199,7 @@ function initTraderPage() {
   refreshTraderStatus();
   refreshTraderPositions();
   refreshTraderRisk();
+  refreshTraderSignalQueue();
   refreshTraderDecisions();
   refreshTraderCommitteeReport();
   refreshTraderTrackRecords();
@@ -200,6 +209,7 @@ function initTraderPage() {
     addPollingInterval(refreshTraderStatus, 15000);
     addPollingInterval(refreshTraderPositions, 15000);
     addPollingInterval(refreshTraderRisk, 15000);
+    addPollingInterval(refreshTraderSignalQueue, 15000);
     addPollingInterval(refreshTraderDecisions, 30000);
     addPollingInterval(refreshTraderCommitteeReport, 60000);
     addPollingInterval(refreshTraderTrackRecords, 60000);
@@ -1132,6 +1142,137 @@ function renderTraderTrackRecords(records, container) {
 // ---------------------------------------------------------------------------
 // Phase 2 Task 8 -- Recent decisions card + committee transcript modal
 // ---------------------------------------------------------------------------
+
+async function refreshTraderSignalQueue() {
+  var container = document.getElementById('trader-signal-queue');
+  if (!container) return;
+  try {
+    var data = await fetchFromAPI('/api/v1/trader/signals?limit=50');
+    if (data === null) return;
+    renderTraderSignalQueue(data.pending || [], data.history || [], container);
+  } catch (e) {
+    container.textContent = 'Signal queue unavailable: ' + String(e);
+  }
+}
+
+function renderTraderSignalQueue(pending, history, container) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+
+  var heading = document.createElement('div');
+  heading.style.cssText = 'font-weight:600;margin-bottom:10px;';
+  heading.textContent = 'Signal Queue';
+  container.appendChild(heading);
+
+  // --- Pending section ---
+  if (pending.length > 0) {
+    var pendingLabel = document.createElement('div');
+    pendingLabel.style.cssText = 'font-size:0.82rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;opacity:0.7;margin-bottom:6px;color:var(--accent,#4caf50);';
+    pendingLabel.textContent = 'Awaiting Response (' + pending.length + ')';
+    container.appendChild(pendingLabel);
+
+    pending.forEach(function(s) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:6px;margin-bottom:6px;background:rgba(var(--accent-rgb,76,175,80),0.08);border:1px solid rgba(var(--accent-rgb,76,175,80),0.25);';
+
+      var badge = document.createElement('span');
+      badge.style.cssText = 'font-size:0.75rem;font-weight:700;padding:2px 7px;border-radius:10px;background:var(--accent,#4caf50);color:#fff;flex-shrink:0;';
+      badge.textContent = 'PENDING';
+      row.appendChild(badge);
+
+      var side = document.createElement('span');
+      side.style.cssText = 'font-weight:600;font-size:0.9rem;min-width:32px;' + (s.side === 'buy' ? 'color:#4caf50;' : 'color:#f44336;');
+      side.textContent = (s.side || '').toUpperCase();
+      row.appendChild(side);
+
+      var asset = document.createElement('span');
+      asset.style.cssText = 'font-weight:500;font-size:0.9rem;';
+      asset.textContent = s.asset || '-';
+      row.appendChild(asset);
+
+      var conf = document.createElement('span');
+      conf.style.cssText = 'opacity:0.7;font-size:0.85rem;';
+      conf.textContent = 'conf ' + Number(s.raw_score).toFixed(2);
+      row.appendChild(conf);
+
+      var when = document.createElement('span');
+      when.style.cssText = 'margin-left:auto;opacity:0.5;font-size:0.8rem;white-space:nowrap;';
+      when.textContent = new Date(Number(s.generated_at)).toLocaleString();
+      row.appendChild(when);
+
+      container.appendChild(row);
+    });
+
+    var divider = document.createElement('div');
+    divider.style.cssText = 'border-top:1px solid rgba(128,128,128,0.15);margin:10px 0;';
+    container.appendChild(divider);
+  }
+
+  // --- History section ---
+  var histLabel = document.createElement('div');
+  histLabel.style.cssText = 'font-size:0.82rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;opacity:0.7;margin-bottom:6px;';
+  histLabel.textContent = 'Recent Signals (' + history.length + ')';
+  container.appendChild(histLabel);
+
+  if (history.length === 0 && pending.length === 0) {
+    var empty = document.createElement('div');
+    empty.style.cssText = 'opacity:0.6;font-size:0.9rem;';
+    empty.textContent = 'No signals yet. The strategy scanner fires when momentum conditions are met.';
+    container.appendChild(empty);
+    return;
+  }
+
+  if (history.length === 0) {
+    var noHist = document.createElement('div');
+    noHist.style.cssText = 'opacity:0.5;font-size:0.85rem;';
+    noHist.textContent = 'No responded signals yet.';
+    container.appendChild(noHist);
+    return;
+  }
+
+  var table = document.createElement('table');
+  table.className = 'trader-table';
+  var thead = document.createElement('thead');
+  var headerRow = document.createElement('tr');
+  ['When', 'Asset', 'Side', 'Conf', 'Response', 'Outcome'].forEach(function(h) {
+    var th = document.createElement('th');
+    th.textContent = h;
+    headerRow.appendChild(th);
+  });
+  thead.appendChild(headerRow);
+  table.appendChild(thead);
+
+  var tbody = document.createElement('tbody');
+  history.forEach(function(s) {
+    var tr = document.createElement('tr');
+
+    var responseLabel = s.approval_response || 'timeout';
+    var outcomeLabel = s.decision_status || (responseLabel === 'skip' ? 'skipped' : responseLabel === 'pause' ? 'paused' : 'vetoed');
+
+    var responseColor = responseLabel === 'approve' ? 'color:#4caf50;' : 'color:#f44336;';
+    var outcomeColor = outcomeLabel === 'executed' ? 'color:#4caf50;' : outcomeLabel === 'skipped' || outcomeLabel === 'paused' ? 'color:rgba(128,128,128,0.8);' : 'color:#f44336;';
+
+    var when = new Date(Number(s.generated_at)).toLocaleString();
+    var sideStyle = s.side === 'buy' ? 'color:#4caf50;font-weight:600;' : 'color:#f44336;font-weight:600;';
+
+    [
+      { text: when, style: '' },
+      { text: s.asset || '-', style: 'font-weight:500;' },
+      { text: (s.side || '-').toUpperCase(), style: sideStyle },
+      { text: Number(s.raw_score).toFixed(2), style: 'opacity:0.8;' },
+      { text: responseLabel.toUpperCase(), style: responseColor + 'font-weight:600;font-size:0.85rem;' },
+      { text: outcomeLabel.toUpperCase(), style: outcomeColor + 'font-size:0.85rem;' },
+    ].forEach(function(cell) {
+      var td = document.createElement('td');
+      td.textContent = cell.text;
+      if (cell.style) td.style.cssText = cell.style;
+      tr.appendChild(td);
+    });
+
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
 
 async function refreshTraderDecisions() {
   var container = document.getElementById('trader-decisions');

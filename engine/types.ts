@@ -110,3 +110,50 @@ export interface PricePoint {
   close: number;
   ts_ms: number;           // ms
 }
+
+// ---------------------------------------------------------------------------
+// Signal telemetry -- Phase 8C Analyst Paw
+// ---------------------------------------------------------------------------
+
+export interface RegimeBucket {
+  ticks: number;
+  pct: number;
+}
+
+export interface RegimeStrategyStats {
+  scored: number;
+  fired: number;
+  suppressed: number;
+}
+
+export interface StrategyTelemetryStat {
+  strategy: string;
+  total_scored: number;
+  fired: number;
+  suppressed: number;
+  suppression_rate: number;   // 0-1
+  fire_rate: number;          // 0-1
+  by_regime: Record<string, RegimeStrategyStats>;
+}
+
+export interface NearMiss {
+  asset: string;
+  strategy: string;
+  consecutive_near_miss_ticks: number;
+  avg_score: number;
+  effective_threshold: number;
+  avg_gap: number;           // effective_threshold - avg_score
+  regime: string | null;
+  last_seen_ms: number;
+}
+
+export interface SignalTelemetrySummary {
+  window_days: number;
+  since_ms: number;
+  generated_at_ms: number;
+  total_ticks: number;
+  equity_ticks: number;
+  regime_distribution: Record<string, RegimeBucket>;
+  strategy_stats: StrategyTelemetryStat[];
+  near_misses: NearMiss[];
+}

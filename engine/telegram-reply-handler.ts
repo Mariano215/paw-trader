@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import { BIGGER_SIZE_USD } from './approval-manager.js'
+import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { logger } from '../logger.js'
 
 export type ApprovalAction = 'approve' | 'skip' | 'pause'
@@ -51,6 +52,10 @@ export function handleTraderButtonCallback(
   const row = db.prepare('SELECT decision_id FROM trader_approvals WHERE id = ?')
     .get(approvalId) as { decision_id: string } | undefined
   if (!row) return null
+
+  if (action === 'skip') {
+    recordSignalSuppressionBySignalId(db, row.decision_id, 'skip')
+  }
 
   return {
     approvalId,
@@ -120,6 +125,10 @@ export function tryHandleApprovalReply(
   `).run(action, Date.now(), override_size ?? null, pending.id)
 
   if (claimed.changes === 0) return null  // another handler already claimed this row
+
+  if (action === 'skip') {
+    recordSignalSuppressionBySignalId(db, pending.decision_id, 'skip')
+  }
 
   return {
     approvalId: pending.id,

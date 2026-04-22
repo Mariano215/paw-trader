@@ -10,6 +10,7 @@ import {
 } from './committee.js'
 import { DEFAULT_SIZE_USD } from './approval-manager.js'
 import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
+import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { logger } from '../logger.js'
 
 // Phase 2 hard cap: committee can size up to this via the size_multiplier.
@@ -144,6 +145,7 @@ export async function dispatchApproval(
       committeeResult.transcript_id,
       now, 'committee_abstain',
     )
+    recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', now)
     db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
     return `Committee abstained. ${committeeResult.thesis}`
   }
@@ -200,7 +202,7 @@ export async function dispatchApproval(
       size_usd: sizeUsd,
       entry_type: 'limit',
       entry_price: 0,  // engine resolves via market price
-      strategy: 'momentum',
+      strategy: signal.strategy_id.replace(/-stocks$/, ''),
       confidence: committeeResult.confidence,
     })
 

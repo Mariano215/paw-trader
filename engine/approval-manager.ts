@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
+import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 
 export interface ApprovalCardParams {
   asset: string
@@ -141,7 +142,10 @@ export function timeoutExpiredApprovals(db: Database.Database): ExpiredApproval[
     WHERE id = ?
   `)
   const txn = db.transaction(() => {
-    for (const r of rows) update.run(now, r.id)
+    for (const r of rows) {
+      update.run(now, r.id)
+      recordSignalSuppressionBySignalId(db, r.signal_id, 'timeout', now)
+    }
   })
   txn()
 

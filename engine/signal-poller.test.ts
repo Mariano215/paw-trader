@@ -48,10 +48,18 @@ describe('signal-poller', () => {
     expect(pending[0].asset).toBe('AAPL')
   })
 
-  it('filters signals below threshold (abs < 0.5)', async () => {
-    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.3)])
+  it('filters signals below threshold (abs < 0.05)', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.03)])
     await pollAndStoreSignals(db, mockClient as EngineClient)
     expect(getPendingSignals(db)).toHaveLength(0)
+  })
+
+  it('stores mild momentum signals that clear the engine-aligned floor', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.3)])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].asset).toBe('MSFT')
   })
 
   it('does not duplicate already-stored signal ids', async () => {

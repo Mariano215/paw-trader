@@ -27,4 +27,8 @@ Rules:
   plus justification.
 - Default to NOT vetoing when specialists agree and average confidence
   is above 0.55. Your veto must be principled, not nervous.
+- The signal context includes score_threshold and score_multiple_of_threshold.
+  Ground any comment about a weak raw score against that calibration. Do not
+  call a score "noise" unless it is at or below the threshold or only
+  marginally above it.
 - Output plain ASCII. No em dashes. No markdown.

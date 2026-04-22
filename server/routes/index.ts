@@ -12,6 +12,8 @@ import strategiesRoutes from './strategies.js'
 import verdictsRoutes from './verdicts.js'
 import committeeRoutes from './committee.js'
 import auditLogRoutes from './audit-log.js'
+import signalsRoutes from './signals.js'
+import syncRoutes from './sync.js'
 
 const router = Router()
 
@@ -20,5 +22,7 @@ router.use(strategiesRoutes)
 router.use(verdictsRoutes)
 router.use(committeeRoutes)
 router.use(auditLogRoutes)
+router.use(signalsRoutes)
+router.use(syncRoutes)
 
 export default router

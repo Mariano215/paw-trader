@@ -1,7 +1,9 @@
 import type Database from 'better-sqlite3'
+import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { logger } from '../logger.js'
 import type { EngineClient } from './engine-client.js'
 
-const SCORE_THRESHOLD = 0.5
+const SCORE_THRESHOLD = TRADER_SIGNAL_SCORE_THRESHOLD
 
 interface StoredSignal {
   id: string
@@ -30,8 +32,13 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
   `)
 
   const insertMany = db.transaction((items: typeof candidates) => {
+    let stored = 0
+    let filtered = 0
     for (const c of items) {
-      if (Math.abs(c.raw_score) < SCORE_THRESHOLD) continue
+      if (Math.abs(c.raw_score) < SCORE_THRESHOLD) {
+        filtered += 1
+        continue
+      }
       insert.run(
         c.id,
         resolveStrategyId(c.strategy, c.asset),
@@ -41,10 +48,21 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
         c.horizon_days,
         c.generated_at,
       )
+      stored += 1
     }
+    return { stored, filtered }
   })
 
-  insertMany(candidates)
+  const result = insertMany(candidates)
+  logger.info(
+    {
+      fetched: candidates.length,
+      stored: result.stored,
+      filtered: result.filtered,
+      threshold: SCORE_THRESHOLD,
+    },
+    'Trader signal poll complete',
+  )
 }
 
 /**

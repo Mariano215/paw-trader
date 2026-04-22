@@ -102,6 +102,11 @@ describe('approval-manager', () => {
     expect(row.side).toBe('buy')
     expect(row.sizeUsd).toBe(DEFAULT_SIZE_USD)
     expect(row.signalId).toBe('sig-t3')
+    const suppression = db.prepare(`
+      SELECT reason FROM trader_signal_suppressions
+      WHERE strategy_id = 'momentum-stocks' AND asset = 'MSFT' AND side = 'buy'
+    `).get() as any
+    expect(suppression.reason).toBe('timeout')
   })
 
   it('timeoutExpiredApprovals returns null asset/side when signal row is missing', () => {

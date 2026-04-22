@@ -55,14 +55,36 @@ export function initTraderTables(db: Database.Database): void {
       created_at      INTEGER NOT NULL
     );
 
+    -- Note: the column is named decision_id for historical reasons, but it
+    -- stores the trader_signals.id (the approval card is raised BEFORE the
+    -- committee runs, so no trader_decisions row exists yet). The old FK
+    -- pointed at trader_decisions(id) which made every approval insert fail
+    -- with FOREIGN KEY constraint in production (trader tests all disable
+    -- FK enforcement so this stayed hidden). migrateTraderApprovalsFk()
+    -- below rebuilds pre-existing tables that still have the broken FK.
     CREATE TABLE IF NOT EXISTS trader_approvals (
       id            TEXT PRIMARY KEY,
-      decision_id   TEXT NOT NULL REFERENCES trader_decisions(id),
+      decision_id   TEXT NOT NULL REFERENCES trader_signals(id),
       sent_at       INTEGER NOT NULL,
       responded_at  INTEGER,
       response      TEXT,
       override_size REAL
     );
+
+    CREATE TABLE IF NOT EXISTS trader_signal_suppressions (
+      id                     TEXT PRIMARY KEY,
+      signal_id              TEXT REFERENCES trader_signals(id),
+      strategy_id            TEXT NOT NULL REFERENCES trader_strategies(id),
+      asset                  TEXT NOT NULL,
+      side                   TEXT NOT NULL,
+      reason                 TEXT NOT NULL,
+      raw_score              REAL NOT NULL,
+      enrichment_fingerprint TEXT,
+      suppressed_at          INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_trader_signal_suppressions_lookup
+      ON trader_signal_suppressions(strategy_id, asset, side, suppressed_at);
 
     CREATE TABLE IF NOT EXISTS trader_verdicts (
       id                     TEXT PRIMARY KEY,
@@ -164,6 +186,63 @@ export function initTraderTables(db: Database.Database): void {
       last_alerted_at INTEGER NOT NULL
     );
   `);
+
+  // Fix the trader_approvals FK for any DB created before the intent
+  // correction. See the comment on the CREATE TABLE above. Idempotent:
+  // no-op when the FK is already correct or the table is empty-and-new.
+  migrateTraderApprovalsFk(db)
+}
+
+/**
+ * Rebuild trader_approvals with the correct FK when the legacy schema is
+ * detected (decision_id -> trader_decisions). The column stores a
+ * trader_signals.id in practice, so the FK must point there to let
+ * createPendingApproval succeed in production (where FKs are ON).
+ *
+ * The rebuild preserves existing rows. Safe to call on every boot because
+ * it short-circuits when the FK is already correct.
+ */
+function migrateTraderApprovalsFk(db: Database.Database): void {
+  const fks = db
+    .prepare('PRAGMA foreign_key_list(trader_approvals)')
+    .all() as Array<{ table: string; from: string; to: string }>
+
+  const decisionFk = fks.find(
+    (r) => r.from === 'decision_id' && r.table === 'trader_decisions',
+  )
+  if (!decisionFk) return  // already on trader_signals, or no FK row yet
+
+  // SQLite cannot ALTER a FK in place. Rebuild with the correct one and
+  // copy every row across. Wrapped in a transaction so a partial rename
+  // never leaves the schema half-migrated. foreign_keys must be OFF
+  // during the swap -- enable flag is restored by the caller's
+  // initialization, which re-runs `db.pragma('foreign_keys = ON')`.
+  const priorPragma = db.pragma('foreign_keys', { simple: true })
+  db.pragma('foreign_keys = OFF')
+  try {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE trader_approvals__new (
+        id            TEXT PRIMARY KEY,
+        decision_id   TEXT NOT NULL REFERENCES trader_signals(id),
+        sent_at       INTEGER NOT NULL,
+        responded_at  INTEGER,
+        response      TEXT,
+        override_size REAL
+      );
+      INSERT INTO trader_approvals__new (id, decision_id, sent_at, responded_at, response, override_size)
+      SELECT id, decision_id, sent_at, responded_at, response, override_size
+      FROM trader_approvals;
+      DROP TABLE trader_approvals;
+      ALTER TABLE trader_approvals__new RENAME TO trader_approvals;
+      COMMIT;
+    `)
+  } catch (err) {
+    db.exec('ROLLBACK')
+    throw err
+  } finally {
+    if (priorPragma === 1) db.pragma('foreign_keys = ON')
+  }
 }
 
 /**

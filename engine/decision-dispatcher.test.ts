@@ -143,6 +143,11 @@ describe('decision-dispatcher', () => {
     expect(row.status).toBe('committee_abstain')
     expect(row.size_usd).toBe(0)
     expect(row.committee_transcript_id).toBe('tr-test-abstain')
+    const suppression = db.prepare(`
+      SELECT reason FROM trader_signal_suppressions
+      WHERE strategy_id = 'momentum-stocks' AND asset = 'AAPL' AND side = 'buy'
+    `).get() as any
+    expect(suppression.reason).toBe('committee_abstain')
   })
 
   it('persists committee transcript for both approve and abstain paths', async () => {

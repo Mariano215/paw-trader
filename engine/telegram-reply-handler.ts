@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import { BIGGER_SIZE_USD } from './approval-manager.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
@@ -13,6 +14,18 @@ export interface ParsedReply {
   fromUserId?: number
 }
 
+function mapTraderAction(
+  rawAction: string,
+): { action: ApprovalAction; override_size?: number } | null {
+  const actionMap: Record<string, { action: ApprovalAction; override_size?: number }> = {
+    approve: { action: 'approve' },
+    skip:    { action: 'skip' },
+    bigger:  { action: 'approve', override_size: BIGGER_SIZE_USD },
+    pause:   { action: 'pause' },
+  }
+  return actionMap[rawAction] ?? null
+}
+
 /**
  * Claim a specific approval row by ID and record the button action.
  * Used by the Telegram inline keyboard callback handler where the approvalId
@@ -26,14 +39,7 @@ export function handleTraderButtonCallback(
   rawAction: string,
   fromUserId?: number,
 ): ParsedReply | null {
-  // Map button action strings to canonical ApprovalAction values
-  const actionMap: Record<string, { action: ApprovalAction; override_size?: number }> = {
-    approve: { action: 'approve' },
-    skip:    { action: 'skip' },
-    bigger:  { action: 'approve', override_size: BIGGER_SIZE_USD },
-    pause:   { action: 'pause' },
-  }
-  const mapped = actionMap[rawAction]
+  const mapped = mapTraderAction(rawAction)
   if (!mapped) {
     logger.warn({ rawAction, approvalId }, 'handleTraderButtonCallback: unknown action')
     return null
@@ -60,6 +66,71 @@ export function handleTraderButtonCallback(
   return {
     approvalId,
     decisionId: row.decision_id,
+    action,
+    override_size,
+    fromUserId,
+  }
+}
+
+/**
+ * Claim the latest approval row for a signal, or create an already-responded
+ * row when Telegram delivery never happened and the dashboard is acting as the
+ * first response path. Returns null when the signal is missing or an approval
+ * for the signal was already claimed earlier.
+ */
+export function handleTraderSignalAction(
+  db: Database.Database,
+  signalId: string,
+  rawAction: string,
+  fromUserId?: number,
+): ParsedReply | null {
+  const mapped = mapTraderAction(rawAction)
+  if (!mapped) {
+    logger.warn({ rawAction, signalId }, 'handleTraderSignalAction: unknown action')
+    return null
+  }
+
+  const signal = db.prepare('SELECT id FROM trader_signals WHERE id = ?').get(signalId) as { id: string } | undefined
+  if (!signal) return null
+
+  const { action, override_size } = mapped
+  const latest = db.prepare(`
+    SELECT id, responded_at
+    FROM trader_approvals
+    WHERE decision_id = ?
+    ORDER BY sent_at DESC
+    LIMIT 1
+  `).get(signalId) as { id: string; responded_at: number | null } | undefined
+
+  if (latest?.responded_at != null) {
+    return null
+  }
+
+  const now = Date.now()
+  let approvalId: string
+  if (latest) {
+    const claimed = db.prepare(`
+      UPDATE trader_approvals
+      SET response = ?, responded_at = ?, override_size = ?
+      WHERE id = ? AND responded_at IS NULL
+    `).run(action, now, override_size ?? null, latest.id)
+    if (claimed.changes === 0) return null
+    approvalId = latest.id
+  } else {
+    approvalId = randomUUID()
+    db.prepare(`
+      INSERT INTO trader_approvals (id, decision_id, sent_at, responded_at, response, override_size)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(approvalId, signalId, now, now, action, override_size ?? null)
+  }
+
+  if (action === 'skip') {
+    recordSignalSuppressionBySignalId(db, signalId, 'skip', now)
+  }
+
+  return {
+    approvalId,
+    decisionId: signalId,
     action,
     override_size,
     fromUserId,

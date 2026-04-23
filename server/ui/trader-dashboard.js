@@ -1155,6 +1155,64 @@ async function refreshTraderSignalQueue() {
   }
 }
 
+function appendTraderScrollable(parent, child, maxHeightPx) {
+  var wrap = document.createElement('div');
+  wrap.className = 'trader-scroll-region';
+  if (maxHeightPx) wrap.style.maxHeight = maxHeightPx + 'px';
+  wrap.appendChild(child);
+  parent.appendChild(wrap);
+  return wrap;
+}
+
+function refreshTraderAfterSignalAction() {
+  refreshTraderSignalQueue();
+  refreshTraderDecisions();
+  if (_strategyDetailState.strategyId) {
+    loadStrategyDecisions(_strategyDetailState.strategyId);
+    loadStrategyVerdicts(_strategyDetailState.strategyId, true);
+  }
+  setTimeout(function() {
+    refreshTraderSignalQueue();
+    refreshTraderDecisions();
+    if (_strategyDetailState.strategyId) {
+      loadStrategyDecisions(_strategyDetailState.strategyId);
+      loadStrategyVerdicts(_strategyDetailState.strategyId, true);
+    }
+  }, 1500);
+}
+
+async function respondToTraderSignal(signalId, action, buttons) {
+  if (!signalId || !action) return;
+  if (action === 'pause' && !confirm('Pause this strategy for new signals?')) return;
+  (buttons || []).forEach(function(btn) { btn.disabled = true; });
+  var result = await apiFetch(
+    '/api/v1/trader/signals/' + encodeURIComponent(signalId) + '/action',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action }),
+    },
+  );
+  if (result && result.ok) {
+    showToast('Trader action sent', 'success');
+    refreshTraderAfterSignalAction();
+    return;
+  }
+  (buttons || []).forEach(function(btn) { btn.disabled = false; });
+  var msg = (result && result.data && result.data.error) ? result.data.error : 'Signal action failed';
+  showToast(msg, 'error');
+}
+
+function makeTraderSignalActionButton(label, action, signalId, buttons) {
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn--sm btn--ghost trader-signal-action-btn';
+  btn.textContent = label;
+  btn.onclick = function() { respondToTraderSignal(signalId, action, buttons); };
+  buttons.push(btn);
+  return btn;
+}
+
 function renderTraderSignalQueue(pending, history, container) {
   while (container.firstChild) container.removeChild(container.firstChild);
 
@@ -1170,37 +1228,57 @@ function renderTraderSignalQueue(pending, history, container) {
     pendingLabel.textContent = 'Awaiting Response (' + pending.length + ')';
     container.appendChild(pendingLabel);
 
+    var pendingList = document.createElement('div');
+    pendingList.className = 'trader-pending-list';
+
     pending.forEach(function(s) {
       var row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:6px;margin-bottom:6px;background:rgba(var(--accent-rgb,76,175,80),0.08);border:1px solid rgba(var(--accent-rgb,76,175,80),0.25);';
+      row.className = 'trader-pending-row';
+
+      var info = document.createElement('div');
+      info.className = 'trader-pending-row__info';
 
       var badge = document.createElement('span');
       badge.style.cssText = 'font-size:0.75rem;font-weight:700;padding:2px 7px;border-radius:10px;background:var(--accent,#4caf50);color:#fff;flex-shrink:0;';
       badge.textContent = 'PENDING';
-      row.appendChild(badge);
+      info.appendChild(badge);
 
       var side = document.createElement('span');
       side.style.cssText = 'font-weight:600;font-size:0.9rem;min-width:32px;' + (s.side === 'buy' ? 'color:#4caf50;' : 'color:#f44336;');
       side.textContent = (s.side || '').toUpperCase();
-      row.appendChild(side);
+      info.appendChild(side);
 
       var asset = document.createElement('span');
       asset.style.cssText = 'font-weight:500;font-size:0.9rem;';
       asset.textContent = s.asset || '-';
-      row.appendChild(asset);
+      info.appendChild(asset);
 
       var conf = document.createElement('span');
       conf.style.cssText = 'opacity:0.7;font-size:0.85rem;';
       conf.textContent = 'conf ' + Number(s.raw_score).toFixed(2);
-      row.appendChild(conf);
+      info.appendChild(conf);
 
       var when = document.createElement('span');
       when.style.cssText = 'margin-left:auto;opacity:0.5;font-size:0.8rem;white-space:nowrap;';
       when.textContent = new Date(Number(s.generated_at)).toLocaleString();
-      row.appendChild(when);
+      info.appendChild(when);
+      row.appendChild(info);
 
-      container.appendChild(row);
+      if (CURRENT_USER && CURRENT_USER.isAdmin) {
+        var actions = document.createElement('div');
+        actions.className = 'trader-pending-row__actions';
+        var buttons = [];
+        actions.appendChild(makeTraderSignalActionButton('Approve', 'approve', s.id, buttons));
+        actions.appendChild(makeTraderSignalActionButton('Skip', 'skip', s.id, buttons));
+        actions.appendChild(makeTraderSignalActionButton('$250', 'bigger', s.id, buttons));
+        actions.appendChild(makeTraderSignalActionButton('Pause', 'pause', s.id, buttons));
+        row.appendChild(actions);
+      }
+
+      pendingList.appendChild(row);
     });
+
+    appendTraderScrollable(container, pendingList, 320);
 
     var divider = document.createElement('div');
     divider.style.cssText = 'border-top:1px solid rgba(128,128,128,0.15);margin:10px 0;';
@@ -1271,7 +1349,7 @@ function renderTraderSignalQueue(pending, history, container) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  container.appendChild(table);
+  appendTraderScrollable(container, table, 360);
 }
 
 async function refreshTraderDecisions() {
@@ -1304,7 +1382,7 @@ function renderTraderDecisions(decisions, container) {
 
   var hint = document.createElement('div');
   hint.style.cssText = 'opacity:0.6;font-size:0.8rem;margin-bottom:8px;';
-  hint.textContent = 'Click a row to see the committee transcript.';
+  hint.textContent = 'Click a row to see the committee transcript (when linked).';
   container.appendChild(hint);
 
   var table = document.createElement('table');
@@ -1343,7 +1421,7 @@ function renderTraderDecisions(decisions, container) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  container.appendChild(table);
+  appendTraderScrollable(container, table, 320);
 }
 
 async function openTranscriptModal(decisionId) {
@@ -2196,7 +2274,7 @@ function renderStrategyAttribution(card, data) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  card.appendChild(table);
+  appendTraderScrollable(card, table, 320);
 }
 
 async function loadStrategyVerdicts(strategyId, reset) {
@@ -2279,7 +2357,7 @@ function renderStrategyVerdicts(card, strategyId) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  card.appendChild(table);
+  appendTraderScrollable(card, table, 320);
 
   // Phase 5 Task 7b -- footer row holds the "Load older" pagination
   // button and the "Download CSV" anchor side by side. Always render the
@@ -2376,7 +2454,7 @@ function renderStrategyDecisions(card, decisions) {
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
-  card.appendChild(table);
+  appendTraderScrollable(card, table, 320);
 }
 
 async function clearCircuitBreaker(rule) {

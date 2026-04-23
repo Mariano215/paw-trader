@@ -1,11 +1,13 @@
 /**
  * trader-routes/signals.ts
  *
- * GET /api/v1/trader/signals?limit=N
+ * GET  /api/v1/trader/signals?limit=N
+ * POST /api/v1/trader/signals/:id/action
  *
  * Returns recent signals with their approval response and decision outcome,
- * so the dashboard Signal Queue card can show both pending and historical
- * signals in one call.
+ * and relays dashboard-originated approval actions back to the live bot.
+ * This lets the trader Signal Queue card show both pending and historical
+ * signals in one call and offer a non-Telegram escape hatch when alerts fail.
  *
  * Response shape:
  * {
@@ -24,6 +26,8 @@
 import { Router, type Request, type Response } from 'express'
 import { getBotDb } from '../db.js'
 import { logger } from '../logger.js'
+import { requireAdmin } from '../auth.js'
+import { broadcastToMac, isBotConnected } from '../ws.js'
 
 const router = Router()
 
@@ -32,6 +36,7 @@ const DEFAULT_LIMIT = 50
 
 interface SignalRow {
   id: string
+  approval_id: string | null
   asset: string
   side: string
   raw_score: number
@@ -60,6 +65,7 @@ router.get('/api/v1/trader/signals', (req: Request, res: Response) => {
     const rows = bdb.prepare(`
       SELECT
         s.id,
+        a.id           AS approval_id,
         s.asset,
         s.side,
         s.raw_score,
@@ -85,6 +91,61 @@ router.get('/api/v1/trader/signals', (req: Request, res: Response) => {
     logger.warn({ err }, 'trader: signals read failed')
     res.status(500).json({ error: 'failed to read signals' })
   }
+})
+
+router.post('/api/v1/trader/signals/:id/action', requireAdmin, (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) {
+    res.status(503).json({ error: 'bot database unavailable' })
+    return
+  }
+
+  const signalId = String(req.params.id)
+  const action = typeof req.body?.action === 'string' ? req.body.action.trim() : ''
+  if (!['approve', 'skip', 'bigger', 'pause'].includes(action)) {
+    res.status(400).json({ error: 'action must be approve, skip, bigger, or pause' })
+    return
+  }
+
+  const signal = bdb.prepare(`
+    SELECT id, status
+    FROM trader_signals
+    WHERE id = ?
+  `).get(signalId) as { id: string; status: string } | undefined
+  if (!signal) {
+    res.status(404).json({ error: 'signal not found' })
+    return
+  }
+  if (signal.status !== 'pending') {
+    res.status(409).json({ error: 'signal is no longer awaiting action' })
+    return
+  }
+
+  const latestApproval = bdb.prepare(`
+    SELECT responded_at
+    FROM trader_approvals
+    WHERE decision_id = ?
+    ORDER BY sent_at DESC
+    LIMIT 1
+  `).get(signalId) as { responded_at: number | null } | undefined
+  if (latestApproval?.responded_at != null) {
+    res.status(409).json({ error: 'signal was already claimed' })
+    return
+  }
+
+  if (!isBotConnected()) {
+    res.status(503).json({ error: 'trader bot is offline; dashboard action not delivered' })
+    return
+  }
+
+  broadcastToMac({
+    type: 'trader-signal-action',
+    signalId,
+    action,
+    fromUserId: req.user?.id ?? null,
+    requestedAt: Date.now(),
+  })
+  res.status(202).json({ accepted: true })
 })
 
 export default router

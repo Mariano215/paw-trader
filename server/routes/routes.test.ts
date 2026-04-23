@@ -24,6 +24,11 @@ import {
 } from './users.js'
 import { authenticate, scopeProjects } from './auth.js'
 
+const wsMock = vi.hoisted(() => ({
+  broadcastToMac: vi.fn(),
+  isBotConnected: vi.fn(() => true),
+}))
+
 // ---------------------------------------------------------------------------
 // In-memory DB used by both the users module and the mocked db.js module
 // ---------------------------------------------------------------------------
@@ -146,6 +151,16 @@ function makeSchema(db: Database.Database) {
     )
   `).run()
   db.prepare(`
+    CREATE TABLE IF NOT EXISTS trader_approvals (
+      id            TEXT PRIMARY KEY,
+      decision_id   TEXT NOT NULL,
+      sent_at       INTEGER NOT NULL,
+      responded_at  INTEGER,
+      response      TEXT,
+      override_size REAL
+    )
+  `).run()
+  db.prepare(`
     CREATE TABLE IF NOT EXISTS trader_verdicts (
       id                     TEXT PRIMARY KEY,
       decision_id            TEXT NOT NULL,
@@ -202,6 +217,11 @@ vi.mock('./db.js', async () => {
     getRecentFeed: vi.fn(() => []),
   }
 })
+
+vi.mock('./ws.js', async () => ({
+  broadcastToMac: wsMock.broadcastToMac,
+  isBotConnected: wsMock.isBotConnected,
+}))
 
 // ---------------------------------------------------------------------------
 // Import routes after mocks
@@ -356,6 +376,12 @@ beforeAll(async () => {
 function tok(t: string): Record<string, string> {
   return { 'x-dashboard-token': t }
 }
+
+beforeEach(() => {
+  wsMock.broadcastToMac.mockClear()
+  wsMock.isBotConnected.mockReset()
+  wsMock.isBotConnected.mockReturnValue(true)
+})
 
 // ===========================================================================
 // Tests
@@ -536,6 +562,88 @@ describe('GET /api/v1/trader/track-records', () => {
     } finally {
       botDbAvailable = true
     }
+  })
+})
+
+describe('POST /api/v1/trader/signals/:id/action', () => {
+  function seedPendingSignal(signalId: string, approvalId?: string): void {
+    testDb.prepare(`DELETE FROM trader_approvals WHERE decision_id = ?`).run(signalId)
+    testDb.prepare(`DELETE FROM trader_signals WHERE id = ?`).run(signalId)
+    testDb.prepare(`DELETE FROM trader_strategies WHERE id = 'signal-action-strategy'`).run()
+    testDb.prepare(`
+      INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('signal-action-strategy', 'Signal Action', 'stocks', 0, 'active', '{}', 1, 1)
+    `).run()
+    testDb.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES (?, 'signal-action-strategy', 'BTC/USD', 'buy', 0.81, 5, NULL, ?, 'pending')
+    `).run(signalId, 1_700_000_300_000)
+    if (approvalId) {
+      testDb.prepare(`
+        INSERT INTO trader_approvals (id, decision_id, sent_at, responded_at, response, override_size)
+        VALUES (?, ?, ?, NULL, NULL, NULL)
+      `).run(approvalId, signalId, 1_700_000_301_000)
+    }
+  }
+
+  it('accepts an admin action and relays it to the Mac bot', async () => {
+    seedPendingSignal('sig-action-1', 'ap-action-1')
+    const res = await httpReq(
+      srv,
+      'POST',
+      '/api/v1/trader/signals/sig-action-1/action',
+      { headers: tok(adminToken), body: { action: 'approve' } },
+    )
+    expect(res.status).toBe(202)
+    expect(res.body).toEqual({ accepted: true })
+    expect(wsMock.broadcastToMac).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'trader-signal-action',
+      signalId: 'sig-action-1',
+      action: 'approve',
+    }))
+  })
+
+  it('returns 503 when the Mac bot is offline', async () => {
+    seedPendingSignal('sig-action-offline')
+    wsMock.isBotConnected.mockReturnValue(false)
+    const res = await httpReq(
+      srv,
+      'POST',
+      '/api/v1/trader/signals/sig-action-offline/action',
+      { headers: tok(adminToken), body: { action: 'skip' } },
+    )
+    expect(res.status).toBe(503)
+    expect((res.body as { error: string }).error).toMatch(/offline/i)
+    expect(wsMock.broadcastToMac).not.toHaveBeenCalled()
+  })
+
+  it('returns 409 when the latest approval was already claimed', async () => {
+    seedPendingSignal('sig-action-claimed', 'ap-action-claimed')
+    testDb.prepare(`
+      UPDATE trader_approvals
+      SET responded_at = ?, response = 'approve'
+      WHERE id = 'ap-action-claimed'
+    `).run(1_700_000_302_000)
+    const res = await httpReq(
+      srv,
+      'POST',
+      '/api/v1/trader/signals/sig-action-claimed/action',
+      { headers: tok(adminToken), body: { action: 'approve' } },
+    )
+    expect(res.status).toBe(409)
+    expect((res.body as { error: string }).error).toMatch(/claimed/i)
+  })
+
+  it('returns 403 for a non-admin caller', async () => {
+    seedPendingSignal('sig-action-member')
+    const res = await httpReq(
+      srv,
+      'POST',
+      '/api/v1/trader/signals/sig-action-member/action',
+      { headers: tok(memberToken), body: { action: 'approve' } },
+    )
+    expect(res.status).toBe(403)
+    expect(wsMock.broadcastToMac).not.toHaveBeenCalled()
   })
 })
 

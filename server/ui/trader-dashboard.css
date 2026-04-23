@@ -6,6 +6,45 @@
  * ============================================================= */
 
 /* ========== PAW TRADER - COMMITTEE TRANSCRIPT (Phase 2 Task 8) ========== */
+.trader-scroll-region {
+  overflow: auto;
+  max-width: 100%;
+  border-radius: 8px;
+}
+.trader-pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.trader-pending-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(var(--accent-rgb, 76, 175, 80), 0.08);
+  border: 1px solid rgba(var(--accent-rgb, 76, 175, 80), 0.25);
+}
+.trader-pending-row__info {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex: 1 1 420px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.trader-pending-row__actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.trader-signal-action-btn {
+  min-width: 0;
+  white-space: nowrap;
+}
 .trader-decision-row { cursor: pointer; transition: background 120ms ease; }
 .trader-decision-row:hover { background: var(--surface-hover, rgba(255,255,255,0.04)); }
 .trader-decision-row--no-transcript { cursor: default; opacity: 0.6; }

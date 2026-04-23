@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import { pollAndStoreSignals } from './signal-poller.js'
+import { enrichPendingSignals } from './enrichment-fetcher.js'
 import { sendPendingApprovals } from './approval-sender.js'
 import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
@@ -210,6 +211,19 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     polled = true
   } catch (err) {
     logger.warn({ err }, 'Trader tick: signal poll failed')
+  }
+
+  // 1b. Enrich pending signals with 30-day price bars (RSI, momentum,
+  //     price levels) so the committee has real market context.
+  //     Runs after poll so newly inserted signals are also enriched.
+  //     Failures are logged but never block the approval-send step.
+  if (polled) {
+    try {
+      const client = deps.getEngineClient()
+      await enrichPendingSignals(deps.db, client)
+    } catch (err) {
+      logger.warn({ err }, 'Trader tick: signal enrichment failed; committee will see (none)')
+    }
   }
 
   // 2. Send approval cards for new pending signals.

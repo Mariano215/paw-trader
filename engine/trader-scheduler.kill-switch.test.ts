@@ -33,6 +33,12 @@ import type { TraderApprovalKeyboard } from './approval-manager.js'
 import type { EngineOrder } from './types.js'
 import * as killSwitch from '../cost/kill-switch-client.js'
 
+vi.mock('./decision-dispatcher.js', () => ({
+  autoDispatchPendingSignals: vi.fn().mockResolvedValue([]),
+}))
+
+import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+
 function makeDb() {
   const db = new Database(':memory:')
   db.pragma('foreign_keys = OFF')
@@ -143,6 +149,9 @@ describe('runTraderTick + kill switch', () => {
     getEngineClient = () => engineClient as EngineClient
     _resetHaltAlertForTest()
     vi.restoreAllMocks()
+    // Reset the module-level mock between tests so call counts start fresh.
+    vi.mocked(autoDispatchPendingSignals).mockReset()
+    vi.mocked(autoDispatchPendingSignals).mockResolvedValue([])
   })
 
   // -------------------------------------------------------------------------
@@ -283,14 +292,17 @@ describe('runTraderTick + kill switch', () => {
 
     insertSignal(db, 'sig-clear-card', 0.9)
 
+    vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+      { action: 'executed', signalId: 'sig-clear-card', asset: 'AAPL', side: 'buy', reason: 'committee approved' },
+    ])
+
     const { send, sendWithKeyboard, networkSend, networkSendWithKeyboard } = makeGatedSends()
     const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
 
     expect(result.sent).toBe(1)
-    expect(networkSendWithKeyboard).toHaveBeenCalledTimes(1)
-    const [text] = networkSendWithKeyboard.mock.calls[0]
-    expect(text).toContain('AAPL')
-    expect(networkSend).not.toHaveBeenCalled()
+    expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
+    // auto-dispatch uses deps.send (not sendWithKeyboard); the gated send hits networkSend
+    expect(networkSendWithKeyboard).not.toHaveBeenCalled()
   })
 
   it('switch CLEAR: halt alert reaches the operator', async () => {
@@ -323,14 +335,18 @@ describe('runTraderTick + kill switch', () => {
       fillOrder({ side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ])
 
-    const { send, sendWithKeyboard, networkSendWithKeyboard } = makeGatedSends()
+    // sig-clear-e2e is 'pending', so auto-dispatch fires for it too.
+    vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+      { action: 'executed', signalId: 'sig-clear-e2e', asset: 'AAPL', side: 'buy', reason: 'committee approved' },
+    ])
+
+    const { send, sendWithKeyboard } = makeGatedSends()
     const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
 
     expect(result.polled).toBe(true)
     expect(result.closedOut).toBe(1)
-    // sig-clear-e2e is 'pending', so a card fires for it too.
     expect(result.sent).toBe(1)
-    expect(networkSendWithKeyboard).toHaveBeenCalledTimes(1)
+    expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
 
     const verdict = db.prepare(
       'SELECT pnl_gross FROM trader_verdicts WHERE decision_id = ?',

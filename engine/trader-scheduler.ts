@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import { pollAndStoreSignals } from './signal-poller.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
-import { sendPendingApprovals } from './approval-sender.js'
+import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { maybeFireWeeklyReport } from './weekly-report.js'
@@ -226,11 +226,15 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   }
 
-  // 2. Send approval cards for new pending signals.
+  // 2. Auto-dispatch pending signals through the committee.
   try {
-    sent = await sendPendingApprovals(deps.db, { sendWithKeyboard: deps.sendWithKeyboard })
+    const dispatched = await autoDispatchPendingSignals(deps.db, {
+      send: deps.send,
+      alertOnReject: process.env.TRADER_ALERT_ON_REJECT === 'true',
+    })
+    sent = dispatched.length
   } catch (err) {
-    logger.error({ err }, 'Trader tick: approval send failed')
+    logger.error({ err }, 'Trader tick: auto-dispatch failed')
   }
 
   // 3. Time out approvals older than 30 min and notify the operator so a

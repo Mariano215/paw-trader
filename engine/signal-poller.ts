@@ -5,6 +5,28 @@ import type { EngineClient } from './engine-client.js'
 
 const SCORE_THRESHOLD = TRADER_SIGNAL_SCORE_THRESHOLD
 
+/**
+ * Returns true when the given timestamp falls within NYSE regular
+ * trading hours: Mon-Fri 09:30-16:00 America/New_York.
+ * Crypto assets (asset.includes('/')) bypass this check entirely.
+ */
+export function isEquityMarketHours(tsMs: number = Date.now()): boolean {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: 'numeric',
+    weekday: 'short',
+    hour12: false,
+  }).formatToParts(new Date(tsMs))
+
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '0'
+  const weekday = get('weekday')
+  if (weekday === 'Sat' || weekday === 'Sun') return false
+
+  const mins = parseInt(get('hour'), 10) * 60 + parseInt(get('minute'), 10)
+  return mins >= 9 * 60 + 30 && mins < 16 * 60
+}
+
 interface StoredSignal {
   id: string
   strategy_id: string
@@ -31,12 +53,12 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'pending')
   `)
 
-  // Check if a pending signal already exists for this strategy+asset+side.
+  // Check if a pending signal already exists for this asset+side.
   // Prevents the engine from flooding the queue with duplicate signals in
   // one poll cycle or across cycles when the user has not acted yet.
   const hasPending = db.prepare(`
     SELECT 1 FROM trader_signals
-    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+    WHERE asset = ? AND side = ? AND status = 'pending'
     LIMIT 1
   `)
 
@@ -44,7 +66,7 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
     let stored = 0
     let filtered = 0
     let deduped = 0
-    // Track which strategy+asset+side combos we have already inserted this
+    // Track which asset+side slots we have already inserted this
     // cycle to handle batches where the engine returns multiple IDs for the
     // same opportunity.
     const seenThisCycle = new Set<string>()
@@ -55,8 +77,16 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
         continue
       }
 
+      // Market hours gate: drop equity signals generated outside NYSE hours.
+      // Crypto (asset contains '/') trades 24/7 and always passes.
+      const isCrypto = c.asset.includes('/')
+      if (!isCrypto && !isEquityMarketHours(c.generated_at)) {
+        filtered += 1
+        continue
+      }
+
       const strategyId = resolveStrategyId(c.strategy, c.asset)
-      const key = `${strategyId}|${c.asset}|${c.side}`
+      const key = `${c.asset.toUpperCase()}|${c.side}`
 
       // Skip if already seen in this batch
       if (seenThisCycle.has(key)) {
@@ -65,7 +95,7 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
       }
 
       // Skip if a pending signal already exists in the DB for this slot
-      const existing = hasPending.get(strategyId, c.asset, c.side)
+      const existing = hasPending.get(c.asset.toUpperCase(), c.side)
       if (existing) {
         deduped += 1
         seenThisCycle.add(key)
@@ -75,7 +105,7 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
       insert.run(
         c.id,
         strategyId,
-        c.asset,
+        c.asset.toUpperCase(),
         c.side,
         c.raw_score,
         c.horizon_days,

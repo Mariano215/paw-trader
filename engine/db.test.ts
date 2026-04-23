@@ -159,4 +159,22 @@ describe("trader DB tables", () => {
     expect(row.decision_id).toBe('sig-1')
     expect(row.sent_at).toBe(1776000000000)
   })
+
+  it('rejects inserting two pending signals for the same asset+side', () => {
+    const testDb = new Database(':memory:')
+    initTraderTables(testDb)
+
+    // Insert a strategy first (required by FK)
+    testDb.prepare(
+      'INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run('momentum-stocks', 'Momentum', 'stocks', 0, 'active', '{}', Date.now(), Date.now())
+
+    const insert = testDb.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, 'momentum-stocks', 'MSFT', 'buy', 0.8, 3, ?, 'pending')
+    `)
+    insert.run('idx-sig-1', Date.now())
+    expect(() => insert.run('idx-sig-2', Date.now())).toThrow()
+  })
 });

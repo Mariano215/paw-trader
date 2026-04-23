@@ -13,6 +13,12 @@ import * as loggerModule from '../logger.js'
 import type { EngineClient } from './engine-client.js'
 import type { TraderApprovalKeyboard } from './approval-manager.js'
 
+vi.mock('./decision-dispatcher.js', () => ({
+  autoDispatchPendingSignals: vi.fn().mockResolvedValue([]),
+}))
+
+import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+
 function makeDb() {
   const db = new Database(':memory:')
   db.pragma('foreign_keys = OFF')
@@ -33,11 +39,11 @@ function makeDb() {
   return db
 }
 
-function insertSignal(db: Database.Database, id: string, score = 0.72) {
+function insertSignal(db: Database.Database, id: string, score = 0.72, side = 'buy') {
   db.prepare(`
     INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
-    VALUES (?, 'momentum-stocks', 'AAPL', 'buy', ?, 20, ?, 'pending')
-  `).run(id, score, Date.now())
+    VALUES (?, 'momentum-stocks', 'AAPL', ?, ?, 20, ?, 'pending')
+  `).run(id, side, score, Date.now())
 }
 
 const healthOk = {
@@ -103,18 +109,20 @@ describe('trader-scheduler', () => {
       expect(sendWithKeyboardMock).not.toHaveBeenCalled()
     })
 
-    it('polls engine and sends approval card for new signals', async () => {
+    it('polls engine and calls autoDispatchPendingSignals for new signals', async () => {
       vi.mocked(engineClient.getSignals!).mockResolvedValue([
         {
           id: 'sig-1', strategy: 'momentum', asset: 'AAPL', side: 'buy',
           raw_score: 0.72, horizon_days: 20, generated_at: Date.now(),
         },
       ])
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
       const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
-      expect(sendWithKeyboardMock).toHaveBeenCalledTimes(1)
-      expect(sendWithKeyboardMock.mock.calls[0][0]).toContain('AAPL')
+      expect(sendWithKeyboardMock).not.toHaveBeenCalled()
     })
 
     it('times out approvals older than 30 min', async () => {
@@ -167,11 +175,13 @@ describe('trader-scheduler', () => {
     it('continues even when engine poll fails', async () => {
       vi.mocked(engineClient.getSignals!).mockRejectedValue(new Error('engine down'))
       insertSignal(db, 'sig-preexisting')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
 
       const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
-      expect(sendWithKeyboardMock).toHaveBeenCalled()
     })
 
     it('continues when getEngineClient throws (credentials missing)', async () => {
@@ -179,23 +189,35 @@ describe('trader-scheduler', () => {
         throw new Error('credentials not configured')
       })
       insertSignal(db, 'sig-preexisting')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
 
       const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
       expect(result.polled).toBe(false)
       expect(result.sent).toBe(1)
     })
 
-    it('continues when sendWithKeyboard fails for one signal', async () => {
-      insertSignal(db, 'sig-1', 0.9)
-      insertSignal(db, 'sig-2', 0.8)
-      let calls = 0
-      const flakySwk = async (): Promise<void> => {
-        calls++
-        if (calls === 1) throw new Error('telegram 503')
-      }
+    it('continues when autoDispatchPendingSignals throws', async () => {
+      insertSignal(db, 'sig-1', 0.9, 'buy')
+      vi.mocked(autoDispatchPendingSignals).mockRejectedValueOnce(new Error('committee blew up'))
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard: flakySwk })
-      expect(result.sent).toBe(1)
+      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      // auto-dispatch failed so sent stays 0, but the tick still completes
+      expect(result.sent).toBe(0)
+      expect(result.polled).toBe(true)
+    })
+
+    it('calls autoDispatchPendingSignals with db and correct deps shape', async () => {
+      vi.mocked(autoDispatchPendingSignals).mockClear()
+      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
+      const [calledDb, calledDeps] = vi.mocked(autoDispatchPendingSignals).mock.calls[0]
+      expect(calledDb).toBe(db)
+      expect(typeof calledDeps.send).toBe('function')
+      expect(calledDeps.alertOnReject).toBe(false)
+      // The old sendWithKeyboard path must not be present in the deps
+      expect((calledDeps as any).sendWithKeyboard).toBeUndefined()
     })
 
     it('sends halt alert via plain send when reconciler_halted is true', async () => {
@@ -247,6 +269,9 @@ describe('trader-scheduler', () => {
     it('continues when health check fails', async () => {
       vi.mocked(engineClient.getHealth!).mockRejectedValue(new Error('health endpoint down'))
       insertSignal(db, 'sig-1')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
 
       const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
       expect(result.polled).toBe(true)
@@ -283,6 +308,9 @@ describe('trader-scheduler', () => {
     it('close-out failure does not halt other phases', async () => {
       insertSignal(db, 'sig-poll')
       vi.mocked(engineClient.getPositions!).mockRejectedValue(new Error('positions endpoint down'))
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-poll', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
 
       // An executed decision must exist for runCloseOutSweep to even call getPositions.
       db.prepare(`
@@ -670,7 +698,7 @@ describe('trader-scheduler', () => {
       insertSignal(db, 'sig-1')
       initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
       await new Promise((resolve) => setTimeout(resolve, 10))
-      expect(sendWithKeyboardMock).toHaveBeenCalledTimes(1)
+      expect(autoDispatchPendingSignals).toHaveBeenCalled()
     })
 
     it('does not start twice', async () => {

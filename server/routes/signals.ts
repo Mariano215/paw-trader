@@ -125,6 +125,63 @@ router.get('/api/v1/trader/signals', (req: Request, res: Response) => {
   }
 })
 
+// GET /api/v1/trader/signals/:id/committee
+// Returns the committee transcript for a signal, if one exists.
+// Looks up the transcript via trader_committee_transcripts.signal_id, taking
+// the most recent row in case a signal ever triggers multiple runs.
+// Returns { transcript: null } when the signal exists but has no transcript.
+// Returns 404 when the signal itself is not found.
+router.get('/api/v1/trader/signals/:id/committee', (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) {
+    res.status(503).json({ error: 'bot database unavailable' })
+    return
+  }
+
+  const signalId = String(req.params.id)
+  try {
+    const signal = bdb.prepare(`SELECT id FROM trader_signals WHERE id = ?`).get(signalId) as { id: string } | undefined
+    if (!signal) {
+      res.status(404).json({ error: 'signal not found' })
+      return
+    }
+
+    const tr = bdb.prepare(`
+      SELECT id, signal_id, transcript_json, rounds, total_tokens, total_cost_usd, created_at
+      FROM trader_committee_transcripts
+      WHERE signal_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(signalId) as {
+      id: string; signal_id: string; transcript_json: string;
+      rounds: number; total_tokens: number; total_cost_usd: number; created_at: number
+    } | undefined
+
+    if (!tr) {
+      res.json({ transcript: null })
+      return
+    }
+
+    let body: unknown = null
+    try { body = JSON.parse(tr.transcript_json) } catch { body = null }
+
+    res.json({
+      transcript: {
+        id: tr.id,
+        signal_id: tr.signal_id,
+        rounds: tr.rounds,
+        total_tokens: tr.total_tokens,
+        total_cost_usd: tr.total_cost_usd,
+        created_at: tr.created_at,
+        body,
+      },
+    })
+  } catch (err) {
+    logger.warn({ err, signalId }, 'trader: signals/:id/committee read failed')
+    res.status(500).json({ error: 'failed to read committee transcript' })
+  }
+})
+
 router.post('/api/v1/trader/signals/:id/action', requireAdmin, (req: Request, res: Response) => {
   const bdb = getBotDb()
   if (!bdb) {

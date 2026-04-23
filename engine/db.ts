@@ -28,6 +28,10 @@ export function initTraderTables(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_signals_status
       ON trader_signals(status, generated_at);
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_trader_signals_pending_asset_side
+      ON trader_signals (asset, side)
+      WHERE status IN ('pending', 'dispatching');
+
     CREATE TABLE IF NOT EXISTS trader_decisions (
       id                      TEXT PRIMARY KEY,
       signal_id               TEXT NOT NULL REFERENCES trader_signals(id),

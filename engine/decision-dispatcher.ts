@@ -13,6 +13,16 @@ import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { logger } from '../logger.js'
 
+export interface AutoDispatchResult {
+  signalId:  string
+  asset:     string
+  side:      'buy' | 'sell'
+  action:    'executed' | 'suppressed' | 'skipped'
+  reason:    string
+  sizeUsd?:  number
+  strategy?: string
+}
+
 // Phase 2 hard cap: committee can size up to this via the size_multiplier.
 // Raised from $100 default in Task 9 once paper trades pass QA.
 const COMMITTEE_MAX_SIZE_USD = 200
@@ -233,6 +243,176 @@ export async function dispatchApproval(
     const msg = err instanceof Error ? err.message : String(err)
     return `Trade blocked by engine: ${msg}. No order placed.`
   }
+}
+
+export interface AutoDispatchDeps {
+  send:           (text: string) => Promise<void>
+  runCommittee?:  (signal: CommitteeSignalInput, deps: CommitteeDeps) => Promise<CommitteeResult>
+  runAgent?:      CommitteeDeps['runAgent']
+  alertOnReject?: boolean
+}
+
+export async function autoDispatchPendingSignals(
+  db: Database.Database,
+  deps: AutoDispatchDeps,
+  engineClient?: EngineClient,
+): Promise<AutoDispatchResult[]> {
+  const pending = db.prepare(
+    "SELECT * FROM trader_signals WHERE status = 'pending' ORDER BY raw_score DESC",
+  ).all() as any[]
+
+  if (pending.length === 0) return []
+
+  const results: AutoDispatchResult[] = []
+
+  for (const signal of pending) {
+    // Atomic claim -- if another dispatch already grabbed it, changes === 0
+    const claimed = db.prepare(
+      "UPDATE trader_signals SET status = 'dispatching' WHERE id = ? AND status = 'pending'",
+    ).run(signal.id)
+    if (claimed.changes === 0) continue
+
+    try {
+      const strategy = db.prepare(
+        'SELECT id, name, tier, status FROM trader_strategies WHERE id = ?',
+      ).get(signal.strategy_id) as { id: string; name: string; tier: number; status: string } | undefined
+
+      if (!strategy || strategy.status === 'paused') {
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_strategy_paused' WHERE id = ?")
+          .run(signal.id)
+        continue
+      }
+
+      const committeeInput: CommitteeSignalInput = {
+        id:              signal.id,
+        asset:           signal.asset,
+        side:            signal.side,
+        raw_score:       signal.raw_score,
+        horizon_days:    signal.horizon_days,
+        enrichment_json: signal.enrichment_json ?? null,
+      }
+
+      const runCommitteeImpl = deps.runCommittee ?? runCommittee
+      const runAgentImpl     = deps.runAgent ?? (await import('../agent.js')).runAgent
+
+      let committeeResult: CommitteeResult
+      try {
+        committeeResult = await runCommitteeImpl(committeeInput, {
+          runAgent: runAgentImpl,
+          defaultSizeUsd: DEFAULT_SIZE_USD,
+          maxSizeUsd: DEFAULT_SIZE_USD,
+        })
+      } catch (err) {
+        logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
+        db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
+          .run(signal.id)
+        continue
+      }
+
+      storeTranscript(db, committeeResult)
+
+      if (committeeResult.decision === 'abstain') {
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_committee_abstain' WHERE id = ?")
+          .run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', Date.now())
+
+        const result: AutoDispatchResult = {
+          signalId: signal.id,
+          asset:    signal.asset,
+          side:     signal.side as 'buy' | 'sell',
+          action:   'suppressed',
+          strategy: strategy.name,
+          reason:   committeeResult.thesis,
+        }
+        results.push(result)
+        if (deps.alertOnReject) {
+          await deps.send(formatRejectionAlert(result))
+        }
+        continue
+      }
+
+      // Committee approved -- submit to engine
+      if (!engineClient) {
+        const { getEngineClient } = await import('./engine-client.js')
+        engineClient = getEngineClient()
+      }
+
+      const sizeUsd    = committeeResult.size_usd > 0 ? committeeResult.size_usd : DEFAULT_SIZE_USD
+      const decisionId = randomUUID()
+      const now        = Date.now()
+
+      try {
+        await engineClient.submitDecision({
+          decision_id:  decisionId,
+          asset:        signal.asset,
+          side:         committeeResult.action ?? signal.side,
+          size_usd:     sizeUsd,
+          entry_type:   'market',
+          entry_price:  0,
+          strategy:     signal.strategy_id,
+          confidence:   committeeResult.confidence,
+        })
+
+        db.prepare(`
+          INSERT INTO trader_decisions
+            (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, committee_transcript_id, decided_at, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          decisionId, signal.id,
+          committeeResult.action ?? signal.side,
+          signal.asset, sizeUsd, 'market',
+          committeeResult.thesis,
+          committeeResult.confidence,
+          committeeResult.transcript_id,
+          now, 'executed',
+        )
+
+        db.prepare("UPDATE trader_signals SET status = 'executed' WHERE id = ?")
+          .run(signal.id)
+
+        const result: AutoDispatchResult = {
+          signalId: signal.id,
+          asset:    signal.asset,
+          side:     signal.side as 'buy' | 'sell',
+          action:   'executed',
+          strategy: strategy.name,
+          sizeUsd,
+          reason:   committeeResult.thesis,
+        }
+        results.push(result)
+        await deps.send(formatExecutionAlert(result, signal.raw_score, strategy.tier))
+      } catch (err) {
+        logger.error({ err, signalId: signal.id, decisionId }, 'Engine submission failed during auto-dispatch')
+        db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
+          .run(signal.id)
+      }
+
+    } catch (err) {
+      logger.error({ err, signalId: signal.id }, 'Unexpected error in autoDispatch loop')
+      db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
+        .run(signal.id)
+    }
+  }
+
+  return results
+}
+
+function formatExecutionAlert(r: AutoDispatchResult, score: number, tier: number): string {
+  const side = r.side.toUpperCase()
+  return [
+    `EXECUTED: ${side} ${r.asset} $${r.sizeUsd} @ market`,
+    `Strategy: ${r.strategy} | Score: ${score.toFixed(2)} | Tier ${tier}`,
+    `Committee: approved`,
+    r.reason,
+  ].join('\n')
+}
+
+function formatRejectionAlert(r: AutoDispatchResult): string {
+  return [
+    `SKIPPED: ${r.side.toUpperCase()} ${r.asset} (committee abstained)`,
+    r.reason,
+    'Suppressed 24h',
+  ].join('\n')
 }
 
 /**

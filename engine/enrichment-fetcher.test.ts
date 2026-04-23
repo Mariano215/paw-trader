@@ -11,11 +11,11 @@ function makeDb() {
   return db
 }
 
-function insertSignal(db: Database.Database, id: string, asset: string, enrichment: string | null = null) {
+function insertSignal(db: Database.Database, id: string, asset: string, enrichment: string | null = null, side: string = 'buy') {
   db.prepare(`
     INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
-    VALUES (?, 'momentum-stocks', ?, 'buy', 0.72, 14, ?, ?, 'pending')
-  `).run(id, asset, enrichment, Date.now())
+    VALUES (?, 'momentum-stocks', ?, ?, 0.72, 14, ?, ?, 'pending')
+  `).run(id, asset, side, enrichment, Date.now())
 }
 
 function makePrices(closes: number[]) {
@@ -79,14 +79,14 @@ describe('enrichPendingSignals', () => {
   })
 
   it('deduplicates price fetches for same asset', async () => {
-    insertSignal(db, 'sig-a', 'AAPL')
-    insertSignal(db, 'sig-b', 'AAPL')
+    insertSignal(db, 'sig-a', 'AAPL', null, 'buy')
+    insertSignal(db, 'sig-b', 'AAPL', null, 'sell')
     const closes = Array.from({ length: 20 }, (_, i) => 150 + i)
     const client = makeClient({ AAPL: closes })
 
     const count = await enrichPendingSignals(db, client as unknown as EngineClient)
     expect(count).toBe(2)
-    expect(vi.mocked(client.getPrices)).toHaveBeenCalledTimes(1)  // fetched once
+    expect(vi.mocked(client.getPrices)).toHaveBeenCalledTimes(1)  // fetched once (same asset, different sides)
   })
 
   it('skips signal gracefully when engine returns no bars', async () => {

@@ -206,10 +206,10 @@ function initTraderPage() {
   if (!_traderPollStarted) {
     _traderPollStarted = true;
     addPollingInterval(refreshTraderOverview, 60000);
-    addPollingInterval(refreshTraderStatus, 15000);
-    addPollingInterval(refreshTraderPositions, 15000);
-    addPollingInterval(refreshTraderRisk, 15000);
-    addPollingInterval(refreshTraderSignalQueue, 15000);
+    addPollingInterval(refreshTraderStatus, 5000);
+    addPollingInterval(refreshTraderPositions, 5000);
+    addPollingInterval(refreshTraderRisk, 5000);
+    addPollingInterval(refreshTraderSignalQueue, 5000);
     addPollingInterval(refreshTraderDecisions, 30000);
     addPollingInterval(refreshTraderCommitteeReport, 60000);
     addPollingInterval(refreshTraderTrackRecords, 60000);
@@ -1311,7 +1311,7 @@ function renderTraderSignalQueue(pending, history, container) {
   table.className = 'trader-table';
   var thead = document.createElement('thead');
   var headerRow = document.createElement('tr');
-  ['When', 'Asset', 'Side', 'Conf', 'Response', 'Outcome'].forEach(function(h) {
+  ['When', 'Asset', 'Side', 'Conf', 'Response', 'Outcome', ''].forEach(function(h) {
     var th = document.createElement('th');
     th.textContent = h;
     headerRow.appendChild(th);
@@ -1346,7 +1346,74 @@ function renderTraderSignalQueue(pending, history, container) {
       tr.appendChild(td);
     });
 
+    // Committee expand button
+    var committeeTd = document.createElement('td');
+    var committeeBtn = document.createElement('button');
+    committeeBtn.textContent = 'Committee';
+    committeeBtn.style.cssText = 'font-size:0.75rem;padding:2px 7px;border-radius:8px;border:1px solid rgba(128,128,128,0.35);background:transparent;color:inherit;cursor:pointer;opacity:0.7;';
+    committeeBtn.title = 'Show committee reasoning';
+    var expandRow = document.createElement('tr');
+    var expandTd = document.createElement('td');
+    expandTd.colSpan = 7;
+    expandTd.style.cssText = 'padding:0;';
+    expandRow.appendChild(expandTd);
+    expandRow.style.display = 'none';
+    var expanded = false;
+    committeeBtn.addEventListener('click', function() {
+      if (expanded) {
+        expandRow.style.display = 'none';
+        expanded = false;
+        committeeBtn.textContent = 'Committee';
+        return;
+      }
+      committeeBtn.textContent = 'Loading...';
+      committeeBtn.disabled = true;
+      fetchFromAPI('/api/v1/trader/signals/' + s.id + '/committee').then(function(data) {
+        committeeBtn.disabled = false;
+        committeeBtn.textContent = 'Committee';
+        var inner = document.createElement('div');
+        inner.style.cssText = 'padding:8px 12px;font-size:0.82rem;opacity:0.9;border-top:1px solid rgba(128,128,128,0.15);background:rgba(128,128,128,0.04);white-space:pre-wrap;word-break:break-word;';
+        if (!data || !data.transcript) {
+          inner.textContent = 'No committee decision yet.';
+        } else {
+          var t = data.transcript;
+          var body = t.body;
+          var lines = [];
+          lines.push('Rounds: ' + t.rounds + '  |  Tokens: ' + t.total_tokens + '  |  Cost: $' + Number(t.total_cost_usd).toFixed(4));
+          if (body && body.coordinator) {
+            lines.push('Coordinator: ' + (body.coordinator.consensus_direction || '') + '  avg conf ' + (body.coordinator.avg_confidence != null ? Number(body.coordinator.avg_confidence).toFixed(2) : '-'));
+          }
+          if (body && body.risk_officer) {
+            var ro = body.risk_officer;
+            lines.push('Risk officer: ' + (ro.veto ? 'VETO' : 'pass') + (ro.reason ? '  ' + ro.reason : ''));
+          }
+          if (body && body.trader) {
+            var tr2 = body.trader;
+            lines.push('Trader: ' + (tr2.action || '') + '  conf ' + (tr2.confidence != null ? Number(tr2.confidence).toFixed(2) : '-') + (tr2.thesis ? '  ' + tr2.thesis : ''));
+          }
+          inner.textContent = lines.join('\n');
+        }
+        expandTd.textContent = '';
+        expandTd.appendChild(inner);
+        expandRow.style.display = '';
+        expanded = true;
+      }).catch(function(err) {
+        committeeBtn.disabled = false;
+        committeeBtn.textContent = 'Committee';
+        expandTd.textContent = '';
+        var errDiv = document.createElement('div');
+        errDiv.style.cssText = 'padding:6px 12px;font-size:0.8rem;color:#f44336;';
+        errDiv.textContent = 'Failed to load committee: ' + String(err);
+        expandTd.appendChild(errDiv);
+        expandRow.style.display = '';
+        expanded = true;
+      });
+    });
+    committeeTd.appendChild(committeeBtn);
+    tr.appendChild(committeeTd);
+
     tbody.appendChild(tr);
+    tbody.appendChild(expandRow);
   });
   table.appendChild(tbody);
   appendTraderScrollable(container, table, 360);

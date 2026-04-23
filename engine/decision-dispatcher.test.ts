@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
-import { dispatchApproval } from './decision-dispatcher.js'
+import { dispatchApproval, autoDispatchPendingSignals } from './decision-dispatcher.js'
 import type { EngineClient } from './engine-client.js'
 import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
 import type { LadderResult } from './autonomy-ladder.js'
@@ -412,5 +412,91 @@ describe('decision-dispatcher', () => {
     expect(submitCall.size_usd).toBe(200)
     // getNav must be consulted -- zero means "no explicit cap", not "cap at zero"
     expect(mockClient.getNav).toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// autoDispatchPendingSignals
+// ---------------------------------------------------------------------------
+
+describe('autoDispatchPendingSignals', () => {
+  let testDb: Database.Database
+
+  beforeEach(() => {
+    testDb = new Database(':memory:')
+    testDb.pragma('foreign_keys = OFF')
+    initTraderTables(testDb)
+  })
+
+  it('marks signal suppressed_committee_abstain when committee abstains', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s1','momentum-stocks','AAPL','buy',0.8,3,?,'pending')`).run(Date.now())
+
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'low conviction', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-1',
+      transcript: {
+        signal_id: 'auto-s1', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'low conviction', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'low conviction', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
+    const row = testDb.prepare("SELECT status FROM trader_signals WHERE id='auto-s1'").get() as any
+    expect(row.status).toBe('suppressed_committee_abstain')
+  })
+
+  it('sends a Telegram alert after suppression when alertOnReject=true', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s2','momentum-stocks','MSFT','buy',0.75,3,?,'pending')`).run(Date.now())
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'thin data', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-2',
+      transcript: {
+        signal_id: 'auto-s2', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'thin data', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'thin data', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee, alertOnReject: true })
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0][0]).toContain('MSFT')
+  })
+
+  it('does not double-dispatch: atomic claim prevents concurrent duplicates', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s3','momentum-stocks','AMZN','buy',0.8,3,?,'pending')`).run(Date.now())
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'ok', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-3',
+      transcript: {
+        signal_id: 'auto-s3', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'ok', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'ok', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    // Call twice sequentially (not concurrent -- SQLite is single-threaded)
+    // First call should process, second should find no pending signals
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
+    expect(stubCommittee).toHaveBeenCalledTimes(1)
   })
 })

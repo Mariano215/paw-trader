@@ -1874,3 +1874,103 @@ describe('GET /api/v1/trader/strategies/:id/verdicts strategy_status (Phase 5 Ta
     expect(body2.strategy_status).toBe('paused')
   })
 })
+
+// ===========================================================================
+// Task 6 Sub-task B -- GET /api/v1/trader/signals/:id/committee
+// ===========================================================================
+
+describe('GET /api/v1/trader/signals/:id/committee', () => {
+  const COMMITTEE_SIGNAL_ID = 'committee-sig-1'
+  const COMMITTEE_SIGNAL_NO_TR = 'committee-sig-no-tr'
+  const COMMITTEE_TRANSCRIPT_ID = 'tr-committee-1'
+
+  beforeAll(() => {
+    testDb.prepare(`DELETE FROM trader_committee_transcripts WHERE id = ?`).run(COMMITTEE_TRANSCRIPT_ID)
+    testDb.prepare(`DELETE FROM trader_signals WHERE id IN (?, ?)`).run(COMMITTEE_SIGNAL_ID, COMMITTEE_SIGNAL_NO_TR)
+    testDb.prepare(`DELETE FROM trader_strategies WHERE id = 'committee-strategy'`).run()
+
+    testDb.prepare(`
+      INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('committee-strategy', 'Committee Test', 'stocks', 0, 'active', '{}', 1, 1)
+    `).run()
+
+    testDb.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES (?, 'committee-strategy', 'AAPL', 'buy', 0.75, 5, NULL, ?, 'routed')
+    `).run(COMMITTEE_SIGNAL_ID, 1_700_000_500_000)
+
+    testDb.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES (?, 'committee-strategy', 'MSFT', 'sell', 0.55, 3, NULL, ?, 'routed')
+    `).run(COMMITTEE_SIGNAL_NO_TR, 1_700_000_600_000)
+
+    testDb.prepare(`
+      INSERT INTO trader_committee_transcripts (id, signal_id, transcript_json, rounds, total_tokens, total_cost_usd, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      COMMITTEE_TRANSCRIPT_ID,
+      COMMITTEE_SIGNAL_ID,
+      JSON.stringify(SAMPLE_TRANSCRIPT),
+      2,
+      1100,
+      0.03,
+      1_700_000_510_000,
+    )
+  })
+
+  it('returns the parsed transcript for a signal that has one', async () => {
+    const res = await httpReq(
+      srv, 'GET', `/api/v1/trader/signals/${COMMITTEE_SIGNAL_ID}/committee`,
+      { headers: tok(adminToken) },
+    )
+    expect(res.status).toBe(200)
+    const body = res.body as {
+      transcript: {
+        id: string; signal_id: string; rounds: number; total_tokens: number;
+        total_cost_usd: number; body: typeof SAMPLE_TRANSCRIPT
+      } | null
+    }
+    expect(body.transcript).not.toBeNull()
+    expect(body.transcript!.id).toBe(COMMITTEE_TRANSCRIPT_ID)
+    expect(body.transcript!.signal_id).toBe(COMMITTEE_SIGNAL_ID)
+    expect(body.transcript!.rounds).toBe(2)
+    expect(body.transcript!.total_tokens).toBe(1100)
+    expect(body.transcript!.body.trader.action).toBe('buy')
+  })
+
+  it('returns { transcript: null } when the signal has no transcript', async () => {
+    const res = await httpReq(
+      srv, 'GET', `/api/v1/trader/signals/${COMMITTEE_SIGNAL_NO_TR}/committee`,
+      { headers: tok(adminToken) },
+    )
+    expect(res.status).toBe(200)
+    const body = res.body as { transcript: null }
+    expect(body.transcript).toBeNull()
+  })
+
+  it('returns 404 for an unknown signal id', async () => {
+    const res = await httpReq(
+      srv, 'GET', '/api/v1/trader/signals/no-such-signal/committee',
+      { headers: tok(adminToken) },
+    )
+    expect(res.status).toBe(404)
+  })
+
+  it('returns 401 when unauthenticated', async () => {
+    const res = await httpReq(srv, 'GET', `/api/v1/trader/signals/${COMMITTEE_SIGNAL_ID}/committee`)
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 503 when the bot DB is unavailable', async () => {
+    botDbAvailable = false
+    try {
+      const res = await httpReq(
+        srv, 'GET', `/api/v1/trader/signals/${COMMITTEE_SIGNAL_ID}/committee`,
+        { headers: tok(adminToken) },
+      )
+      expect(res.status).toBe(503)
+    } finally {
+      botDbAvailable = true
+    }
+  })
+})

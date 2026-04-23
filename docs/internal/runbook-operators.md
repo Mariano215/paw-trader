@@ -1,11 +1,12 @@
 # Runbook: Multi-Operator Alert Routing
 
-_Last updated: 2026-04-19 (Phase 6 Task 6)_
+_Last updated: 2026-04-23 (full-auto pipeline)_
 
-The Paw Trader broadcasts every alert, halt notice, timeout notice, and
-approval card to a configured list of Telegram chat ids. Any operator on
-the list can reply APPROVE, SKIP, PAUSE STRATEGY, or tap an inline button.
-First tap wins -- the database claim is race-safe.
+The Paw Trader broadcasts execution alerts, rejection alerts, and halt
+notices to a configured list of Telegram chat ids. Signals no longer require
+manual approval -- the committee decides automatically and sends an
+informational alert. Operators can still override via Telegram reply (skip/pause)
+on execution alerts, but are never required to act.
 
 This runbook covers the precedence rules, how to add a new operator, and
 what "best-effort" means for the broadcast.
@@ -71,24 +72,19 @@ Drop their id from whichever list they appear on and restart. There is
 no dashboard toggle for a single operator -- the list is the source of
 truth.
 
-## First-tap-wins on approvals
+## Manual override via Telegram reply
 
-Every operator sees the same approval card with the same callback_data
-encoding the `approval_id`. When any one of them taps a button:
+The approval gate is gone. Signals are auto-dispatched to the committee and
+executed or suppressed without operator action. Operators receive plain-text
+alerts after each decision.
 
-1. `handleTraderButtonCallback` runs the claim UPDATE
-   `WHERE responded_at IS NULL`.
-2. The first tap sets `responded_at` and `response`; subsequent taps
-   find zero changed rows and the handler returns null.
-3. Only the winning tap fires the downstream dispatch.
+Overrides still work on execution alerts:
+- Reply `skip` -- attempts to cancel the order if still open
+- Reply `pause` -- pauses the strategy (no new signals submitted)
 
-This is tested in `src/trader/telegram-reply-handler.test.ts` by the
-"returns null when approval already claimed (duplicate tap)" case, which
-covers the multi-operator race directly: two calls for the same
-approvalId, one wins, one returns null.
-
-The same claim also protects text replies (`tryHandleApprovalReply`) so
-a mix of button taps and `APPROVE` replies cannot double-execute.
+The reply handler (`telegram-reply-handler.ts`) matches inbound text against
+open approvals the same way as before; the claim UPDATE is still race-safe
+for the case where multiple operators reply simultaneously.
 
 ## Best-effort delivery
 

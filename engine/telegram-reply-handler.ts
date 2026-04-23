@@ -60,7 +60,11 @@ export function handleTraderButtonCallback(
   if (!row) return null
 
   if (action === 'skip') {
-    recordSignalSuppressionBySignalId(db, row.decision_id, 'skip')
+    bulkSkipMatchingSignals(db, row.decision_id)
+  }
+
+  if (action === 'pause') {
+    db.prepare("UPDATE trader_signals SET status='paused' WHERE id=?").run(row.decision_id)
   }
 
   return {
@@ -125,7 +129,12 @@ export function handleTraderSignalAction(
   }
 
   if (action === 'skip') {
-    recordSignalSuppressionBySignalId(db, signalId, 'skip', now)
+    bulkSkipMatchingSignals(db, signalId, now)
+  }
+
+  if (action === 'pause') {
+    // Mark only the actioned signal -- the strategy pause handles future signals
+    db.prepare("UPDATE trader_signals SET status='paused' WHERE id=?").run(signalId)
   }
 
   return {
@@ -134,6 +143,57 @@ export function handleTraderSignalAction(
     action,
     override_size,
     fromUserId,
+  }
+}
+
+/**
+ * Mark the actioned signal as 'skipped' and bulk-skip ALL other pending
+ * signals for the same strategy+asset+side. Records a suppression for each
+ * so the 24-hour cooldown applies to the whole cohort, not just the one
+ * signal the user clicked.
+ *
+ * This prevents the queue from staying full when the engine generates
+ * multiple signals for the same asset in the same cycle.
+ */
+function bulkSkipMatchingSignals(
+  db: Database.Database,
+  signalId: string,
+  now = Date.now(),
+): void {
+  // Get strategy+asset+side for this signal
+  const anchor = db.prepare(`
+    SELECT strategy_id, asset, side
+    FROM trader_signals
+    WHERE id = ?
+  `).get(signalId) as { strategy_id: string; asset: string; side: string } | undefined
+
+  if (!anchor) {
+    // Fallback: at least suppress the one signal
+    recordSignalSuppressionBySignalId(db, signalId, 'skip', now)
+    db.prepare("UPDATE trader_signals SET status='skipped' WHERE id=?").run(signalId)
+    return
+  }
+
+  // Find all pending signals for same strategy+asset+side
+  const siblings = db.prepare(`
+    SELECT id FROM trader_signals
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+  `).all(anchor.strategy_id, anchor.asset, anchor.side) as { id: string }[]
+
+  // Bulk status update
+  db.prepare(`
+    UPDATE trader_signals
+    SET status = 'skipped'
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+  `).run(anchor.strategy_id, anchor.asset, anchor.side)
+
+  // Record suppression for each (including the actioned one)
+  for (const s of siblings) {
+    recordSignalSuppressionBySignalId(db, s.id, 'skip', now)
+  }
+  // Always ensure the actioned signal itself is suppressed even if not in siblings
+  if (!siblings.find(s => s.id === signalId)) {
+    recordSignalSuppressionBySignalId(db, signalId, 'skip', now)
   }
 }
 
@@ -198,7 +258,11 @@ export function tryHandleApprovalReply(
   if (claimed.changes === 0) return null  // another handler already claimed this row
 
   if (action === 'skip') {
-    recordSignalSuppressionBySignalId(db, pending.decision_id, 'skip')
+    bulkSkipMatchingSignals(db, pending.decision_id)
+  }
+
+  if (action === 'pause') {
+    db.prepare("UPDATE trader_signals SET status='paused' WHERE id=?").run(pending.decision_id)
   }
 
   return {

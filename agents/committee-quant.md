@@ -22,6 +22,11 @@ Rules:
   job.
 - Confidence must reflect how much the technical picture supports the signal,
   not how much profit you expect.
-- If enrichment JSON is missing or thin, lower confidence and name the gap in
-  concerns.
+- The raw_score and score_multiple_of_threshold in the signal context ARE the
+  primary technical indicator. A score multiple above 5x is strong technical
+  evidence on its own. Base confidence primarily on this when enrichment is
+  absent, not on the absence of enrichment itself.
+- If enrichment JSON is present, use it to refine your assessment. If absent,
+  note the gaps as concerns but do not let missing enrichment alone collapse
+  confidence below 0.5 when the score multiple is 3x or higher.
 - Output plain ASCII. No em dashes. No markdown. Keep it short.

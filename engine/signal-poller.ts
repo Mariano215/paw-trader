@@ -31,26 +31,60 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'pending')
   `)
 
+  // Check if a pending signal already exists for this strategy+asset+side.
+  // Prevents the engine from flooding the queue with duplicate signals in
+  // one poll cycle or across cycles when the user has not acted yet.
+  const hasPending = db.prepare(`
+    SELECT 1 FROM trader_signals
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+    LIMIT 1
+  `)
+
   const insertMany = db.transaction((items: typeof candidates) => {
     let stored = 0
     let filtered = 0
+    let deduped = 0
+    // Track which strategy+asset+side combos we have already inserted this
+    // cycle to handle batches where the engine returns multiple IDs for the
+    // same opportunity.
+    const seenThisCycle = new Set<string>()
+
     for (const c of items) {
       if (Math.abs(c.raw_score) < SCORE_THRESHOLD) {
         filtered += 1
         continue
       }
+
+      const strategyId = resolveStrategyId(c.strategy, c.asset)
+      const key = `${strategyId}|${c.asset}|${c.side}`
+
+      // Skip if already seen in this batch
+      if (seenThisCycle.has(key)) {
+        deduped += 1
+        continue
+      }
+
+      // Skip if a pending signal already exists in the DB for this slot
+      const existing = hasPending.get(strategyId, c.asset, c.side)
+      if (existing) {
+        deduped += 1
+        seenThisCycle.add(key)
+        continue
+      }
+
       insert.run(
         c.id,
-        resolveStrategyId(c.strategy, c.asset),
+        strategyId,
         c.asset,
         c.side,
         c.raw_score,
         c.horizon_days,
         c.generated_at,
       )
+      seenThisCycle.add(key)
       stored += 1
     }
-    return { stored, filtered }
+    return { stored, filtered, deduped }
   })
 
   const result = insertMany(candidates)
@@ -59,6 +93,7 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
       fetched: candidates.length,
       stored: result.stored,
       filtered: result.filtered,
+      deduped: result.deduped,
       threshold: SCORE_THRESHOLD,
     },
     'Trader signal poll complete',

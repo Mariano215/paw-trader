@@ -147,6 +147,9 @@ export async function dispatchApproval(
     )
     recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', now)
     db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
+    // Close any other pending signals for the same asset+side: the committee
+    // verdict already covers them and they should not re-queue.
+    closeSiblingPendingSignals(db, signal.id, signal.strategy_id, signal.asset, signal.side, now)
     return `Committee abstained. ${committeeResult.thesis}`
   }
 
@@ -222,10 +225,49 @@ export async function dispatchApproval(
     )
 
     db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
+    // Close any pending duplicates for the same asset+side -- trade already placed.
+    closeSiblingPendingSignals(db, signal.id, signal.strategy_id, signal.asset, signal.side, now)
 
     return `Order placed. Asset: ${signal.asset}, Size: $${result.approved_size_usd}, Confidence: ${committeeResult.confidence.toFixed(2)}, Status: ${result.status}, ID: ${result.client_order_id.slice(0, 8)}...`
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return `Trade blocked by engine: ${msg}. No order placed.`
   }
+}
+
+/**
+ * Bulk-close all pending signals for the same strategy+asset+side EXCEPT the
+ * actioned signal itself. Used after a committee verdict (approve or abstain)
+ * so duplicate signals from the same engine cycle don't pile up in the queue.
+ * Records a committee_abstain suppression for each closed sibling so the
+ * 24-hour cooldown prevents immediate re-alerts.
+ */
+function closeSiblingPendingSignals(
+  db: Database.Database,
+  excludeSignalId: string,
+  strategyId: string,
+  asset: string,
+  side: string,
+  now = Date.now(),
+): void {
+  const siblings = db.prepare(`
+    SELECT id FROM trader_signals
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+      AND id != ?
+  `).all(strategyId, asset, side, excludeSignalId) as { id: string }[]
+
+  if (siblings.length === 0) return
+
+  db.prepare(`
+    UPDATE trader_signals
+    SET status = 'decided'
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+      AND id != ?
+  `).run(strategyId, asset, side, excludeSignalId)
+
+  for (const s of siblings) {
+    recordSignalSuppressionBySignalId(db, s.id, 'committee_abstain', now)
+  }
+
+  logger.info({ strategyId, asset, side, count: siblings.length }, 'Closed sibling pending signals after committee verdict')
 }

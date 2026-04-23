@@ -62,7 +62,11 @@ router.get('/api/v1/trader/signals', (req: Request, res: Response) => {
     : DEFAULT_LIMIT
 
   try {
-    const rows = bdb.prepare(`
+    // Pending: signal status is still 'pending' -- the skip/approve action
+    // updates status so this clears immediately after any action.
+    // Latest approval joined via subquery to avoid fanout when multiple
+    // approval attempts exist for one signal.
+    const pending = bdb.prepare(`
       SELECT
         s.id,
         a.id           AS approval_id,
@@ -77,14 +81,42 @@ router.get('/api/v1/trader/signals', (req: Request, res: Response) => {
         d.size_usd,
         d.decided_at
       FROM trader_signals s
-      LEFT JOIN trader_approvals a ON a.decision_id = s.id
-      LEFT JOIN trader_decisions d ON d.signal_id  = s.id
+      LEFT JOIN trader_approvals a ON a.id = (
+        SELECT id FROM trader_approvals
+        WHERE decision_id = s.id
+        ORDER BY sent_at DESC LIMIT 1
+      )
+      LEFT JOIN trader_decisions d ON d.signal_id = s.id
+      WHERE s.status = 'pending'
       ORDER BY s.generated_at DESC
       LIMIT ?
     `).all(limit) as SignalRow[]
 
-    const pending = rows.filter(r => r.approval_response === null && r.responded_at === null)
-    const history = rows.filter(r => r.approval_response !== null || r.responded_at !== null)
+    const history = bdb.prepare(`
+      SELECT
+        s.id,
+        a.id           AS approval_id,
+        s.asset,
+        s.side,
+        s.raw_score,
+        s.status       AS signal_status,
+        s.generated_at,
+        a.response     AS approval_response,
+        a.responded_at,
+        d.status       AS decision_status,
+        d.size_usd,
+        d.decided_at
+      FROM trader_signals s
+      LEFT JOIN trader_approvals a ON a.id = (
+        SELECT id FROM trader_approvals
+        WHERE decision_id = s.id
+        ORDER BY sent_at DESC LIMIT 1
+      )
+      LEFT JOIN trader_decisions d ON d.signal_id = s.id
+      WHERE s.status != 'pending'
+      ORDER BY s.generated_at DESC
+      LIMIT ?
+    `).all(limit) as SignalRow[]
 
     res.json({ pending, history })
   } catch (err) {

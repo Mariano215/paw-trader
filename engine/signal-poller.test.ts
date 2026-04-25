@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedAllStrategies, seedMomentumStrategy } from './strategy-manager.js'
+
+// Tuesday 2026-04-21 10:00 ET = 14:00 UTC — always within NYSE market hours
+const MARKET_HOURS_TS = new Date('2026-04-21T14:00:00Z').getTime()
 import {
   pollAndStoreSignals,
   getPendingSignals,
@@ -29,7 +32,7 @@ const makeCandidate = (
   side: 'buy' as const,
   raw_score: score,
   horizon_days: horizon,
-  generated_at: Date.now(),
+  generated_at: MARKET_HOURS_TS,
 })
 
 describe('signal-poller', () => {
@@ -109,9 +112,9 @@ describe('signal-poller', () => {
 
   it('deduplicates same asset+side across different strategy names in one batch', async () => {
     const candidates = [
-      { id: 'a1', strategy: 'momentum-stocks',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: Date.now() },
-      { id: 'a2', strategy: 'mean-reversion',     asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: Date.now() },
-      { id: 'a3', strategy: 'momentum-crypto',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: Date.now() },
+      { id: 'a1', strategy: 'momentum-stocks',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a2', strategy: 'mean-reversion',     asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a3', strategy: 'momentum-crypto',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ]
     vi.mocked(mockClient.getSignals!).mockResolvedValue(candidates)
     await pollAndStoreSignals(db, mockClient as EngineClient)
@@ -121,12 +124,12 @@ describe('signal-poller', () => {
 
   it('deduplicates same asset+side across sequential poll cycles (different strategy IDs)', async () => {
     vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
-      { id: 'b1', strategy: 'momentum', asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: Date.now() },
+      { id: 'b1', strategy: 'momentum', asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ])
     await pollAndStoreSignals(db, mockClient as EngineClient)
 
     vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
-      { id: 'b2', strategy: 'mean-reversion', asset: 'AAPL', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: Date.now() },
+      { id: 'b2', strategy: 'mean-reversion', asset: 'AAPL', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ])
     await pollAndStoreSignals(db, mockClient as EngineClient)
 

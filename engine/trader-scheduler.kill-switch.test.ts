@@ -25,6 +25,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 
+// Tuesday 2026-04-21 10:00 ET = 14:00 UTC — always within NYSE market hours
+const MARKET_HOURS_TS = new Date('2026-04-21T14:00:00Z').getTime()
+
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import { runTraderTick, _resetHaltAlertForTest } from './trader-scheduler.js'
@@ -173,7 +176,7 @@ describe('runTraderTick + kill switch', () => {
         side: 'buy',
         raw_score: 0.72,
         horizon_days: 20,
-        generated_at: Date.now(),
+        generated_at: MARKET_HOURS_TS,
       },
     ])
 

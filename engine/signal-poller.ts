@@ -39,12 +39,15 @@ interface StoredSignal {
   status: string
 }
 
-export async function pollAndStoreSignals(db: Database.Database, client: EngineClient): Promise<void> {
+export async function pollAndStoreSignals(
+  db: Database.Database,
+  client: EngineClient,
+): Promise<{ fetched: number }> {
   let candidates
   try {
     candidates = await client.getSignals(30)
   } catch {
-    return  // engine unreachable -- skip cycle, do not throw
+    return { fetched: 0 }  // engine unreachable -- skip cycle, do not throw
   }
 
   const insert = db.prepare(`
@@ -128,6 +131,7 @@ export async function pollAndStoreSignals(db: Database.Database, client: EngineC
     },
     'Trader signal poll complete',
   )
+  return { fetched: candidates.length }
 }
 
 /**

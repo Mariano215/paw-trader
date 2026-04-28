@@ -12,6 +12,10 @@ import {
   evaluateAndRecordCoinbaseHealth,
   evaluateAndRecordNavDrop,
   recordAlertFired,
+  checkSignalDrought,
+  SIGNAL_DROUGHT_ALERT_ID,
+  evaluateAlpacaHealth,
+  ALPACA_DOWN_ALERT_ID,
 } from './monitor.js'
 import { checkKillSwitch } from '../cost/kill-switch-client.js'
 import { BOT_API_TOKEN, DASHBOARD_API_TOKEN, DASHBOARD_URL } from '../config.js'
@@ -75,6 +79,14 @@ let _engineUnreachableAlertSent = false
 const ENGINE_UNREACHABLE_THRESHOLD = 3  // 3 × 5-min ticks = 15 min before alerting
 
 /**
+ * Consecutive zero-fetched poll counter.  Incremented each tick that the
+ * signal poll returns fetched=0; reset to zero when fetched>0 or when the
+ * poll fails entirely.  Passed to checkSignalDrought in the monitor phase
+ * so it can fire the drought alert after 1 hour of silence.
+ */
+let _consecutiveZeroPollCount = 0
+
+/**
  * Start the trader tick. Each tick:
  *  1. Checks engine health and alerts if reconciler is halted (once per halt event).
  *  2. Polls the engine for new signals and stores them in trader_signals.
@@ -109,6 +121,7 @@ export function stopTraderScheduler(): void {
   if (intervalHandle) {
     clearInterval(intervalHandle)
     intervalHandle = null
+    _consecutiveZeroPollCount = 0
     logger.info('Trader scheduler stopped')
   }
 }
@@ -207,9 +220,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   // 1. Poll engine for fresh signals.
   try {
     const client = deps.getEngineClient()
-    await pollAndStoreSignals(deps.db, client)
+    const pollResult = await pollAndStoreSignals(deps.db, client)
     polled = true
+    _consecutiveZeroPollCount = pollResult.fetched === 0
+      ? _consecutiveZeroPollCount + 1
+      : 0
   } catch (err) {
+    _consecutiveZeroPollCount = 0
     logger.warn({ err }, 'Trader tick: signal poll failed')
   }
 
@@ -446,6 +463,21 @@ async function runMonitorPhase(deps: TraderSchedulerDeps): Promise<void> {
   // without taking down abstain + sharpe.  The other phases of the
   // trader tick already follow this same "try once, log, fall through"
   // pattern.
+  // 5. Signal drought alert -- runs unconditionally (no engine client needed).
+  //    Fires after 1 hour of consecutive zero-fetched polls so a broken
+  //    signal generator (e.g. Alpaca DNS timeout) surfaces to the operator
+  //    within an hour rather than silently going unnoticed for days.
+  try {
+    const drought = checkSignalDrought(deps.db, nowMs, _consecutiveZeroPollCount)
+    if (drought.fire && drought.message) {
+      recordAlertFired(deps.db, SIGNAL_DROUGHT_ALERT_ID, nowMs)
+      await deps.send(drought.message)
+      logger.warn({ consecutiveZeros: _consecutiveZeroPollCount }, 'Trader tick: signal drought alert sent')
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader tick: signal drought check failed')
+  }
+
   let client: EngineClient | null = null
   try {
     client = deps.getEngineClient()
@@ -500,5 +532,19 @@ async function runMonitorPhase(deps: TraderSchedulerDeps): Promise<void> {
     }
   } catch (err) {
     logger.error({ err }, 'Trader tick: NAV drop check failed')
+  }
+
+  // 6. Alpaca health alert -- fires when alpaca_connected === false persists
+  //    for 15+ min.  Separate from the Coinbase check; both brokers are
+  //    monitored independently.
+  try {
+    const alpaca = await evaluateAlpacaHealth(deps.db, nowMs, () => client!.getHealth())
+    if (alpaca.fire && alpaca.message) {
+      recordAlertFired(deps.db, ALPACA_DOWN_ALERT_ID, nowMs)
+      await deps.send(alpaca.message)
+      logger.warn('Trader tick: Alpaca health alert sent')
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader tick: Alpaca health check failed')
   }
 }

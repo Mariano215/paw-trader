@@ -524,3 +524,109 @@ export async function evaluateAndRecordNavDrop(
     drop_pct: dropPct,
   }
 }
+
+// ---------------------------------------------------------------------------
+// 2e. checkSignalDrought -- fires when consecutive zero-fetched poll ticks
+//     reach the threshold (default 12 × 5-min ticks = 1 hour).  Intended to
+//     catch engine-side failures (broken DNS, Alpaca timeout, signal job
+//     crash) that produce no signals without raising a health-check error.
+//
+//     Counter is maintained in trader-scheduler.ts (_consecutiveZeroPollCount)
+//     and passed in by the caller.  Pure read -- caller calls recordAlertFired
+//     on fire (same contract as checkAbstainDigest).
+// ---------------------------------------------------------------------------
+const SIGNAL_DROUGHT_TICKS = 12                              // 12 × 5-min = 1 hour
+const SIGNAL_DROUGHT_DEDUP_MS = 2 * 60 * 60 * 1000          // 2 hours between fires
+export const SIGNAL_DROUGHT_ALERT_ID = 'signal_drought'
+
+export function checkSignalDrought(
+  db: Database.Database,
+  nowMs: number,
+  consecutiveZeros: number,
+): AlertCheckResult {
+  if (consecutiveZeros < SIGNAL_DROUGHT_TICKS) {
+    return { fire: false }
+  }
+
+  const dedupRow = db
+    .prepare(`SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?`)
+    .get(SIGNAL_DROUGHT_ALERT_ID) as { last_alerted_at: number } | undefined
+
+  if (dedupRow && nowMs - dedupRow.last_alerted_at < SIGNAL_DROUGHT_DEDUP_MS) {
+    return { fire: false }
+  }
+
+  return {
+    fire: true,
+    message:
+      'Trader: no signals for 1+ hour. Engine signal generators may be stalled. ' +
+      'Check /health and the engine log for Alpaca connectivity errors.',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2f. evaluateAlpacaHealth -- mirrors evaluateAndRecordCoinbaseHealth.
+//     Detects when alpaca_connected === false persists beyond the 15-min
+//     grace window and fires a Telegram once per 2-hour dedup window.
+//     Two trader_alert_state rows: alpaca_first_down (outage clock) and
+//     alpaca_alert (dedup timestamp).  Caller calls recordAlertFired on fire.
+// ---------------------------------------------------------------------------
+const ALPACA_OUTAGE_THRESHOLD_MS = 15 * 60 * 1000           // 15-min grace (same as Coinbase)
+const ALPACA_DEDUP_MS = 2 * 60 * 60 * 1000                  // 2 hours between repeat alerts
+const ALPACA_FIRST_DOWN_ID = 'alpaca_first_down'
+export const ALPACA_DOWN_ALERT_ID = 'alpaca_alert'
+
+export async function evaluateAlpacaHealth(
+  db: Database.Database,
+  nowMs: number,
+  getHealth: () => Promise<{ alpaca_connected?: boolean } | null>,
+): Promise<AlertCheckResult> {
+  let body: { alpaca_connected?: boolean } | null = null
+  try {
+    body = await getHealth()
+  } catch {
+    body = null
+  }
+
+  const isDown = body !== null && body !== undefined && body.alpaca_connected === false
+
+  if (!isDown) {
+    db.prepare(
+      `DELETE FROM trader_alert_state WHERE alert_id = ?`,
+    ).run(ALPACA_FIRST_DOWN_ID)
+    return { fire: false }
+  }
+
+  const firstDownRow = db
+    .prepare(
+      `SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?`,
+    )
+    .get(ALPACA_FIRST_DOWN_ID) as { last_alerted_at: number } | undefined
+
+  if (!firstDownRow) {
+    recordAlertFired(db, ALPACA_FIRST_DOWN_ID, nowMs)
+    return { fire: false }
+  }
+
+  const outageMs = nowMs - firstDownRow.last_alerted_at
+  if (outageMs < ALPACA_OUTAGE_THRESHOLD_MS) {
+    return { fire: false }
+  }
+
+  const lastAlertRow = db
+    .prepare(
+      `SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?`,
+    )
+    .get(ALPACA_DOWN_ALERT_ID) as { last_alerted_at: number } | undefined
+
+  if (lastAlertRow && nowMs - lastAlertRow.last_alerted_at < ALPACA_DEDUP_MS) {
+    return { fire: false }
+  }
+
+  return {
+    fire: true,
+    message:
+      'Trader: Alpaca API unreachable for 15+ min. Signals blocked. ' +
+      'Check WSL2 DNS (resolv.conf) or Alpaca status page.',
+  }
+}

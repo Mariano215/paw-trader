@@ -48,6 +48,7 @@
  * Timestamps are always milliseconds (the ClaudePaw-wide convention).
  */
 import type Database from 'better-sqlite3'
+import { isEquityMarketHours } from './signal-poller.js'
 
 export interface AlertCheckResult {
   fire: boolean
@@ -545,6 +546,17 @@ export function checkSignalDrought(
   consecutiveZeros: number,
 ): AlertCheckResult {
   if (consecutiveZeros < SIGNAL_DROUGHT_TICKS) {
+    return { fire: false }
+  }
+
+  // Off-hours guard: equity strategies are gated to NYSE 09:30-16:00 ET in
+  // signal-poller.ts. Outside those hours the only signal source is the
+  // 24/7 crypto generator, which routinely scores 0.0 in non-breakout
+  // regimes -- a correct, common state, not a stalled engine. Suppressing
+  // the drought alert outside market hours avoids paging the operator at
+  // 22:00 ET on a flat tape. During market hours the alert fires as
+  // before so a real engine outage still surfaces within an hour.
+  if (!isEquityMarketHours(nowMs)) {
     return { fire: false }
   }
 

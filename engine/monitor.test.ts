@@ -15,6 +15,7 @@ import { initTraderTables } from './db.js'
 import { seedAllStrategies } from './strategy-manager.js'
 import {
   checkAbstainDigest,
+  checkSignalDrought,
   evaluateAndRecordSharpeFlip,
   evaluateAndRecordCoinbaseHealth,
   evaluateAndRecordNavDrop,
@@ -29,6 +30,7 @@ import {
   NAV_DROP_WINDOW_MS,
   NAV_DROP_DEDUP_MS,
   NAV_DROP_DEFAULT_THRESHOLD,
+  SIGNAL_DROUGHT_ALERT_ID,
 } from './monitor.js'
 
 function makeDb() {
@@ -741,5 +743,47 @@ describe('monitor: evaluateAndRecordNavDrop', () => {
     ]
     const result = await evaluateAndRecordNavDrop(db, NOW, async () => snapshots)
     expect(result.drop_pct).toBeGreaterThan(0)
+  })
+})
+
+describe('monitor: checkSignalDrought (off-hours gate)', () => {
+  let db: ReturnType<typeof makeDb>
+  // Tuesday Apr 28 2026, 12:00 EDT  -> NYSE OPEN
+  const DURING_HOURS_MS = Date.UTC(2026, 3, 28, 16, 0, 0) // 12:00 EDT == 16:00 UTC
+  // Tuesday Apr 28 2026, 22:00 EDT  -> NYSE CLOSED (after 16:00)
+  const AFTER_HOURS_MS  = Date.UTC(2026, 3, 29,  2, 0, 0) // 22:00 EDT == next-day 02:00 UTC
+  // Saturday Apr 25 2026, 12:00 EDT -> WEEKEND, CLOSED
+  const WEEKEND_MS      = Date.UTC(2026, 3, 25, 16, 0, 0)
+
+  beforeEach(() => { db = makeDb() })
+
+  it('fires when consecutive zero ticks reach threshold during NYSE hours', () => {
+    const result = checkSignalDrought(db, DURING_HOURS_MS, 12)
+    expect(result.fire).toBe(true)
+    expect(result.message).toContain('no signals for 1+ hour')
+  })
+
+  it('suppresses the alert outside NYSE hours even when threshold is reached', () => {
+    const result = checkSignalDrought(db, AFTER_HOURS_MS, 12)
+    expect(result.fire).toBe(false)
+  })
+
+  it('suppresses the alert on weekends', () => {
+    const result = checkSignalDrought(db, WEEKEND_MS, 12)
+    expect(result.fire).toBe(false)
+  })
+
+  it('does not fire below the consecutive-zero threshold during NYSE hours', () => {
+    const result = checkSignalDrought(db, DURING_HOURS_MS, 11)
+    expect(result.fire).toBe(false)
+  })
+
+  it('respects the dedup window during NYSE hours', () => {
+    db.prepare(`
+      INSERT INTO trader_alert_state (alert_id, last_alerted_at)
+      VALUES (?, ?)
+    `).run(SIGNAL_DROUGHT_ALERT_ID, DURING_HOURS_MS - 30 * 60 * 1000) // 30 min ago
+    const result = checkSignalDrought(db, DURING_HOURS_MS, 20)
+    expect(result.fire).toBe(false)
   })
 })

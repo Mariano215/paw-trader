@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
-import { pollAndStoreSignals } from './signal-poller.js'
+import { pollAndStoreSignals, isEquityMarketHours } from './signal-poller.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
@@ -136,6 +136,13 @@ export function _resetTickLockForTest(): void {
   _tickInProgress = false
 }
 
+/** Read + reset the zero-poll counter. Exposed for tests only. */
+export function _getAndResetZeroPollCountForTest(): number {
+  const v = _consecutiveZeroPollCount
+  _consecutiveZeroPollCount = 0
+  return v
+}
+
 /**
  * Execute one tick of the trader loop. Exported for manual runs / tests.
  * Each of the five phases is guarded so a failure in one does not abort the rest.
@@ -222,9 +229,17 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     const client = deps.getEngineClient()
     const pollResult = await pollAndStoreSignals(deps.db, client)
     polled = true
-    _consecutiveZeroPollCount = pollResult.fetched === 0
-      ? _consecutiveZeroPollCount + 1
-      : 0
+    // Only count consecutive zero-fetched ticks during market hours.
+    // Outside NYSE hours equity signals legitimately stop; accumulating
+    // the counter overnight causes a spurious drought alert on the first
+    // market-hours tick of the next session (false positive).
+    if (pollResult.fetched > 0) {
+      _consecutiveZeroPollCount = 0
+    } else if (isEquityMarketHours()) {
+      _consecutiveZeroPollCount++
+    } else {
+      _consecutiveZeroPollCount = 0
+    }
   } catch (err) {
     _consecutiveZeroPollCount = 0
     logger.warn({ err }, 'Trader tick: signal poll failed')

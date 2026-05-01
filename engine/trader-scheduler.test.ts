@@ -8,6 +8,7 @@ import {
   runTraderTick,
   _resetHaltAlertForTest,
   _resetTickLockForTest,
+  _getAndResetZeroPollCountForTest,
 } from './trader-scheduler.js'
 import * as loggerModule from '../logger.js'
 import type { EngineClient } from './engine-client.js'
@@ -574,6 +575,32 @@ describe('trader-scheduler', () => {
           (args[0] as string).includes('engine halt call failed'),
       )
       expect(followUpCalls.length).toBe(1)
+    })
+
+    it('resets zero-poll counter outside market hours so overnight silence does not trigger false drought at open', async () => {
+      vi.useFakeTimers()
+      // 2026-04-30 00:00 UTC = 2026-04-29 20:00 EDT -- outside NYSE 09:30-16:00 window
+      vi.setSystemTime(new Date('2026-04-30T00:00:00Z'))
+
+      // Engine is reachable but returns 0 signals (simulates post-market silence)
+      vi.mocked(engineClient.getSignals!).mockResolvedValue([])
+
+      // Run 15 ticks (> drought threshold of 12); all outside market hours.
+      // Each tick must reset the counter to 0 rather than increment it.
+      for (let i = 0; i < 15; i++) {
+        await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      }
+
+      // Counter must be 0 -- overnight silence must not carry into the next session.
+      expect(_getAndResetZeroPollCountForTest()).toBe(0)
+
+      // No drought alert should have been sent (market was closed for every tick).
+      const droughtCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) =>
+          typeof args[0] === 'string' &&
+          (args[0] as string).includes('no signals for 1+ hour'),
+      )
+      expect(droughtCalls.length).toBe(0)
     })
   })
 

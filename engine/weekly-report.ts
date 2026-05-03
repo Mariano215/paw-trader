@@ -16,11 +16,10 @@
  *     to reuse `renderReportHtml` and pipe the HTML into the browser in a
  *     sibling `saveReportPdf` helper.
  *
- *  2. Email is out of scope. There is no nodemailer dependency and the
- *     Gmail OAuth pipeline lives in `src/social-cli.ts`. Future work can
- *     wire the HTML into that pipeline (subject + HTML body, attachment).
- *     This module deliberately does not reach for that integration to keep
- *     the weekly report's hot path free of OAuth failure modes.
+ *  2. Email delivery: after saving the HTML to disk, `maybeFireWeeklyReport`
+ *     sends the full HTML report to TRADER_REPORT_RECIPIENT via the Gmail
+ *     OAuth pipeline (`src/google/gmail.ts`). Email failures are caught and
+ *     logged; they do not block the Telegram summary or disk save.
  *
  *  3. Kill-switch events are read as a singleton snapshot. The server
  *     `system_state` table stores only the current state, not a historical
@@ -38,6 +37,9 @@ import { logger } from '../logger.js'
 import { listTrackRecords, type StrategyTrackRecord } from './track-record.js'
 import type { EngineClient } from './engine-client.js'
 import type { NavSnapshot } from './types.js'
+import { sendEmail } from '../google/gmail.js'
+
+const TRADER_REPORT_RECIPIENT = process.env.TRADER_REPORT_TO ?? 'security@example.com'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -823,14 +825,8 @@ export function renderReportSummary(report: WeeklyReport): string {
   // ping without opening the HTML report.
   parts.push(formatKillSwitchSummary(report.killSwitchLog))
 
-  // Join with " . " (period + space) so Telegram plain-text is scannable
-  // on mobile without markdown line breaks. "em dashes never" rule kept.
-  const summary = parts.join(' . ')
-  // Defensive: enforce 400 char ceiling. Truncate at a word boundary.
-  if (summary.length <= 400) return summary
-  const clipped = summary.slice(0, 397)
-  const lastSpace = clipped.lastIndexOf(' ')
-  return (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped) + '...'
+  // One stat per line so Telegram renders each metric on its own row.
+  return parts.join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1002,21 @@ export async function maybeFireWeeklyReport(args: {
   // Include the file path on its own line so the operator can jump to it.
   // Plain text only; ChannelManager.send does not pass parse_mode.
   await args.send(`${summary}\nReport: ${filePath}`)
+
+  // Email the full HTML report. Failure is non-fatal -- the Telegram
+  // summary and disk file are already delivered at this point.
+  const dateRange = `${formatDate(weekStartMs)} to ${formatDate(weekEndMs)}`
+  try {
+    await sendEmail({
+      to: TRADER_REPORT_RECIPIENT,
+      subject: `Paw Trader Weekly Report: ${dateRange}`,
+      htmlBody: html,
+    })
+    logger.info({ to: TRADER_REPORT_RECIPIENT }, 'Weekly report: email sent')
+  } catch (err) {
+    logger.warn({ err }, 'Weekly report: email delivery failed; report saved to disk')
+  }
+
   writeLastFireMs(args.db, nowMs)
   return { fired: true, path: filePath }
 }

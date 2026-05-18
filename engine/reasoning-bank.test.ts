@@ -16,6 +16,7 @@ import {
   formatPastCases,
   retrievePastCases,
   insertCase,
+  rollupRecentOutcomes,
   type ReasoningBankCase,
 } from './reasoning-bank.js'
 
@@ -111,5 +112,101 @@ describe('ReasoningBank retrieval', () => {
     const rendered = retrievePastCases(db, { asset: 'AAPL', strategy: 'momentum-stocks' })
     expect(rendered).not.toBeNull()
     expect(rendered!).toContain('AAPL buy via momentum-stocks')
+  })
+})
+
+function freshDb(): Database.Database {
+  const db = new Database(':memory:')
+  db.exec(`
+    CREATE TABLE trader_strategies (
+      id TEXT PRIMARY KEY, name TEXT, asset_class TEXT NOT NULL,
+      tier TEXT, status TEXT, params_json TEXT, created_at INTEGER, updated_at INTEGER
+    );
+    CREATE TABLE trader_reasoning_bank (
+      id TEXT PRIMARY KEY, decision_id TEXT, signal_id TEXT,
+      asset TEXT NOT NULL, side TEXT NOT NULL, strategy TEXT NOT NULL,
+      summary TEXT NOT NULL, thesis_grade TEXT, outcome TEXT,
+      pnl_net REAL, embedding_id TEXT, created_at INTEGER NOT NULL
+    );
+  `)
+  db.prepare("INSERT INTO trader_strategies (id, asset_class) VALUES ('eq-mom', 'equity')").run()
+  db.prepare("INSERT INTO trader_strategies (id, asset_class) VALUES ('cr-mom', 'crypto')").run()
+  return db
+}
+
+function insertRollupCase(db: Database.Database, p: {
+  id: string, asset: string, side: string, strategy: string,
+  pnl_net: number | null, outcome: string | null, created_at: number
+}): void {
+  db.prepare(`
+    INSERT INTO trader_reasoning_bank
+      (id, asset, side, strategy, summary, pnl_net, outcome, created_at)
+    VALUES (?, ?, ?, ?, 'summary', ?, ?, ?)
+  `).run(p.id, p.asset, p.side, p.strategy, p.pnl_net, p.outcome, p.created_at)
+}
+
+describe('rollupRecentOutcomes', () => {
+  it('returns calibration message on empty DB', () => {
+    const db = freshDb()
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.total).toBe(0)
+    expect(result.formatted).toContain('No prior paper trades')
+  })
+
+  it('aggregates win/loss/avg for equity', () => {
+    const db = freshDb()
+    const t = Date.now()
+    insertRollupCase(db, { id: 'c1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: t - 5000 })
+    insertRollupCase(db, { id: 'c2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -0.01, outcome: 'loss', created_at: t - 4000 })
+    insertRollupCase(db, { id: 'c3', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: 0.005, outcome: 'win', created_at: t - 3000 })
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.total).toBe(3)
+    expect(result.wins).toBe(2)
+    expect(result.losses).toBe(1)
+    expect(result.winRate).toBeCloseTo(0.667, 2)
+    expect(result.avgPnLPct).toBeCloseTo(0.5, 1)
+    expect(result.formatted).toMatch(/2W\/1L/)
+  })
+
+  it('separates equity from crypto', () => {
+    const db = freshDb()
+    const t = Date.now()
+    insertRollupCase(db, { id: 'e1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: t })
+    insertRollupCase(db, { id: 'c1', asset: 'BTC', side: 'buy', strategy: 'cr-mom', pnl_net: -0.03, outcome: 'loss', created_at: t })
+    const eq = rollupRecentOutcomes(db, 'equity', 20)
+    const cr = rollupRecentOutcomes(db, 'crypto', 20)
+    expect(eq.total).toBe(1)
+    expect(cr.total).toBe(1)
+    expect(eq.wins).toBe(1)
+    expect(cr.losses).toBe(1)
+  })
+
+  it('limits to most recent N', () => {
+    const db = freshDb()
+    for (let i = 0; i < 30; i++) {
+      insertRollupCase(db, { id: `c${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.01, outcome: 'win', created_at: 1000 + i })
+    }
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.total).toBe(20)
+  })
+
+  it('groups by symbol with trade count', () => {
+    const db = freshDb()
+    insertRollupCase(db, { id: 'a1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.01, outcome: 'win', created_at: 1000 })
+    insertRollupCase(db, { id: 'a2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: 2000 })
+    insertRollupCase(db, { id: 't1', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: -0.01, outcome: 'loss', created_at: 3000 })
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.bySymbol.AAPL).toMatch(/2 trades/)
+    expect(result.bySymbol.TSLA).toMatch(/1 trade/)
+  })
+
+  it('handles all-loss scenario with warning text', () => {
+    const db = freshDb()
+    for (let i = 0; i < 5; i++) {
+      insertRollupCase(db, { id: `l${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -0.02, outcome: 'loss', created_at: 1000 + i })
+    }
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.winRate).toBe(0)
+    expect(result.formatted.toLowerCase()).toContain('warning')
   })
 })

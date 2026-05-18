@@ -6,6 +6,37 @@ import type Database from 'better-sqlite3'
 import { logger } from '../logger.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { rollupRecentOutcomes, type AssetClass } from './reasoning-bank.js'
+
+// ---------------------------------------------------------------------------
+// Rollup helpers (Task 8)
+// ---------------------------------------------------------------------------
+
+function assetClassForStrategy(db: Database.Database | undefined, strategyId: string | null): AssetClass {
+  if (!db || !strategyId) return 'equity'
+  try {
+    const row = db.prepare('SELECT asset_class FROM trader_strategies WHERE id = ?').get(strategyId) as { asset_class?: string } | undefined
+    return row?.asset_class === 'crypto' ? 'crypto' : 'equity'
+  } catch {
+    return 'equity'
+  }
+}
+
+function buildRollupBlock(db: Database.Database | undefined, assetClass: AssetClass): string {
+  if (!db) return ''
+  try {
+    const rollup = rollupRecentOutcomes(db, assetClass, 20)
+    if (rollup.total === 0) return ''
+    return [
+      '=== RECENT PAPER TRADE OUTCOMES ===',
+      rollup.formatted,
+      '===================================',
+      '',
+    ].join('\n')
+  } catch {
+    return ''
+  }
+}
 
 // Dynamically import runAgent lazily so tests can mock it without forcing
 // a full agent subsystem boot.
@@ -112,6 +143,14 @@ export interface CommitteeDeps {
    * the bank.
    */
   pastCases?: string | null
+  /**
+   * Phase 2 Task 8 -- ReasoningBank rollup injection.
+   *
+   * Optional. When provided, the rollup of recent paper trade outcomes
+   * is prepended to ALL specialist, coordinator, risk officer, and trader
+   * prompts so every LLM call in the committee sees aggregate P&L context.
+   */
+  db?: Database.Database
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +280,16 @@ export async function runCommittee(
 
   const context = buildSignalContext(signal)
 
+  // Task 8: compute rollup block once; prepend to every LLM-bound prompt.
+  const assetClass = assetClassForStrategy(deps.db, (signal as any).strategy_id ?? null)
+  const rollupBlock = buildRollupBlock(deps.db, assetClass)
+
   // ---- Round 1: four specialists in parallel ----
   const specialistRoles: SpecialistRole[] = ['quant', 'fundamentalist', 'macro', 'sentiment']
 
   const specialistResults = await Promise.all(
     specialistRoles.map(async (role) => {
-      const prompt = loadPrompt(SPECIALIST_FILES[role])
+      const prompt = rollupBlock + loadPrompt(SPECIALIST_FILES[role])
       const raw = await callAgent(deps, prompt, `ROUND 1\n\n${context}`, `committee-${role}`)
       const parsed = parseAgentJson<SpecialistOpinion>(raw)
       if (!parsed || parsed.role !== role) {
@@ -275,7 +318,7 @@ export async function runCommittee(
   }
 
   // ---- Coordinator synthesis ----
-  const coordPrompt = loadPrompt(SUPPORT_FILES.coordinator)
+  const coordPrompt = rollupBlock + loadPrompt(SUPPORT_FILES.coordinator)
   // Prepend ReasoningBank past cases when present. The bank stays empty
   // until Phase 3's verdicts pipeline lands, so in practice this block
   // is a no-op in Phase 2 -- but the injection point is wired so the
@@ -306,7 +349,7 @@ export async function runCommittee(
           errors.push(`round2:${c.role} unknown role`)
           return null
         }
-        const prompt = loadPrompt(file)
+        const prompt = rollupBlock + loadPrompt(file)
         const raw = await callAgent(
           deps,
           prompt,
@@ -332,7 +375,7 @@ export async function runCommittee(
   }
 
   // ---- Risk Officer final verdict ----
-  const riskPrompt = loadPrompt(SUPPORT_FILES.risk_officer)
+  const riskPrompt = rollupBlock + loadPrompt(SUPPORT_FILES.risk_officer)
   const transcriptSoFar =
     `${context}\n\nROUND 1:\n` +
     round1.map((o) => `- ${o.role}: conf=${o.confidence} opinion="${o.opinion}" concerns=${JSON.stringify(o.concerns)}`).join('\n') +
@@ -369,7 +412,7 @@ export async function runCommittee(
   }
 
   // ---- Trader final decision ----
-  const traderPrompt = loadPrompt(SUPPORT_FILES.trader)
+  const traderPrompt = rollupBlock + loadPrompt(SUPPORT_FILES.trader)
   const traderMessage =
     `${transcriptSoFar}\n\n` +
     `RISK OFFICER VERDICT: veto=${effectiveRisk.veto} reason="${effectiveRisk.reason}"\n\n` +

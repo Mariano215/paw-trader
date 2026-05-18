@@ -14,6 +14,7 @@ import committeeRoutes from './committee.js'
 import auditLogRoutes from './audit-log.js'
 import signalsRoutes from './signals.js'
 import syncRoutes from './sync.js'
+import bypassProgressRoutes from './bypass-progress.js'
 
 const router = Router()
 
@@ -24,5 +25,6 @@ router.use(committeeRoutes)
 router.use(auditLogRoutes)
 router.use(signalsRoutes)
 router.use(syncRoutes)
+router.use(bypassProgressRoutes)
 
 export default router

@@ -10,6 +10,8 @@ import {
   type CommitteeSignalInput,
 } from './committee.js'
 import type { AgentResult } from '../agent.js'
+import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import type { RollupResult } from './reasoning-bank.js'
 
 const baseSignal: CommitteeSignalInput = {
   id: 'sig-c-1',
@@ -85,8 +87,8 @@ describe('committee -- helpers', () => {
     expect(ctx).toContain('asset: AAPL')
     expect(ctx).toContain('raw_score: 0.72')
     expect(ctx).toContain('abs_raw_score: 0.72')
-    expect(ctx).toContain('score_threshold: 0.05')
-    expect(ctx).toContain('score_multiple_of_threshold: 14.40')
+    expect(ctx).toContain(`score_threshold: ${TRADER_SIGNAL_SCORE_THRESHOLD}`)
+    expect(ctx).toContain(`score_multiple_of_threshold: ${(0.72 / TRADER_SIGNAL_SCORE_THRESHOLD).toFixed(2)}`)
     expect(ctx).toContain('enrichment: {"rsi":45}')
   })
 })
@@ -353,5 +355,62 @@ describe('committee -- transcript persistence', () => {
         errors: [],
       },
     })).not.toThrow()
+  })
+})
+
+describe('committee -- rollup injection', () => {
+  const rollupScript: Record<string, string> = {
+    'committee-quant': '{"role":"quant","opinion":"neutral","confidence":0.5,"concerns":[]}',
+    'committee-fundamentalist': '{"role":"fundamentalist","opinion":"neutral","confidence":0.5,"concerns":[]}',
+    'committee-macro': '{"role":"macro","opinion":"neutral","confidence":0.5,"concerns":[]}',
+    'committee-sentiment': '{"role":"sentiment","opinion":"neutral","confidence":0.5,"concerns":[]}',
+    'committee-coordinator': '{"role":"coordinator","consensus_direction":"buy","avg_confidence":0.5,"skip_round_2":true,"challenges":[]}',
+    'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"ok","concerns":[]}',
+    'committee-trader': '{"role":"trader","action":"buy","thesis":"test","confidence":0.5,"size_multiplier":1}',
+  }
+
+  it('prepends rollup block to specialist prompts when paper outcomes exist', async () => {
+    const db = makeDb()
+    db.prepare("INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at) VALUES ('eq-mom','Equity Momentum','equity',0,'active','{}',?,?)").run(Date.now(), Date.now())
+    db.prepare("INSERT INTO trader_reasoning_bank (id, asset, side, strategy, summary, outcome, pnl_net, created_at) VALUES ('c1','AAPL','buy','eq-mom','x','win',0.02,?)").run(Date.now())
+
+    const promptCaptures: string[] = []
+    const fakeRunAgent: CommitteeDeps['runAgent'] = async (message, _sid, _typ, _gh, _evt, actionPlan) => {
+      promptCaptures.push(message)
+      const source = actionPlan?.source ?? 'unknown'
+      return { text: rollupScript[source] ?? null, resultSubtype: 'success' } as AgentResult
+    }
+
+    const signal: CommitteeSignalInput & { strategy_id: string } = {
+      id: 'sig-rollup-1', asset: 'AAPL', side: 'buy', raw_score: 0.6, horizon_days: 5,
+      enrichment_json: null, strategy_id: 'eq-mom',
+    }
+
+    await runCommittee(signal as any, deps(fakeRunAgent, { db }))
+
+    expect(promptCaptures.some((p) => p.includes('RECENT PAPER TRADE OUTCOMES'))).toBe(true)
+    expect(promptCaptures.some((p) => p.includes('Last 1 paper trades (equity)'))).toBe(true)
+  })
+
+  it('falls back gracefully when rollup throws (no rollup block in prompts)', async () => {
+    const db = makeDb()
+    // Drop trader_strategies so rollupRecentOutcomes throws (JOIN will fail)
+    db.exec('DROP TABLE IF EXISTS trader_strategies')
+
+    const promptCaptures: string[] = []
+    const fakeRunAgent: CommitteeDeps['runAgent'] = async (message, _sid, _typ, _gh, _evt, actionPlan) => {
+      promptCaptures.push(message)
+      const source = actionPlan?.source ?? 'unknown'
+      return { text: rollupScript[source] ?? null, resultSubtype: 'success' } as AgentResult
+    }
+
+    const signal: CommitteeSignalInput & { strategy_id: string } = {
+      id: 'sig-rollup-2', asset: 'AAPL', side: 'buy', raw_score: 0.6, horizon_days: 5,
+      enrichment_json: null, strategy_id: 'eq-mom',
+    }
+
+    await runCommittee(signal as any, deps(fakeRunAgent, { db }))
+
+    expect(promptCaptures.every((p) => !p.includes('RECENT PAPER TRADE OUTCOMES'))).toBe(true)
   })
 })

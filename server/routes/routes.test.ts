@@ -1974,3 +1974,65 @@ describe('GET /api/v1/trader/signals/:id/committee', () => {
     }
   })
 })
+
+// ===========================================================================
+// Task 9 -- GET /api/v1/trader/bypass-progress
+// ===========================================================================
+
+describe('GET /api/v1/trader/bypass-progress', () => {
+  it('returns 401 when unauthenticated', async () => {
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/bypass-progress')
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 503 when bot DB is unavailable', async () => {
+    botDbAvailable = false
+    try {
+      const res = await httpReq(srv, 'GET', '/api/v1/trader/bypass-progress', { headers: tok(adminToken) })
+      expect(res.status).toBe(503)
+    } finally {
+      botDbAvailable = true
+    }
+  })
+
+  it('returns correct shape with zero rows', async () => {
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/bypass-progress', { headers: tok(adminToken) })
+    expect(res.status).toBe(200)
+    const body = res.body as Record<string, unknown>
+    expect(typeof body.count).toBe('number')
+    expect(body.target).toBe(20)
+    expect(typeof body.daily).toBe('number')
+    expect(body.dailyCap).toBe(20)
+    expect(typeof body.flipped).toBe('boolean')
+  })
+
+  it('counts bypass-tagged decisions and ignores rejected ones', async () => {
+    const nowMs = Date.now()
+    // Insert two bypass decisions: one accepted, one rejected (should not count)
+    testDb.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('bp-test-1', 'sig-bp-1', 'buy', 'SPY', 100, 'market', '[BYPASS] breakout', 0.8, nowMs, 'executed')
+    testDb.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('bp-test-2', 'sig-bp-2', 'buy', 'QQQ', 100, 'market', '[BYPASS] momentum', 0.7, nowMs, 'rejected')
+    // Insert a normal (non-bypass) decision that should not count in bypass count
+    testDb.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('bp-test-3', 'sig-bp-3', 'sell', 'IWM', 50, 'market', 'normal thesis', 0.6, nowMs, 'executed')
+
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/bypass-progress', { headers: tok(adminToken) })
+    expect(res.status).toBe(200)
+    const body = res.body as { count: number; target: number; daily: number; dailyCap: number; flipped: boolean }
+    // Only bp-test-1 is bypass + not rejected
+    expect(body.count).toBeGreaterThanOrEqual(1)
+    expect(body.flipped).toBe(body.count >= 20)
+    // daily should include bp-test-1 and bp-test-3 (non-abstain, today)
+    expect(body.daily).toBeGreaterThanOrEqual(2)
+  })
+})

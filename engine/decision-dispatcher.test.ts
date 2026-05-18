@@ -1,4 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+// Mock config to disable bypass for tests that exercise the committee path.
+// Bypass-gates tests live in decision-dispatcher.bypass.test.ts with their own mock.
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js')
+  return {
+    ...actual,
+    TRADER_COMMITTEE_BYPASS: false,
+    TRADER_BYPASS_TRADE_TARGET: 20,
+    TRADER_DAILY_TRADE_CAP: 20,
+  }
+})
+
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'

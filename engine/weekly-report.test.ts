@@ -11,6 +11,15 @@ import path from 'node:path'
 import { mkdirSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import os from 'node:os'
 
+// CRITICAL: stub Gmail so tests do not send real emails to security@example.com.
+// Discovered May 17 2026 during weekly-report loop fix — every test run of
+// maybeFireWeeklyReport previously hit the live Gmail API. Combined with deploy
+// CI runs, that was a hidden source of inbox noise on top of the production
+// scheduler loop the same patch addresses.
+vi.mock('../google/gmail.js', () => ({
+  sendEmail: vi.fn().mockResolvedValue({ id: 'mock-message-id', threadId: 'mock-thread' }),
+}))
+
 import { initTraderTables } from './db.js'
 import { seedAllStrategies } from './strategy-manager.js'
 import { recomputeTrackRecord } from './track-record.js'
@@ -719,6 +728,53 @@ describe('scheduler gate', () => {
     const row = db.prepare('SELECT value FROM kv_settings WHERE key = ?').get(WEEKLY_REPORT_KV_KEY) as { value: string } | undefined
     expect(row).toBeDefined()
     expect(Number(row!.value)).toBe(sun_901)
+  })
+
+  // Regression coverage for May 17 2026 email-loop incident.
+  // Pre-fix order was: build → send → email → writeLastFireMs. A throw in
+  // send (Telegram outage, parse_mode reject, etc.) left kv_settings stale,
+  // so every 60s scheduler tick during the 12h Sunday grace re-fired the
+  // email until the window closed. Post-fix order: gate → writeLastFireMs
+  // FIRST → build/send/email. Tests pin that ordering.
+  it('persists last fire timestamp even when send throws (no loop)', async () => {
+    const sun_901 = SUN_APR_19_9AM_UTC + 60_000
+    const throwingSend = vi.fn().mockRejectedValue(new Error('telegram outage'))
+
+    await expect(
+      maybeFireWeeklyReport({ db, engineClient: null, send: throwingSend, nowMs: sun_901, reportsDir: tmpDir })
+    ).rejects.toThrow('telegram outage')
+
+    // CRUCIAL: kv_settings must still have advanced. Without this, the next
+    // scheduler tick would see lastFire < fireAtMs and fire again.
+    const row = db.prepare('SELECT value FROM kv_settings WHERE key = ?').get(WEEKLY_REPORT_KV_KEY) as { value: string } | undefined
+    expect(row).toBeDefined()
+    expect(Number(row!.value)).toBe(sun_901)
+
+    // And shouldFireWeeklyReport now returns false for the rest of the grace.
+    const sun_902 = sun_901 + 60_000
+    expect(shouldFireWeeklyReport(sun_902, Number(row!.value))).toBe(false)
+  })
+
+  it('second concurrent invocation bails out (kv already advanced)', async () => {
+    const { resetInFlightFireForTest } = await import('./weekly-report.js')
+    resetInFlightFireForTest()
+    const sun_901 = SUN_APR_19_9AM_UTC + 60_000
+    const sun_902 = sun_901 + 60_000
+
+    // First call: launch but do not await. Its synchronous prelude commits
+    // writeLastFireMs before the first await in buildReport.
+    const inFlight = maybeFireWeeklyReport({ db, engineClient: null, send, nowMs: sun_901, reportsDir: tmpDir })
+
+    // Second call one minute later: kv was already updated by the first
+    // call's synchronous prelude, so the gate trips and this call bails
+    // immediately without ever reaching send.
+    const concurrent = await maybeFireWeeklyReport({ db, engineClient: null, send, nowMs: sun_902, reportsDir: tmpDir })
+    expect(concurrent.fired).toBe(false)
+    expect(concurrent.reason).toMatch(/already fired/)
+
+    // Drain the in-flight first call so the test isolates cleanly.
+    await inFlight
+    resetInFlightFireForTest()
   })
 })
 

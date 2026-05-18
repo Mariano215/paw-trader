@@ -52,8 +52,8 @@ describe('signal-poller', () => {
     expect(pending[0].asset).toBe('AAPL')
   })
 
-  it('filters signals below threshold (abs < 0.05)', async () => {
-    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.03)])
+  it('filters signals below threshold (abs < 0.02)', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.01)])
     await pollAndStoreSignals(db, mockClient as EngineClient)
     expect(getPendingSignals(db)).toHaveLength(0)
   })

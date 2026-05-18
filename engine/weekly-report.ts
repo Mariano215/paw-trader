@@ -982,43 +982,80 @@ export async function maybeFireWeeklyReport(args: {
   if (!shouldFireWeeklyReport(nowMs, lastFire)) {
     return { fired: false, reason: 'not time yet or already fired this week' }
   }
-  const { weekStartMs, weekEndMs } = computeWeekBoundary(nowMs)
-  const report = await buildReport(
-    args.db,
-    args.engineClient,
-    {
-      weekStartMs,
-      weekEndMs,
-      nowMs,
-      killSwitch: args.killSwitch ?? null,
-    },
-    {
-      fetchKillSwitchLog: args.fetchKillSwitchLog,
-    },
-  )
-  const html = renderReportHtml(report)
-  const filePath = saveReport(html, weekStartMs, args.reportsDir)
-  const summary = renderReportSummary(report)
-  // Include the file path on its own line so the operator can jump to it.
-  // Plain text only; ChannelManager.send does not pass parse_mode.
-  await args.send(`${summary}\nReport: ${filePath}`)
+  // Concurrent-tick guard: if another tick is already mid-fire, skip.
+  // Without this, a slow send/email lets the next 60s scheduler tick re-read
+  // a still-stale kv_settings and queue a duplicate fire.
+  if (inFlightFire) {
+    return { fired: false, reason: 'fire already in flight on another tick' }
+  }
+  inFlightFire = true
 
-  // Email the full HTML report. Failure is non-fatal -- the Telegram
-  // summary and disk file are already delivered at this point.
-  const dateRange = `${formatDate(weekStartMs)} to ${formatDate(weekEndMs)}`
+  // Persist state FIRST so that even if downstream send/email throws, the
+  // gate closes for this week. Previously writeLastFireMs ran AFTER the
+  // send+email pair; any post-email exception left kv_settings stale and
+  // every subsequent 60s tick re-fired the email until the grace expired.
+  // Worst case under the new ordering: one Sunday delivery silently skipped
+  // -- far better than an inbox flood.
   try {
-    await sendEmail({
-      to: TRADER_REPORT_RECIPIENT,
-      subject: `Paw Trader Weekly Report: ${dateRange}`,
-      htmlBody: html,
-    })
-    logger.info({ to: TRADER_REPORT_RECIPIENT }, 'Weekly report: email sent')
+    writeLastFireMs(args.db, nowMs)
   } catch (err) {
-    logger.warn({ err }, 'Weekly report: email delivery failed; report saved to disk')
+    logger.error({ err }, 'Weekly report: failed to persist last fire timestamp; aborting to avoid loop')
+    inFlightFire = false
+    return { fired: false, reason: 'state persist failed' }
   }
 
-  writeLastFireMs(args.db, nowMs)
-  return { fired: true, path: filePath }
+  try {
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(nowMs)
+    const report = await buildReport(
+      args.db,
+      args.engineClient,
+      {
+        weekStartMs,
+        weekEndMs,
+        nowMs,
+        killSwitch: args.killSwitch ?? null,
+      },
+      {
+        fetchKillSwitchLog: args.fetchKillSwitchLog,
+      },
+    )
+    const html = renderReportHtml(report)
+    const filePath = saveReport(html, weekStartMs, args.reportsDir)
+    const summary = renderReportSummary(report)
+    // Include the file path on its own line so the operator can jump to it.
+    // Plain text only; ChannelManager.send does not pass parse_mode.
+    await args.send(`${summary}\nReport: ${filePath}`)
+
+    // Email the full HTML report. Failure is non-fatal -- the Telegram
+    // summary and disk file are already delivered at this point.
+    const dateRange = `${formatDate(weekStartMs)} to ${formatDate(weekEndMs)}`
+    try {
+      await sendEmail({
+        to: TRADER_REPORT_RECIPIENT,
+        subject: `Paw Trader Weekly Report: ${dateRange}`,
+        htmlBody: html,
+      })
+      logger.info({ to: TRADER_REPORT_RECIPIENT }, 'Weekly report: email sent')
+    } catch (err) {
+      logger.warn({ err }, 'Weekly report: email delivery failed; report saved to disk')
+    }
+
+    return { fired: true, path: filePath }
+  } finally {
+    inFlightFire = false
+  }
+}
+
+// Module-level guard against concurrent fires within a single bot process.
+// Set when maybeFireWeeklyReport begins building the report; cleared in the
+// finally block once the function returns. Together with the writeLastFireMs
+// reorder above, this closes the email-loop window the May 17 2026 incident
+// surfaced. Tests can reset via resetInFlightFireForTest.
+let inFlightFire = false
+
+/** Reset the concurrent-fire guard. Tests only -- production should never call this. */
+export function resetInFlightFireForTest(): void {
+  inFlightFire = false
 }
 
 // ---------------------------------------------------------------------------

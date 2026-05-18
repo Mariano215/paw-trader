@@ -7,11 +7,22 @@ import {
   type CommitteeDeps,
   type CommitteeResult,
   type CommitteeSignalInput,
+  type CommitteeTranscript,
 } from './committee.js'
 import { DEFAULT_SIZE_USD } from './approval-manager.js'
 import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { logger } from '../logger.js'
+import {
+  TRADER_COMMITTEE_BYPASS,
+  TRADER_BYPASS_TRADE_TARGET,
+  TRADER_DAILY_TRADE_CAP,
+} from '../config.js'
+import {
+  countBypassTrades,
+  countTradesToday,
+  invalidateCounters,
+} from './bypass-counter.js'
 
 export interface AutoDispatchResult {
   signalId:  string
@@ -126,21 +137,72 @@ export async function dispatchApproval(
     logger.warn({ err, signalId: signal.id }, 'ReasoningBank retrieval failed; proceeding without past cases')
   }
 
-  let committeeResult: CommitteeResult
-  try {
-    committeeResult = await runCommitteeImpl(committeeInput, {
-      runAgent: runAgentImpl,
-      defaultSizeUsd: defaultSize,
-      maxSizeUsd: COMMITTEE_MAX_SIZE_USD,
-      pastCases,
-    })
-  } catch (err) {
-    logger.error({ err, signalId: signal.id }, 'Committee run threw; blocking trade')
-    return 'Committee run failed. No trade placed.'
+  // Gate 1: daily cap (applies regardless of bypass mode)
+  const dailyCount = countTradesToday(db)
+  if (dailyCount >= TRADER_DAILY_TRADE_CAP) {
+    logger.warn(
+      { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: TRADER_DAILY_TRADE_CAP },
+      'daily cap reached, suppressing',
+    )
+    db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
+    return 'Daily trade cap reached. No trade placed.'
   }
 
-  // Persist the transcript regardless of approve/abstain for audit.
-  storeTranscript(db, committeeResult)
+  // Gate 2: bypass branch (only while under target)
+  const bypass = TRADER_COMMITTEE_BYPASS
+  const bypassCount = bypass ? countBypassTrades(db) : 0
+  const useBypass = bypass && bypassCount < TRADER_BYPASS_TRADE_TARGET
+
+  let committeeResult: CommitteeResult
+  if (useBypass) {
+    const tag = `[BYPASS#${bypassCount + 1}/${TRADER_BYPASS_TRADE_TARGET}]`
+    logger.warn(
+      { event: 'trader.bypass.dispatched', signalId: signal.id, asset: signal.asset, bypassCount: bypassCount + 1, target: TRADER_BYPASS_TRADE_TARGET },
+      `TRADER_COMMITTEE_BYPASS active — ${tag} (paper mode)`,
+    )
+    if (bypassCount + 1 === TRADER_BYPASS_TRADE_TARGET) {
+      logger.warn(
+        { event: 'trader.bypass.target_reached', count: TRADER_BYPASS_TRADE_TARGET },
+        'bypass target reached, next signal will use committee',
+      )
+    }
+    const bypassTs = Date.now()
+    committeeResult = {
+      decision:      'approve',
+      action:        signal.side as 'buy' | 'sell',
+      size_usd:      defaultSize,
+      confidence:    1.0,
+      thesis:        `${tag} Committee skipped via TRADER_COMMITTEE_BYPASS. Paper mode only.`,
+      transcript_id: randomUUID(),
+      transcript: {
+        signal_id:       signal.id,
+        started_at:      bypassTs,
+        finished_at:     bypassTs,
+        rounds_executed: 0,
+        round_1:         [],
+        risk_officer:    { role: 'risk_officer', veto: false, reason: 'bypassed', concerns: [] },
+        trader:          { role: 'trader', action: signal.side as 'buy' | 'sell', thesis: 'bypassed', confidence: 1.0, size_multiplier: 1 },
+        errors:          [],
+      } satisfies CommitteeTranscript,
+    }
+    invalidateCounters()
+  } else {
+    try {
+      committeeResult = await runCommitteeImpl(committeeInput, {
+        runAgent: runAgentImpl,
+        defaultSizeUsd: defaultSize,
+        maxSizeUsd: COMMITTEE_MAX_SIZE_USD,
+        pastCases,
+        db,
+      })
+    } catch (err) {
+      logger.error({ err, signalId: signal.id }, 'Committee run threw; blocking trade')
+      return 'Committee run failed. No trade placed.'
+    }
+
+    // Persist the transcript regardless of approve/abstain for audit.
+    storeTranscript(db, committeeResult)
+  }
 
   if (committeeResult.decision === 'abstain') {
     db.prepare(`
@@ -292,24 +354,74 @@ export async function autoDispatchPendingSignals(
         enrichment_json: signal.enrichment_json ?? null,
       }
 
+      // Gate 1: daily cap (applies regardless of bypass mode)
+      const dailyCount = countTradesToday(db)
+      if (dailyCount >= TRADER_DAILY_TRADE_CAP) {
+        logger.warn(
+          { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: TRADER_DAILY_TRADE_CAP },
+          'daily cap reached, suppressing',
+        )
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
+        continue
+      }
+
+      // Gate 2: bypass branch (only while under target)
+      const bypass = TRADER_COMMITTEE_BYPASS
+      const bypassCount = bypass ? countBypassTrades(db) : 0
+      const useBypass = bypass && bypassCount < TRADER_BYPASS_TRADE_TARGET
+
       const runCommitteeImpl = deps.runCommittee ?? runCommittee
       const runAgentImpl     = deps.runAgent ?? (await import('../agent.js')).runAgent
 
       let committeeResult: CommitteeResult
-      try {
-        committeeResult = await runCommitteeImpl(committeeInput, {
-          runAgent: runAgentImpl,
-          defaultSizeUsd: DEFAULT_SIZE_USD,
-          maxSizeUsd: DEFAULT_SIZE_USD,
-        })
-      } catch (err) {
-        logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
-        db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
-          .run(signal.id)
-        continue
+      if (useBypass) {
+        const tag = `[BYPASS#${bypassCount + 1}/${TRADER_BYPASS_TRADE_TARGET}]`
+        logger.warn(
+          { event: 'trader.bypass.dispatched', signalId: signal.id, asset: signal.asset, bypassCount: bypassCount + 1, target: TRADER_BYPASS_TRADE_TARGET },
+          `TRADER_COMMITTEE_BYPASS active — ${tag} (paper mode)`,
+        )
+        if (bypassCount + 1 === TRADER_BYPASS_TRADE_TARGET) {
+          logger.warn(
+            { event: 'trader.bypass.target_reached', count: TRADER_BYPASS_TRADE_TARGET },
+            'bypass target reached, next signal will use committee',
+          )
+        }
+        const bypassTs = Date.now()
+        committeeResult = {
+          decision:      'approve',
+          action:        signal.side as 'buy' | 'sell',
+          size_usd:      DEFAULT_SIZE_USD,
+          confidence:    1.0,
+          thesis:        `${tag} Committee skipped via TRADER_COMMITTEE_BYPASS. Paper mode only.`,
+          transcript_id: randomUUID(),
+          transcript: {
+            signal_id:       signal.id,
+            started_at:      bypassTs,
+            finished_at:     bypassTs,
+            rounds_executed: 0,
+            round_1:         [],
+            risk_officer:    { role: 'risk_officer', veto: false, reason: 'bypassed', concerns: [] },
+            trader:          { role: 'trader', action: signal.side as 'buy' | 'sell', thesis: 'bypassed', confidence: 1.0, size_multiplier: 1 },
+            errors:          [],
+          } satisfies CommitteeTranscript,
+        }
+        invalidateCounters()
+      } else {
+        try {
+          committeeResult = await runCommitteeImpl(committeeInput, {
+            runAgent: runAgentImpl,
+            defaultSizeUsd: DEFAULT_SIZE_USD,
+            maxSizeUsd: DEFAULT_SIZE_USD,
+            db,
+          })
+        } catch (err) {
+          logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
+          db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
+            .run(signal.id)
+          continue
+        }
+        storeTranscript(db, committeeResult)
       }
-
-      storeTranscript(db, committeeResult)
 
       if (committeeResult.decision === 'abstain') {
         db.prepare("UPDATE trader_signals SET status = 'suppressed_committee_abstain' WHERE id = ?")

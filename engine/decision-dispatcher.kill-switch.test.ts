@@ -12,6 +12,18 @@
  * drives the dispatcher through to engineClient.submitDecision.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+// Disable bypass so kill-switch tests exercise the real committee path.
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js')
+  return {
+    ...actual,
+    TRADER_COMMITTEE_BYPASS: false,
+    TRADER_BYPASS_TRADE_TARGET: 20,
+    TRADER_DAILY_TRADE_CAP: 20,
+  }
+})
+
 import Database from 'better-sqlite3'
 
 import { initTraderTables } from './db.js'

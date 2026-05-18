@@ -125,6 +125,97 @@ export function retrievePastCases(
   return formatPastCases(cases)
 }
 
+export type AssetClass = 'equity' | 'crypto'
+
+export interface RollupResult {
+  total: number
+  wins: number
+  losses: number
+  winRate: number
+  avgPnLPct: number
+  worstDrawdownPct: number
+  bestTradePct: number
+  bySymbol: Record<string, string>
+  formatted: string
+}
+
+/**
+ * Aggregate the most recent N closed-trade cases for a given asset class
+ * and return a summary suitable for prepending to committee specialist
+ * prompts. Pure SQL over trader_reasoning_bank joined to trader_strategies.
+ */
+export function rollupRecentOutcomes(
+  db: Database.Database,
+  assetClass: AssetClass,
+  limit = 20,
+): RollupResult {
+  const rows = db.prepare(`
+    SELECT rb.asset, rb.side, rb.pnl_net, rb.outcome, rb.created_at
+    FROM trader_reasoning_bank rb
+    INNER JOIN trader_strategies s ON s.id = rb.strategy
+    WHERE s.asset_class = ?
+    ORDER BY rb.created_at DESC
+    LIMIT ?
+  `).all(assetClass, limit) as Array<{
+    asset: string; side: string; pnl_net: number | null; outcome: string | null; created_at: number
+  }>
+
+  if (rows.length === 0) {
+    return {
+      total: 0, wins: 0, losses: 0, winRate: 0, avgPnLPct: 0,
+      worstDrawdownPct: 0, bestTradePct: 0, bySymbol: {},
+      formatted: 'No prior paper trades yet -- calibration phase.',
+    }
+  }
+
+  let wins = 0
+  let losses = 0
+  const pnls: number[] = []
+  const bySymbolPnLs: Record<string, number[]> = {}
+  for (const r of rows) {
+    const pnlPct = (r.pnl_net ?? 0) * 100
+    pnls.push(pnlPct)
+    if ((r.outcome ?? '').toLowerCase() === 'win') wins++
+    else if ((r.outcome ?? '').toLowerCase() === 'loss') losses++
+    if (!bySymbolPnLs[r.asset]) bySymbolPnLs[r.asset] = []
+    bySymbolPnLs[r.asset].push(pnlPct)
+  }
+  const total = rows.length
+  const winRate = total === 0 ? 0 : wins / total
+  const avgPnLPct = pnls.reduce((s, x) => s + x, 0) / total
+  const worstDrawdownPct = Math.min(...pnls)
+  const bestTradePct = Math.max(...pnls)
+
+  const bySymbol: Record<string, string> = {}
+  for (const [sym, vals] of Object.entries(bySymbolPnLs)) {
+    const avg = vals.reduce((s, x) => s + x, 0) / vals.length
+    const label = vals.length === 1 ? '1 trade' : `${vals.length} trades`
+    bySymbol[sym] = `${avg >= 0 ? '+' : ''}${avg.toFixed(2)}% (${label})`
+  }
+
+  const symbolList = Object.entries(bySymbol)
+    .map(([sym, blurb]) => `  ${sym}: ${blurb}`)
+    .join('\n')
+
+  const warning = (winRate < 0.4 && total >= 5)
+    ? '\n  WARNING: win rate below 40%. Consider tightening selection or pausing.'
+    : ''
+
+  const formatted = [
+    `Last ${total} paper trades (${assetClass}): ${wins}W/${losses}L (${(winRate * 100).toFixed(0)}%).`,
+    `Avg ${avgPnLPct >= 0 ? '+' : ''}${avgPnLPct.toFixed(2)}%. ` +
+      `Best ${bestTradePct >= 0 ? '+' : ''}${bestTradePct.toFixed(2)}%. ` +
+      `Worst ${worstDrawdownPct.toFixed(2)}%.`,
+    'By symbol:',
+    symbolList + warning,
+  ].join('\n')
+
+  return {
+    total, wins, losses, winRate, avgPnLPct,
+    worstDrawdownPct, bestTradePct, bySymbol, formatted,
+  }
+}
+
 /**
  * Insert a case into the bank. Not called from the hot path in Phase
  * 2; kept here so tests can seed the bank and so Phase 3 has a clear

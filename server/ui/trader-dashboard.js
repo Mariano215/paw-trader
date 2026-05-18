@@ -172,6 +172,14 @@ function ensureTraderPageDOM() {
   trackCard.textContent = 'Loading strategy track records...';
   page.appendChild(trackCard);
 
+  // Bypass progress card (Task 10 -- feedback loop)
+  var bypassCard = document.createElement('div');
+  bypassCard.id = 'trader-bypass-card';
+  bypassCard.className = 'stat-card';
+  bypassCard.style.cssText = 'padding:18px;margin-top:12px;';
+  bypassCard.textContent = 'Loading bypass progress...';
+  page.appendChild(bypassCard);
+
   // Halt button card
   var haltCard = document.createElement('div');
   haltCard.className = 'stat-card';
@@ -203,6 +211,7 @@ function initTraderPage() {
   refreshTraderDecisions();
   refreshTraderCommitteeReport();
   refreshTraderTrackRecords();
+  refreshTraderBypassProgress();
   if (!_traderPollStarted) {
     _traderPollStarted = true;
     addPollingInterval(refreshTraderOverview, 60000);
@@ -213,6 +222,7 @@ function initTraderPage() {
     addPollingInterval(refreshTraderDecisions, 30000);
     addPollingInterval(refreshTraderCommitteeReport, 60000);
     addPollingInterval(refreshTraderTrackRecords, 60000);
+    addPollingInterval(refreshTraderBypassProgress, 60000);
   }
 }
 
@@ -1137,6 +1147,42 @@ function renderTraderTrackRecords(records, container) {
   });
   table.appendChild(tbody);
   container.appendChild(table);
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 -- Bypass progress card (feedback loop)
+// ---------------------------------------------------------------------------
+
+async function refreshTraderBypassProgress() {
+  var container = document.getElementById('trader-bypass-card');
+  if (!container) return;
+  try {
+    var data = await fetchFromAPI('/api/v1/trader/bypass-progress');
+    if (data === null) return; // auth redirect
+    while (container.firstChild) container.removeChild(container.firstChild);
+
+    var heading = document.createElement('div');
+    heading.style.cssText = 'font-weight:600;margin-bottom:10px;';
+    heading.textContent = 'Bypass Progress';
+    container.appendChild(heading);
+
+    var countRow = document.createElement('div');
+    countRow.style.cssText = 'font-size:1.6rem;font-weight:700;margin-bottom:4px;';
+    countRow.textContent = (data.count || 0) + ' / ' + (data.target || 0);
+    container.appendChild(countRow);
+
+    var dailyRow = document.createElement('div');
+    dailyRow.style.cssText = 'opacity:0.7;font-size:0.85rem;margin-bottom:4px;';
+    dailyRow.textContent = 'Today: ' + (data.daily || 0) + ' / ' + (data.dailyCap || 0);
+    container.appendChild(dailyRow);
+
+    var modeRow = document.createElement('div');
+    modeRow.style.cssText = 'opacity:0.7;font-size:0.85rem;';
+    modeRow.textContent = data.flipped ? 'Committee active' : 'Bypass mode (collecting data)';
+    container.appendChild(modeRow);
+  } catch (e) {
+    container.textContent = 'Bypass progress unavailable: ' + String(e);
+  }
 }
 
 // ---------------------------------------------------------------------------

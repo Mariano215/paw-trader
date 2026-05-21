@@ -7,6 +7,8 @@ import { logger } from '../logger.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
 import { rollupRecentOutcomes, type AssetClass } from './reasoning-bank.js'
+import type { MarkovRegimePayload } from './types.js'
+import type { SignalEnrichment } from './enrichment-fetcher.js'
 
 // ---------------------------------------------------------------------------
 // Rollup helpers (Task 8)
@@ -206,6 +208,114 @@ export function parseAgentJson<T>(raw: string | null | undefined): T | null {
 }
 
 // ---------------------------------------------------------------------------
+// Markov regime helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the markov_regime payload from a signal's enrichment_json string.
+ * Returns null on any parse failure or if the field is absent -- callers
+ * treat null as "no opinion".
+ */
+function parseMarkovRegime(enrichmentJson: string | null): MarkovRegimePayload | null {
+  if (!enrichmentJson) return null
+  try {
+    const parsed = JSON.parse(enrichmentJson) as Partial<SignalEnrichment>
+    const regime = parsed.markov_regime
+    if (!regime || typeof regime !== 'object') return null
+    if (typeof regime.markov_signal !== 'number') return null
+    return regime as MarkovRegimePayload
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Deterministic risk gate that runs AFTER the LLM risk officer verdict.
+ *
+ * Hard vetoes (always enforced, override everything including LLM clears):
+ *   - avg committee confidence below 0.30
+ *
+ * Markov tiebreaker (when enrichment.markov_regime is present):
+ *   - If Markov conflicts with the proposed action by > 0.30
+ *     (buy + markov_signal <= -0.30, OR sell + markov_signal >= 0.30) → veto.
+ *   - If Markov agrees or is neutral AND the LLM vetoed → clear the veto.
+ *     The LLM disagreement-veto is replaced; LLM event-risk vetoes (earnings,
+ *     halt) are NOT cleared here because Markov agreement only speaks to
+ *     regime direction, not idiosyncratic event risk.  The caller decides
+ *     which LLM vetoes are regime-type by passing llmVetoed=true only when
+ *     the LLM veto reason matches a disagreement pattern.
+ *
+ * No-Markov fallback (when enrichment.markov_regime is absent):
+ *   - Add a veto when avg confidence < 0.45 (raised floor vs old "any split").
+ *   - When avg confidence >= 0.45 the gate returns null, deferring to the LLM.
+ *     This preserves genuine event-risk vetoes from the LLM in the no-Markov path.
+ *
+ * Returns null when no deterministic override needed (LLM verdict stands).
+ * Returns a RiskVerdict when the gate fires.
+ */
+function applyDeterministicRiskGate(
+  action: 'buy' | 'sell',
+  avgConfidence: number,
+  markov: MarkovRegimePayload | null,
+  llmVetoedOnDisagreement: boolean,
+): RiskVerdict | null {
+  // Hard veto: avg confidence below absolute floor (0.30) -- beats everything.
+  if (avgConfidence < 0.30) {
+    return {
+      role: 'risk_officer',
+      veto: true,
+      reason: `Hard veto: avg committee confidence ${avgConfidence.toFixed(2)} below 0.30 floor.`,
+      concerns: [`risk_officer_hard_confidence_floor_${avgConfidence.toFixed(2)}`],
+    }
+  }
+
+  if (markov !== null) {
+    const markovSignal = markov.markov_signal
+
+    // Markov conflicts with proposed action → veto regardless of LLM.
+    const conflicts =
+      (action === 'buy'  && markovSignal <= -0.30) ||
+      (action === 'sell' && markovSignal >=  0.30)
+
+    if (conflicts) {
+      return {
+        role: 'risk_officer',
+        veto: true,
+        reason: `Markov regime conflicts with ${action} action (markov_signal=${markovSignal.toFixed(3)}).`,
+        concerns: [`risk_officer_markov_conflict_${markovSignal.toFixed(3)}`],
+      }
+    }
+
+    // Markov agrees/neutral. If the LLM fired a disagreement-type veto, clear it.
+    // If the LLM fired a genuine event-risk veto (earnings, halt), leave it alone.
+    if (llmVetoedOnDisagreement) {
+      return {
+        role: 'risk_officer',
+        veto: false,
+        reason: `Markov regime supports ${action} (markov_signal=${markovSignal.toFixed(3)}); specialist disagreement overridden.`,
+        concerns: [],
+      }
+    }
+
+    // LLM did not veto on disagreement (either no-veto or event-risk veto) -- no override.
+    return null
+  }
+
+  // No Markov: raise the floor to 0.45.  Only add a veto; never clear the LLM.
+  if (avgConfidence < 0.45) {
+    return {
+      role: 'risk_officer',
+      veto: true,
+      reason: `No Markov data; avg confidence ${avgConfidence.toFixed(2)} below no-Markov floor of 0.45.`,
+      concerns: [`risk_officer_no_markov_confidence_${avgConfidence.toFixed(2)}`],
+    }
+  }
+
+  // No Markov, confidence acceptable -- no deterministic override.
+  return null
+}
+
+// ---------------------------------------------------------------------------
 // Signal context builder
 // ---------------------------------------------------------------------------
 
@@ -394,6 +504,36 @@ export async function runCommittee(
     veto: true,
     reason: 'Risk officer output failed to parse. Fail-closed abstain.',
     concerns: ['risk_officer_parse_failed'],
+  }
+
+  // Deterministic Markov gate -- runs after LLM verdict, may override it.
+  // The gate is skipped when the LLM failed to parse (fail-closed stays).
+  if (riskVerdict) {
+    const markov = parseMarkovRegime(signal.enrichment_json)
+    const avgConf = coordinator?.avg_confidence ?? 0
+    // Proposed action comes from the coordinator direction; fall back to signal side.
+    const proposedAction: 'buy' | 'sell' =
+      coordinator?.consensus_direction === 'buy' || coordinator?.consensus_direction === 'sell'
+        ? coordinator.consensus_direction
+        : signal.side
+    // Classify whether the LLM veto was disagreement-type so the gate knows
+    // whether to clear it when Markov agrees.  Any other reason (earnings,
+    // halt, sector risk) is treated as a genuine event-risk veto and preserved.
+    const DISAGREEMENT_PATTERNS = [
+      'disagree', 'split', 'mixed', 'diverge', 'conflict', 'low confidence', 'thin conviction',
+    ]
+    const llmVetoedOnDisagreement =
+      riskVerdict.veto &&
+      DISAGREEMENT_PATTERNS.some((p) => riskVerdict.reason.toLowerCase().includes(p))
+    const gateVerdict = applyDeterministicRiskGate(proposedAction, avgConf, markov, llmVetoedOnDisagreement)
+    if (gateVerdict !== null) {
+      logger.debug(
+        { gateVeto: gateVerdict.veto, reason: gateVerdict.reason, markovSignal: markov?.markov_signal },
+        'Committee deterministic risk gate fired',
+      )
+      // Replace the LLM verdict with the gate verdict.
+      Object.assign(effectiveRisk, gateVerdict)
+    }
   }
 
   if (effectiveRisk.veto) {

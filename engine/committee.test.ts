@@ -358,6 +358,186 @@ describe('committee -- transcript persistence', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Markov regime gate tests
+// ---------------------------------------------------------------------------
+
+function makeEnrichmentJson(markovSignal: number | null): string | null {
+  if (markovSignal === null) return null
+  const payload = {
+    price_current: 150,
+    price_change_1d_pct: 0.5,
+    price_change_5d_pct: 1.2,
+    price_change_20d_pct: 3.4,
+    rsi_14: 55,
+    window_high: 155,
+    window_low: 140,
+    pct_from_window_high: -3.2,
+    bars_fetched: 22,
+    fetched_at: Date.now(),
+    markov_regime: {
+      source: 'markov_regime',
+      asset: 'AAPL',
+      as_of: '2026-05-20',
+      n_obs: 200,
+      current_state: markovSignal > 0.1 ? 'bull' : markovSignal < -0.1 ? 'bear' : 'sideways',
+      markov_signal: markovSignal,
+      stationary: { bear: 0.2, sideways: 0.3, bull: 0.5 },
+      persistence_diag: [0.9, 0.85, 0.92],
+      walk_forward: { sharpe: 0.8, max_drawdown: -0.05, n_trades: 12 },
+      computed_at_ms: Date.now(),
+      params: { window: 60, threshold: 0.1, backtest: true, days: 30 },
+    },
+  }
+  return JSON.stringify(payload)
+}
+
+/** Shared specialist + coordinator script for Markov gate tests. */
+function markovBaseScript(
+  avgConfidence: number,
+  consensusDirection: 'buy' | 'sell' | 'mixed' = 'buy',
+): Record<string, string> {
+  return {
+    'committee-quant':         `{"role":"quant","opinion":"ok","confidence":${avgConfidence},"concerns":[]}`,
+    'committee-fundamentalist':`{"role":"fundamentalist","opinion":"ok","confidence":${avgConfidence},"concerns":[]}`,
+    'committee-macro':         `{"role":"macro","opinion":"mixed","confidence":${(avgConfidence - 0.1).toFixed(2)},"concerns":["some concern"]}`,
+    'committee-sentiment':     `{"role":"sentiment","opinion":"ok","confidence":${avgConfidence},"concerns":[]}`,
+    'committee-coordinator':   JSON.stringify({
+      role: 'coordinator',
+      consensus_direction: consensusDirection,
+      avg_confidence: avgConfidence,
+      skip_round_2: true,
+      challenges: [],
+    }),
+    // LLM risk officer would normally veto on specialist split; gate should override
+    'committee-risk-officer':  '{"role":"risk_officer","veto":true,"reason":"Specialists show sharp directional split","concerns":["disagreement"]}',
+    'committee-trader':        `{"role":"trader","action":"${consensusDirection === 'sell' ? 'sell' : 'buy'}","thesis":"momentum","confidence":${avgConfidence},"size_multiplier":1}`,
+  }
+}
+
+describe('committee -- Markov regime gate', () => {
+  it('Markov agrees with majority + mild specialist split → action goes through (NOT abstain)', async () => {
+    // markov_signal=+0.55 agrees with buy; LLM risk officer wants to veto on disagreement
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: makeEnrichmentJson(0.55),
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(markovBaseScript(0.60))))
+    expect(result.decision).toBe('approve')
+    expect(result.action).toBe('buy')
+    expect(result.transcript.risk_officer.veto).toBe(false)
+    expect(result.transcript.risk_officer.reason).toContain('markov_signal')
+  })
+
+  it('Markov conflicts with action (buy, markov_signal=-0.6) → Risk Officer veto with markov_conflict reason', async () => {
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: makeEnrichmentJson(-0.6),
+    }
+    // LLM says no-veto; gate should override to veto
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"All clear","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+    expect(result.transcript.risk_officer.veto).toBe(true)
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('markov_conflict'))).toBe(true)
+  })
+
+  it('Markov absent + avg confidence 0.50 + mild split → goes through', async () => {
+    // No markov_regime in enrichment; avg conf 0.50 >= 0.45 fallback floor.
+    // With no Markov, the gate only adds vetoes -- it does not clear LLM vetoes.
+    // So the LLM must say veto:false for the trade to proceed.
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: null,
+    }
+    const script = {
+      ...markovBaseScript(0.50),
+      // LLM clears veto; gate has no opinion at conf=0.50 >= 0.45 -- trade goes through.
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"Borderline but acceptable","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('approve')
+    expect(result.transcript.risk_officer.veto).toBe(false)
+  })
+
+  it('Markov absent + avg confidence 0.40 + mild split → still vetoes (below 0.45 fallback floor)', async () => {
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: null,
+    }
+    const script = {
+      ...markovBaseScript(0.40),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"Borderline but ok","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+    expect(result.transcript.risk_officer.veto).toBe(true)
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('no_markov_confidence'))).toBe(true)
+  })
+
+  it('Hard veto: avg confidence 0.20 → veto regardless of Markov', async () => {
+    // Markov is strongly bullish but confidence is below absolute floor
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: makeEnrichmentJson(0.9),
+    }
+    const script = {
+      ...markovBaseScript(0.20),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"Score is high, proceed","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+    expect(result.transcript.risk_officer.veto).toBe(true)
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('hard_confidence_floor'))).toBe(true)
+  })
+
+  it('Markov neutral (signal=0.0) with buy action → does not conflict, trade goes through', async () => {
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: makeEnrichmentJson(0.0),
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(markovBaseScript(0.60))))
+    expect(result.decision).toBe('approve')
+    expect(result.transcript.risk_officer.veto).toBe(false)
+  })
+
+  it('Markov at exact boundary (-0.30 with buy) → does not veto (boundary is exclusive)', async () => {
+    // markov_signal = -0.30, threshold is <= -0.30, so -0.30 should veto
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      enrichment_json: makeEnrichmentJson(-0.30),
+    }
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"ok","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    // -0.30 <= -0.30 is true → veto
+    expect(result.decision).toBe('abstain')
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('markov_conflict'))).toBe(true)
+  })
+
+  it('Sell action: Markov negative signal agrees with sell → goes through', async () => {
+    const signal: CommitteeSignalInput = {
+      ...baseSignal,
+      side: 'sell',
+      enrichment_json: makeEnrichmentJson(-0.7),
+    }
+    const script = {
+      ...markovBaseScript(0.65, 'sell'),
+      'committee-risk-officer': '{"role":"risk_officer","veto":true,"reason":"Specialists disagree on sell","concerns":["split"]}',
+      'committee-trader': '{"role":"trader","action":"sell","thesis":"bear regime","confidence":0.65,"size_multiplier":1}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('approve')
+    expect(result.action).toBe('sell')
+    expect(result.transcript.risk_officer.veto).toBe(false)
+  })
+})
+
 describe('committee -- rollup injection', () => {
   const rollupScript: Record<string, string> = {
     'committee-quant': '{"role":"quant","opinion":"neutral","confidence":0.5,"concerns":[]}',

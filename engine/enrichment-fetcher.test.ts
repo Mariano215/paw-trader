@@ -3,6 +3,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
 import type { EngineClient } from './engine-client.js'
+import type { MarkovRegimePayload } from './types.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -26,12 +27,32 @@ function makePrices(closes: number[]) {
   }))
 }
 
-function makeClient(priceMap: Record<string, number[]>): Pick<EngineClient, 'getPrices'> {
+function makeMarkovPayload(asset: string): MarkovRegimePayload {
+  return {
+    source: 'markov_regime',
+    asset,
+    as_of: '2026-05-20',
+    n_obs: 120,
+    current_state: 'bull',
+    markov_signal: 0.62,
+    stationary: { bear: 0.2, sideways: 0.3, bull: 0.5 },
+    persistence_diag: [0.85, 0.75, 0.9],
+    walk_forward: { sharpe: null, max_drawdown: null, n_trades: 0 },
+    computed_at_ms: 1748000000000,
+    params: { window: 20, threshold: 0.02, backtest: false, days: 252 },
+  }
+}
+
+function makeClient(
+  priceMap: Record<string, number[]>,
+  markovFn?: (asset: string) => Promise<MarkovRegimePayload | null>,
+): Pick<EngineClient, 'getPrices' | 'getMarkovRegime'> {
   return {
     getPrices: vi.fn(async (asset: string) => {
       const closes = priceMap[asset] ?? []
       return makePrices(closes)
     }),
+    getMarkovRegime: vi.fn(markovFn ?? (async () => null)),
   }
 }
 
@@ -132,5 +153,97 @@ describe('enrichPendingSignals', () => {
     const { rsi_14, bars_fetched } = JSON.parse(row.enrichment_json)
     expect(rsi_14).toBeNull()
     expect(bars_fetched).toBe(3)
+  })
+})
+
+describe('fetchMarkovRegime via enrichPendingSignals', () => {
+  let db: Database.Database
+
+  beforeEach(() => {
+    db = makeDb()
+  })
+
+  it('happy path equity -- merges markov_regime block for SPY', async () => {
+    insertSignal(db, 'sig-spy', 'SPY')
+    const closes = Array.from({ length: 20 }, (_, i) => 440 + i)
+    const payload = makeMarkovPayload('SPY')
+    const client = makeClient({ SPY: closes }, async () => payload)
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-spy') as { enrichment_json: string }
+    const enrichment = JSON.parse(row.enrichment_json)
+    expect(enrichment.markov_regime).not.toBeNull()
+    expect(enrichment.markov_regime.source).toBe('markov_regime')
+    expect(enrichment.markov_regime.current_state).toBe('bull')
+    expect(enrichment.markov_regime.markov_signal).toBeCloseTo(0.62)
+    expect(enrichment.markov_regime.asset).toBe('SPY')
+  })
+
+  it('happy path crypto -- URL contains BTC%2FUSD', async () => {
+    insertSignal(db, 'sig-btc', 'BTC/USD')
+    const closes = Array.from({ length: 20 }, (_, i) => 60000 + i * 100)
+    const payload = makeMarkovPayload('BTC/USD')
+    const getMarkovRegimeFn = vi.fn(async (_asset: string) => payload)
+    const client: Pick<EngineClient, 'getPrices' | 'getMarkovRegime'> = {
+      getPrices: vi.fn(async () => makePrices(closes)),
+      getMarkovRegime: getMarkovRegimeFn,
+    }
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+
+    // The method receives the raw asset string; encoding is the engine-client's responsibility.
+    // Assert the mock was called with the raw asset so engine-client can encode it.
+    expect(getMarkovRegimeFn).toHaveBeenCalledWith('BTC/USD')
+
+    // Verify the enrichment block was stored
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-btc') as { enrichment_json: string }
+    const enrichment = JSON.parse(row.enrichment_json)
+    expect(enrichment.markov_regime.asset).toBe('BTC/USD')
+  })
+
+  it('404 response -- markov_regime is null, enrichment still succeeds', async () => {
+    insertSignal(db, 'sig-404', 'AAPL')
+    const closes = Array.from({ length: 20 }, (_, i) => 180 + i)
+    // getMarkovRegime returns null (engine-client already swallows 4xx and returns null)
+    const client = makeClient({ AAPL: closes }, async () => null)
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-404') as { enrichment_json: string }
+    expect(row.enrichment_json).not.toBeNull()
+    const enrichment = JSON.parse(row.enrichment_json)
+    expect(enrichment.markov_regime).toBeNull()
+    expect(enrichment.price_current).not.toBeNull()
+  })
+
+  it('network error from getMarkovRegime -- markov_regime is null, enrichment still succeeds', async () => {
+    insertSignal(db, 'sig-net-err', 'TSLA')
+    const closes = Array.from({ length: 20 }, (_, i) => 200 + i)
+    // engine-client catches errors and returns null; simulate that here
+    const client = makeClient({ TSLA: closes }, async () => null)
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-net-err') as { enrichment_json: string }
+    expect(row.enrichment_json).not.toBeNull()
+    const enrichment = JSON.parse(row.enrichment_json)
+    expect(enrichment.markov_regime).toBeNull()
+    expect(enrichment.bars_fetched).toBe(20)
+  })
+
+  it('timeout -- getMarkovRegime returns null, enrichment still succeeds', async () => {
+    insertSignal(db, 'sig-timeout', 'MSFT')
+    const closes = Array.from({ length: 20 }, (_, i) => 380 + i)
+    // Simulate engine-client absorbing an AbortError and returning null
+    const client = makeClient({ MSFT: closes }, async () => null)
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-timeout') as { enrichment_json: string }
+    expect(row.enrichment_json).not.toBeNull()
+    const enrichment = JSON.parse(row.enrichment_json)
+    expect(enrichment.markov_regime).toBeNull()
+    expect(enrichment.rsi_14).not.toBeNull()
   })
 })

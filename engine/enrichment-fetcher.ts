@@ -13,6 +13,7 @@
 
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
+import type { MarkovRegimePayload } from './types.js'
 import { logger } from '../logger.js'
 
 export interface SignalEnrichment {
@@ -36,6 +37,8 @@ export interface SignalEnrichment {
   bars_fetched: number
   /** UTC ms when enrichment was computed. */
   fetched_at: number
+  /** Markov regime payload from GET /signals/markov/{asset}. Null when unavailable. */
+  markov_regime: MarkovRegimePayload | null
 }
 
 /**
@@ -70,7 +73,7 @@ function pctChange(from: number, to: number): number {
   return round2(((to - from) / from) * 100)
 }
 
-function computeEnrichment(closes: number[]): SignalEnrichment {
+function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null): SignalEnrichment {
   const n = closes.length
   const now = Date.now()
 
@@ -86,6 +89,7 @@ function computeEnrichment(closes: number[]): SignalEnrichment {
       pct_from_window_high: null,
       bars_fetched: 0,
       fetched_at: now,
+      markov_regime: markov,
     }
   }
 
@@ -108,6 +112,7 @@ function computeEnrichment(closes: number[]): SignalEnrichment {
     pct_from_window_high: round2(((current - windowHigh) / windowHigh) * 100),
     bars_fetched:         n,
     fetched_at:           now,
+    markov_regime:        markov,
   }
 }
 
@@ -138,8 +143,9 @@ export async function enrichPendingSignals(
   const fromMs = now - LOOKBACK_MS
   const toMs   = now
 
-  // One price fetch per unique asset
+  // One price fetch + one markov fetch per unique asset
   const priceCache = new Map<string, number[]>()
+  const markovCache = new Map<string, MarkovRegimePayload | null>()
 
   const uniqueAssets = [...new Set(signals.map(s => s.asset))]
   await Promise.allSettled(
@@ -153,6 +159,12 @@ export async function enrichPendingSignals(
         logger.warn({ err, asset }, 'enrichment: price fetch failed; signal stays unenriched')
         priceCache.set(asset, [])
       }
+
+      const markov = await client.getMarkovRegime(asset)
+      markovCache.set(asset, markov)
+      if (markov != null) {
+        logger.debug({ asset, state: markov.current_state }, 'enrichment: markov regime fetched')
+      }
     }),
   )
 
@@ -164,7 +176,8 @@ export async function enrichPendingSignals(
       const closes = priceCache.get(signal.asset) ?? []
       // Skip if engine returned no bars (offline or asset not tracked)
       if (closes.length === 0) continue
-      const data = computeEnrichment(closes)
+      const markov = markovCache.get(signal.asset) ?? null
+      const data = computeEnrichment(closes, markov)
       update.run(JSON.stringify(data), signal.id)
       enriched++
     }

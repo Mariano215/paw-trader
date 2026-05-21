@@ -112,6 +112,28 @@ export interface PricePoint {
 }
 
 // ---------------------------------------------------------------------------
+// Markov regime -- enrichment-fetcher
+// ---------------------------------------------------------------------------
+
+export interface MarkovRegimePayload {
+  source: 'markov_regime';
+  asset: string;
+  as_of: string;                // ISO date
+  n_obs: number;
+  current_state: 'bear' | 'sideways' | 'bull';
+  markov_signal: number;        // in [-1, +1]
+  stationary: { bear: number; sideways: number; bull: number };
+  persistence_diag: [number, number, number];  // [bear->bear, side->side, bull->bull]
+  walk_forward: {
+    sharpe: number | null;
+    max_drawdown: number | null;
+    n_trades: number;
+  };
+  computed_at_ms: number;
+  params: { window: number; threshold: number; backtest: boolean; days: number };
+}
+
+// ---------------------------------------------------------------------------
 // Signal telemetry -- Phase 8C Analyst Paw
 // ---------------------------------------------------------------------------
 

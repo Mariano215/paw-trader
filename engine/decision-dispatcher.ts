@@ -260,7 +260,12 @@ export async function dispatchApproval(
         )
         return null
       })
-      const navCap = nav != null ? nav * RISK_MULTIPLIER : DEFAULT_SIZE_USD
+      // Treat null OR non-positive NAV as "no usable NAV" so cold-start
+      // engines (no positions, no snapshots -> nav=0) fall back to the
+      // hard default cap instead of zeroing the cap and submitting
+      // size_usd=0, which the engine rejects with 422 position_sizer.
+      const navUsable = nav != null && nav > 0
+      const navCap = navUsable ? nav * RISK_MULTIPLIER : DEFAULT_SIZE_USD
       cap = Math.min(navCap, HARD_CEILING_USD)
     }
     const sizeUsd = Math.min(ladderScaled, cap)
@@ -452,6 +457,22 @@ export async function autoDispatchPendingSignals(
       const sizeUsd    = committeeResult.size_usd > 0 ? committeeResult.size_usd : DEFAULT_SIZE_USD
       const decisionId = randomUUID()
       const now        = Date.now()
+
+      // Audit log so the 422 root cause is visible without re-arming a
+      // monitor. Records what payload we actually sent to the engine.
+      logger.info(
+        {
+          event:       'trader.auto_dispatch.submit',
+          signalId:    signal.id,
+          decisionId,
+          asset:       signal.asset,
+          side:        committeeResult.action ?? signal.side,
+          size_usd:    sizeUsd,
+          confidence:  committeeResult.confidence,
+          strategy:    signal.strategy_id,
+        },
+        'auto-dispatch submitting decision to engine',
+      )
 
       try {
         await engineClient.submitDecision({

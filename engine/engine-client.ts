@@ -12,8 +12,10 @@ import type {
   NavPeriod,
   PricePoint,
   SignalTelemetrySummary,
+  MarkovRegimePayload,
 } from "./types.js";
 import { getCredential } from "../credentials.js";
+import { logger } from "../logger.js";
 
 export interface EngineClientOptions {
   baseUrl: string;
@@ -44,7 +46,19 @@ export class EngineClient {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!resp.ok) {
-      throw new Error("Engine API error " + resp.status + " on " + path);
+      // Capture response body so 4xx validation errors and 5xx engine errors
+      // surface their actual cause in logs. Without this every failure shows
+      // up as a bare status code; tracking down a 422 takes a manual curl.
+      let body = "";
+      try {
+        body = await resp.text();
+      } catch {
+        body = "<unable to read response body>";
+      }
+      const trimmed = body.length > 800 ? body.slice(0, 800) + "...(truncated)" : body;
+      throw new Error(
+        "Engine API error " + resp.status + " on " + path + " :: " + trimmed,
+      );
     }
     return resp.json() as Promise<T>;
   }
@@ -268,6 +282,45 @@ export class EngineClient {
     return this.requestNullable<SignalTelemetrySummary>(
       `/signals/telemetry?days=${days}`,
     )
+  }
+
+  /**
+   * GET /signals/markov/{asset} -- Markov-chain regime payload for enrichment.
+   * The asset segment is URI-encoded so BTC/USD becomes BTC%2FUSD on the wire
+   * while FastAPI's `path` converter decodes it back to BTC/USD server-side.
+   *
+   * Hard 5 s timeout -- Markov computation is fast but we cannot let a hung
+   * engine stall the enrichment pipeline.  Returns null on ANY error (network,
+   * 4xx, 5xx, timeout, parse failure) so callers always get a result even when
+   * the regime endpoint is unavailable.
+   *
+   * backtest=false skips the walk-forward backtest (~1.5 s saved per call);
+   * the nightly job refreshes walk-forward results independently.
+   */
+  async getMarkovRegime(asset: string): Promise<MarkovRegimePayload | null> {
+    const path = `/signals/markov/${encodeURIComponent(asset)}?backtest=false&window=20&threshold=0.02`;
+    const url = this.baseUrl + path;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          'X-Engine-Token': this.token,
+          'Content-Type': 'application/json',
+        },
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        logger.warn({ asset, status: resp.status }, 'enrichment: markov regime fetch non-2xx');
+        return null;
+      }
+      return (await resp.json()) as MarkovRegimePayload;
+    } catch (err) {
+      logger.warn({ asset, err }, 'enrichment: markov regime fetch failed');
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 

@@ -105,6 +105,25 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
 
   const tickMs = deps.tickMs ?? DEFAULT_TICK_MS
 
+  // Crash recovery: any signal stuck in 'dispatching' from a prior bot
+  // process never finished its dispatch loop (likely killed mid-claim).
+  // Reset them to 'pending' so the next tick picks them up; otherwise
+  // autoDispatchPendingSignals' "WHERE status = 'pending'" query silently
+  // returns 0 rows and the queue stays frozen across restarts.
+  try {
+    const reset = deps.db
+      .prepare("UPDATE trader_signals SET status = 'pending' WHERE status = 'dispatching'")
+      .run()
+    if (reset.changes > 0) {
+      logger.warn(
+        { resetCount: reset.changes },
+        'Trader scheduler: reset stuck dispatching rows on startup',
+      )
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader scheduler: dispatching-row reset failed (non-fatal)')
+  }
+
   logger.info({ tickMs }, 'Trader scheduler started')
 
   const tick = () => {

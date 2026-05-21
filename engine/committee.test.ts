@@ -6,8 +6,10 @@ import {
   storeTranscript,
   parseAgentJson,
   buildSignalContext,
+  classifyVetoCategory,
   type CommitteeDeps,
   type CommitteeSignalInput,
+  type RiskVerdict,
 } from './committee.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
@@ -90,6 +92,61 @@ describe('committee -- helpers', () => {
     expect(ctx).toContain(`score_threshold: ${TRADER_SIGNAL_SCORE_THRESHOLD}`)
     expect(ctx).toContain(`score_multiple_of_threshold: ${(0.72 / TRADER_SIGNAL_SCORE_THRESHOLD).toFixed(2)}`)
     expect(ctx).toContain('enrichment: {"rsi":45}')
+  })
+})
+
+describe('committee -- classifyVetoCategory', () => {
+  const base = (over: Partial<RiskVerdict>): RiskVerdict => ({
+    role: 'risk_officer',
+    veto: true,
+    reason: '',
+    concerns: [],
+    ...over,
+  })
+
+  it('prefers structured category field', () => {
+    expect(classifyVetoCategory(base({ category: 'event_risk', reason: 'specialists disagree' })))
+      .toBe('event_risk')
+    expect(classifyVetoCategory(base({ category: 'disagreement' }))).toBe('disagreement')
+  })
+
+  it("returns 'none' when veto is false and no category", () => {
+    expect(classifyVetoCategory(base({ veto: false }))).toBe('none')
+  })
+
+  it('detects disagreement via whole-word fallback', () => {
+    expect(classifyVetoCategory(base({ reason: 'Specialists disagree on direction.' })))
+      .toBe('disagreement')
+    expect(classifyVetoCategory(base({ reason: 'Mixed signals; thin conviction.' })))
+      .toBe('disagreement')
+    expect(classifyVetoCategory(base({ reason: 'Low confidence across the board.' })))
+      .toBe('disagreement')
+  })
+
+  it('does NOT match negated disagreement phrasing (no false positives)', () => {
+    expect(classifyVetoCategory(base({ reason: 'No disagreement, but earnings tomorrow.' })))
+      .toBe('none')
+    expect(classifyVetoCategory(base({ reason: 'Not split; halt risk on this name.' })))
+      .toBe('none')
+  })
+
+  it('does NOT match substring-only hits (e.g. "conflict" inside "no conflict")', () => {
+    // Negation stripping removes "no conflict"; nothing else matches.
+    expect(classifyVetoCategory(base({ reason: 'No conflict here, but SEC action pending.' })))
+      .toBe('none')
+  })
+
+  it("returns 'none' for event-risk reasons without disagreement keywords", () => {
+    expect(classifyVetoCategory(base({ reason: 'Earnings in 24 hours; preserve capital.' })))
+      .toBe('none')
+    expect(classifyVetoCategory(base({ reason: 'Halt risk after regulatory headline.' })))
+      .toBe('none')
+  })
+
+  it("category 'none' on a true-veto verdict still returns 'none'", () => {
+    // If the LLM explicitly tags 'none', trust it -- the gate will not clear.
+    expect(classifyVetoCategory(base({ category: 'none', reason: 'specialists disagree' })))
+      .toBe('none')
   })
 })
 

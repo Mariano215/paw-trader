@@ -10,8 +10,24 @@ round 2 rebuttals when present.
 Produce JSON on a single line. No prose around it:
 
 ```
-{"role":"risk_officer","veto":<true|false>,"reason":"<1-2 sentence justification>","concerns":["<short concern>", ...]}
+{"role":"risk_officer","veto":<true|false>,"category":"<category>","reason":"<1-2 sentence justification>","concerns":["<short concern>", ...]}
 ```
+
+The `category` field is REQUIRED. Use exactly one of these values:
+- `disagreement` -- specialists split, mixed direction, weak/low avg confidence,
+  thin conviction. Use when the doubt is internal (committee uncertainty).
+- `event_risk`   -- pending earnings within 48h, known SEC action, halt risk,
+  regulatory headline, crowded trade at late-cycle valuation. Use when the
+  doubt is external (something concrete about the asset or market).
+- `confidence`   -- avg committee confidence below an absolute floor (purely
+  a number-driven veto with no specific event).
+- `size`         -- the proposed size would breach a circuit-breaker context.
+- `data`         -- a critical risk dimension is missing AND the trade would
+  commit more than default Phase-1 size.
+- `none`         -- no veto (only valid when `veto` is false).
+
+The downstream Markov tiebreaker only clears `disagreement` vetoes. Use
+`event_risk` for genuine red flags so they are preserved.
 
 Veto triggers (non-exhaustive, use judgment):
 - Size would breach any circuit breaker context the committee is aware of.

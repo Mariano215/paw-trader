@@ -73,11 +73,36 @@ export interface CoordinatorSynthesis {
   challenges: Array<{ role: string; question: string }>
 }
 
+/**
+ * Reason category the risk officer attaches to a verdict. Lets downstream
+ * gates (e.g. Markov tiebreaker) treat "disagreement" vetoes differently
+ * from genuine event-risk vetoes without keyword-matching free-text.
+ *
+ * - disagreement: specialists split / low avg confidence / weak conviction
+ * - event_risk:   earnings, halt, SEC action, regulatory headline
+ * - confidence:   below absolute confidence floor
+ * - size:         circuit breaker / position-size breach
+ * - data:         missing critical risk data
+ * - none:         no veto (or category not provided)
+ */
+export type RiskVetoCategory =
+  | 'disagreement'
+  | 'event_risk'
+  | 'confidence'
+  | 'size'
+  | 'data'
+  | 'none'
+
 export interface RiskVerdict {
   role: 'risk_officer'
   veto: boolean
   reason: string
   concerns: string[]
+  /**
+   * Optional category for the verdict. Older / parse-degraded LLM outputs
+   * may omit this; callers must handle absence (see classifyVetoCategory).
+   */
+  category?: RiskVetoCategory
 }
 
 export interface TraderVerdict {
@@ -253,6 +278,46 @@ function parseMarkovRegime(enrichmentJson: string | null): MarkovRegimePayload |
  * Returns null when no deterministic override needed (LLM verdict stands).
  * Returns a RiskVerdict when the gate fires.
  */
+
+/**
+ * Classify a risk officer veto into a category.
+ *
+ * Prefers the structured `category` field on the verdict (returned by the
+ * current risk officer prompt). When absent (older prompts, fallback paths,
+ * or parse-degraded outputs), falls back to keyword matching on the reason
+ * text with word boundaries to avoid the "no conflict" matches "conflict"
+ * class of false positives.
+ *
+ * Keyword fallback is intentionally narrow: only fires on whole-word hits
+ * for disagreement-shaped reasons.  Anything else, including event_risk
+ * keywords, falls through to 'none' so the gate treats the LLM veto as
+ * non-overridable.
+ */
+export function classifyVetoCategory(v: RiskVerdict): RiskVetoCategory {
+  if (v.category) return v.category
+  if (!v.veto) return 'none'
+  const reason = (v.reason ?? '').toLowerCase()
+  // Strip easy negations so "no disagreement" / "not split" don't match.
+  const stripped = reason.replace(/\b(no|not|without)\s+\w+/g, '')
+  const disagreementWords = [
+    'disagree', 'disagreement',
+    'split', 'splits',
+    'diverge', 'divergent', 'divergence',
+    'conflict', 'conflicting',
+    'mixed',
+    'thin conviction',
+    'low conviction',
+    'low confidence',
+    'weak consensus',
+  ]
+  // Whole-word match (handles "thin conviction" as a phrase too).
+  const hit = disagreementWords.some((w) => {
+    const pattern = new RegExp(`\\b${w.replace(/\s+/g, '\\s+')}\\b`)
+    return pattern.test(stripped)
+  })
+  return hit ? 'disagreement' : 'none'
+}
+
 function applyDeterministicRiskGate(
   action: 'buy' | 'sell',
   avgConfidence: number,
@@ -517,14 +582,14 @@ export async function runCommittee(
         ? coordinator.consensus_direction
         : signal.side
     // Classify whether the LLM veto was disagreement-type so the gate knows
-    // whether to clear it when Markov agrees.  Any other reason (earnings,
+    // whether to clear it when Markov agrees. Any other category (earnings,
     // halt, sector risk) is treated as a genuine event-risk veto and preserved.
-    const DISAGREEMENT_PATTERNS = [
-      'disagree', 'split', 'mixed', 'diverge', 'conflict', 'low confidence', 'thin conviction',
-    ]
+    //
+    // Prefer the structured `category` field; fall back to word-boundary
+    // keyword matching on the reason text when the LLM omits it (older
+    // prompts or parse-degraded outputs).
     const llmVetoedOnDisagreement =
-      riskVerdict.veto &&
-      DISAGREEMENT_PATTERNS.some((p) => riskVerdict.reason.toLowerCase().includes(p))
+      riskVerdict.veto && classifyVetoCategory(riskVerdict) === 'disagreement'
     const gateVerdict = applyDeterministicRiskGate(proposedAction, avgConf, markov, llmVetoedOnDisagreement)
     if (gateVerdict !== null) {
       logger.debug(

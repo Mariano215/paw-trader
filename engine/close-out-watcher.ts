@@ -20,6 +20,7 @@ import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
 import { recomputeTrackRecord } from './track-record.js'
+import { insertPnlSnapshot, getLastCumulativePnl } from './db.js'
 import {
   computeVerdict,
   rollUpFills,
@@ -450,6 +451,64 @@ export async function runCloseOutSweep(
       errors += 1
     }
   }
+  // Write a daily PnL snapshot when at least one verdict closed this
+  // pass. nav_open/nav_close require the engine; fetch best-effort and
+  // fall back to 0 so the trade-count and pnl_day columns always land.
+  // cumulative_pnl carries forward from the last stored row.
+  if (processed > 0) {
+    try {
+      const todayNY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+      // Sum pnl_net for verdicts closed today -- pull from DB so we
+      // capture verdicts written in prior ticks on the same calendar day,
+      // not just the ones written this pass.
+      const pnlRow = db.prepare(`
+        SELECT COALESCE(SUM(pnl_net), 0) AS total_pnl, COUNT(*) AS cnt
+        FROM trader_verdicts
+        WHERE date(closed_at / 1000, 'unixepoch', 'localtime') = ?
+      `).get(todayNY) as { total_pnl: number; cnt: number }
+
+      let navOpen = 0
+      let navClose = 0
+      try {
+        const [openSnap, closeSnap] = await Promise.all([
+          engineClient.getNavLatest('day_open'),
+          engineClient.getNavLatest('day_close'),
+        ])
+        navOpen = openSnap?.nav ?? 0
+        navClose = closeSnap?.nav ?? 0
+      } catch {
+        // engine unreachable -- leave nav at 0, snapshot still useful
+      }
+
+      const prior = getLastCumulativePnl(db)
+      // Avoid double-counting: subtract any prior cumulative that already
+      // includes today's row (INSERT OR REPLACE will overwrite it).
+      const priorRow = db.prepare(
+        `SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date = ?`,
+      ).get(todayNY) as { cumulative_pnl: number } | undefined
+      const priorToday = priorRow?.cumulative_pnl ?? 0
+      const priorBase = prior - priorToday
+
+      insertPnlSnapshot(db, {
+        date: todayNY,
+        navOpen,
+        navClose,
+        pnlDay: pnlRow.total_pnl,
+        tradesCount: pnlRow.cnt,
+        benchReturn: 0,   // backfilled later when /prices available
+        cumulativePnl: priorBase + pnlRow.total_pnl,
+      })
+
+      logger.info(
+        { date: todayNY, pnlDay: pnlRow.total_pnl, tradesCount: pnlRow.cnt, navOpen, navClose },
+        'Close-out sweep: daily PnL snapshot written',
+      )
+    } catch (err) {
+      logger.warn({ err }, 'Close-out sweep: PnL snapshot write failed; verdicts already persisted')
+    }
+  }
+
   return { processed, stillOpen, errors }
 }
 

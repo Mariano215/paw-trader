@@ -509,6 +509,13 @@ export async function runCloseOutSweep(
     }
   }
 
+  if (errors > 0) {
+    logger.warn(
+      { errors, processed, stillOpen },
+      'Close-out sweep: completed with errors -- decisions stuck on no-fills or partial may accumulate',
+    )
+  }
+
   return { processed, stillOpen, errors }
 }
 

@@ -102,7 +102,10 @@ export function computeTrackRecord(
     if (v.pnl_gross > 0) {
       win_count += 1
       winnerPcts.push(pct)
-    } else if (v.pnl_gross < 0) {
+    } else {
+      // Break-even trades (pnl_gross === 0) count as losses -- conservative
+      // convention that keeps win_count + loser_count === trade_count and
+      // avoids inflating win rate by silently excluding zero-pnl closes.
       loserPcts.push(pct)
     }
     net_pnl_usd += v.pnl_net

@@ -124,6 +124,26 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
     logger.warn({ err }, 'Trader scheduler: dispatching-row reset failed (non-fatal)')
   }
 
+  // Crash recovery: decision rows left at 'submitting' mean the process crashed
+  // after the INSERT but before the engine ACK.  On restart the signal is reset
+  // to 'pending' (above) so it re-enters dispatch with a new decisionId.  Mark
+  // the orphaned decision rows 'failed' so they don't pollute audit queries and
+  // so the duplicate guard (engine_order_id IS NOT NULL) can never falsely match
+  // them (it won't -- NULL != NOT NULL -- but 'failed' makes intent explicit).
+  try {
+    const orphaned = deps.db
+      .prepare("UPDATE trader_decisions SET status = 'failed' WHERE status = 'submitting'")
+      .run()
+    if (orphaned.changes > 0) {
+      logger.warn(
+        { count: orphaned.changes },
+        'Trader scheduler: marked orphaned submitting decisions as failed on startup',
+      )
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader scheduler: submitting-row cleanup failed (non-fatal)')
+  }
+
   logger.info({ tickMs }, 'Trader scheduler started')
 
   const tick = () => {
@@ -235,6 +255,11 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   } catch (err) {
     _healthCheckConsecutiveFailures++
+    // If the engine was previously halted (_haltAlertSent=true) and health is
+    // now unreachable, keep reconcilerHalted=true so dispatch stays blocked.
+    // This prevents a Tailscale blip from silently re-opening the dispatch gate
+    // while the underlying halt condition is still active.
+    if (_haltAlertSent) reconcilerHalted = true
     logger.warn({ err, consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader tick: health check failed')
     if (_healthCheckConsecutiveFailures >= ENGINE_UNREACHABLE_THRESHOLD && !_engineUnreachableAlertSent) {
       _engineUnreachableAlertSent = true
@@ -260,7 +285,12 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       _consecutiveZeroPollCount = 0
     }
   } catch (err) {
-    _consecutiveZeroPollCount = 0
+    // Poll error ≠ signal drought.  The engine may be unreachable, which is a
+    // separate condition covered by the ENGINE_UNREACHABLE_THRESHOLD alert in
+    // the health-check section above.  Incrementing the drought counter on every
+    // throw would fire a "no signals" alert during an engine outage, which is the
+    // wrong framing and causes two simultaneous alarms for the same root cause.
+    // Do not touch _consecutiveZeroPollCount here.
     logger.warn({ err }, 'Trader tick: signal poll failed')
   }
 
@@ -278,14 +308,22 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   }
 
   // 2. Auto-dispatch pending signals through the committee.
-  try {
-    const dispatched = await autoDispatchPendingSignals(deps.db, {
-      send: deps.send,
-      alertOnReject: process.env.TRADER_ALERT_ON_REJECT === 'true',
-    })
-    sent = dispatched.length
-  } catch (err) {
-    logger.error({ err }, 'Trader tick: auto-dispatch failed')
+  // Skipped when the reconciler is halted: dispatching signals while the engine
+  // cannot reconcile orders would push approvals that can never execute, which
+  // misleads the operator and wastes committee budget. Wait for the halt to
+  // clear (signalled by reconcilerHalted returning to false next tick).
+  if (reconcilerHalted) {
+    logger.info('Trader tick: skipping auto-dispatch because reconciler is halted')
+  } else {
+    try {
+      const dispatched = await autoDispatchPendingSignals(deps.db, {
+        send: deps.send,
+        alertOnReject: process.env.TRADER_ALERT_ON_REJECT === 'true',
+      })
+      sent = dispatched.length
+    } catch (err) {
+      logger.error({ err }, 'Trader tick: auto-dispatch failed')
+    }
   }
 
   // 3. Time out approvals older than 30 min and notify the operator so a

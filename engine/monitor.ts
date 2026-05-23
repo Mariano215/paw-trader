@@ -480,6 +480,22 @@ export async function evaluateAndRecordNavDrop(
   }
   const comparison = inWindow[inWindow.length - 1] // oldest in window
 
+  // Guard against a zero or negative comparison NAV.  Dividing by zero
+  // produces NaN; NaN < threshold is always false in JavaScript, which
+  // silently suppresses the halt alert.  A zero NAV is almost certainly
+  // a data error from the engine, not a real portfolio state -- skip the
+  // comparison rather than firing a spurious halt or missing a real one.
+  if (comparison.nav <= 0) {
+    return { fire: false, halt: false }
+  }
+
+  // Guard current NAV too: a zero or negative current NAV from a bad engine
+  // snapshot would produce dropPct >= 1.0 (100% drop) and fire a spurious halt.
+  // Same rationale as the comparison guard above.
+  if (current.nav <= 0) {
+    return { fire: false, halt: false }
+  }
+
   // Positive number when NAV dropped.  A NAV recovery (current > comparison)
   // produces a negative drop_pct and never fires.
   const dropPct = (comparison.nav - current.nav) / comparison.nav

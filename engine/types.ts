@@ -80,7 +80,7 @@ export interface DecisionStatus {
 
 export interface SubmitDecisionResult {
   client_order_id: string;
-  broker_order_id: string;
+  broker_order_id: string | null;
   status: string;
   approved_size_usd: number;
 }

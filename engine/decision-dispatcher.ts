@@ -416,7 +416,7 @@ export async function autoDispatchPendingSignals(
           committeeResult = await runCommitteeImpl(committeeInput, {
             runAgent: runAgentImpl,
             defaultSizeUsd: DEFAULT_SIZE_USD,
-            maxSizeUsd: DEFAULT_SIZE_USD,
+            maxSizeUsd: COMMITTEE_MAX_SIZE_USD,
             db,
           })
         } catch (err) {
@@ -475,17 +475,21 @@ export async function autoDispatchPendingSignals(
       )
 
       try {
-        await engineClient.submitDecision({
-          decision_id:  decisionId,
-          asset:        signal.asset,
-          side:         committeeResult.action ?? signal.side,
-          size_usd:     sizeUsd,
-          entry_type:   'market',
-          entry_price:  0,
-          strategy:     signal.strategy_id,
-          confidence:   committeeResult.confidence,
-        })
+        // Duplicate guard: if a decision row for this signal already has an
+        // engine_order_id, the broker already accepted a previous submission.
+        // Skip rather than double-submit.
+        const existing = db.prepare(
+          "SELECT id FROM trader_decisions WHERE signal_id = ? AND engine_order_id IS NOT NULL LIMIT 1",
+        ).get(signal.id)
+        if (existing) {
+          logger.warn({ signalId: signal.id, decisionId }, 'Duplicate guard hit — skipping re-submission')
+          db.prepare("UPDATE trader_signals SET status = 'executed' WHERE id = ?").run(signal.id)
+          continue
+        }
 
+        // INSERT first so the audit row exists before the broker sees the order.
+        // Status 'submitting' prevents a crash-between-insert-and-submit from
+        // leaving the row in a state that triggers a duplicate next tick.
         db.prepare(`
           INSERT INTO trader_decisions
             (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, committee_transcript_id, decided_at, status)
@@ -497,11 +501,39 @@ export async function autoDispatchPendingSignals(
           committeeResult.thesis,
           committeeResult.confidence,
           committeeResult.transcript_id,
-          now, 'executed',
+          now, 'submitting',
         )
 
-        db.prepare("UPDATE trader_signals SET status = 'executed' WHERE id = ?")
-          .run(signal.id)
+        let engineResult: Awaited<ReturnType<EngineClient['submitDecision']>>
+        try {
+          engineResult = await engineClient.submitDecision({
+            decision_id:  decisionId,
+            asset:        signal.asset,
+            side:         committeeResult.action ?? signal.side,
+            size_usd:     sizeUsd,
+            entry_type:   'market',
+            entry_price:  0,
+            strategy:     signal.strategy_id,
+            confidence:   committeeResult.confidence,
+          })
+        } catch (engineErr) {
+          logger.error({ err: engineErr, signalId: signal.id, decisionId }, 'Engine submission failed during auto-dispatch')
+          db.prepare("UPDATE trader_decisions SET status = 'failed' WHERE id = ?").run(decisionId)
+          db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
+          // Alert operator: 'failed' is terminal — signal will not be retried.
+          await deps.send(
+            `TRADER ALERT: Signal ${signal.id} (${signal.asset} ${signal.side}) failed engine submission and will not retry. ` +
+            `Error: ${engineErr instanceof Error ? engineErr.message : String(engineErr)}`,
+          ).catch(() => {/* send errors must not block the continue */})
+          continue
+        }
+
+        // Write the broker order ID so the duplicate guard (engine_order_id IS NOT NULL)
+        // can fire on the next tick if this signal is somehow re-queued.  Without this
+        // write the guard is dead code and the engine gets double-submitted.
+        db.prepare("UPDATE trader_decisions SET status = 'executed', engine_order_id = ? WHERE id = ?")
+          .run(engineResult.broker_order_id ?? null, decisionId)
+        db.prepare("UPDATE trader_signals SET status = 'executed' WHERE id = ?").run(signal.id)
 
         const result: AutoDispatchResult = {
           signalId: signal.id,
@@ -515,9 +547,8 @@ export async function autoDispatchPendingSignals(
         results.push(result)
         await deps.send(formatExecutionAlert(result, signal.raw_score, strategy.tier))
       } catch (err) {
-        logger.error({ err, signalId: signal.id, decisionId }, 'Engine submission failed during auto-dispatch')
-        db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
-          .run(signal.id)
+        logger.error({ err, signalId: signal.id, decisionId }, 'Unexpected error in auto-dispatch submission block')
+        db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?").run(signal.id)
       }
 
     } catch (err) {

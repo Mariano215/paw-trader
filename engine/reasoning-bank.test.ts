@@ -153,26 +153,54 @@ describe('rollupRecentOutcomes', () => {
     expect(result.formatted).toContain('No prior paper trades')
   })
 
+  it('excludes unresolved (null outcome) trades from totals', () => {
+    const db = freshDb()
+    const t = Date.now()
+    // Insert 3 resolved + 2 unresolved (outcome=null, simulating open positions)
+    insertRollupCase(db, { id: 'r1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 50, outcome: 'win', created_at: t - 3000 })
+    insertRollupCase(db, { id: 'r2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -20, outcome: 'loss', created_at: t - 2000 })
+    insertRollupCase(db, { id: 'u1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: null, outcome: null, created_at: t - 1000 })
+    insertRollupCase(db, { id: 'u2', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: null, outcome: null, created_at: t })
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    // Only resolved trades count
+    expect(result.total).toBe(2)
+    expect(result.wins).toBe(1)
+    expect(result.losses).toBe(1)
+    expect(result.winRate).toBeCloseTo(0.5, 2)
+    // Avg = (50 + -20) / 2 = 15
+    expect(result.avgPnLUsd).toBeCloseTo(15, 1)
+  })
+
+  it('returns calibration message when all trades are unresolved', () => {
+    const db = freshDb()
+    const t = Date.now()
+    insertRollupCase(db, { id: 'u1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: null, outcome: null, created_at: t })
+    const result = rollupRecentOutcomes(db, 'equity', 20)
+    expect(result.total).toBe(0)
+    expect(result.formatted).toContain('calibration phase')
+  })
+
   it('aggregates win/loss/avg for equity', () => {
     const db = freshDb()
     const t = Date.now()
-    insertRollupCase(db, { id: 'c1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: t - 5000 })
-    insertRollupCase(db, { id: 'c2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -0.01, outcome: 'loss', created_at: t - 4000 })
-    insertRollupCase(db, { id: 'c3', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: 0.005, outcome: 'win', created_at: t - 3000 })
+    // pnl_net is stored as USD dollar values
+    insertRollupCase(db, { id: 'c1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 20, outcome: 'win', created_at: t - 5000 })
+    insertRollupCase(db, { id: 'c2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -10, outcome: 'loss', created_at: t - 4000 })
+    insertRollupCase(db, { id: 'c3', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: 5, outcome: 'win', created_at: t - 3000 })
     const result = rollupRecentOutcomes(db, 'equity', 20)
     expect(result.total).toBe(3)
     expect(result.wins).toBe(2)
     expect(result.losses).toBe(1)
     expect(result.winRate).toBeCloseTo(0.667, 2)
-    expect(result.avgPnLPct).toBeCloseTo(0.5, 1)
+    expect(result.avgPnLUsd).toBeCloseTo(5, 1)
     expect(result.formatted).toMatch(/2W\/1L/)
   })
 
   it('separates equity from crypto', () => {
     const db = freshDb()
     const t = Date.now()
-    insertRollupCase(db, { id: 'e1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: t })
-    insertRollupCase(db, { id: 'c1', asset: 'BTC', side: 'buy', strategy: 'cr-mom', pnl_net: -0.03, outcome: 'loss', created_at: t })
+    insertRollupCase(db, { id: 'e1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 20, outcome: 'win', created_at: t })
+    insertRollupCase(db, { id: 'c1', asset: 'BTC', side: 'buy', strategy: 'cr-mom', pnl_net: -30, outcome: 'loss', created_at: t })
     const eq = rollupRecentOutcomes(db, 'equity', 20)
     const cr = rollupRecentOutcomes(db, 'crypto', 20)
     expect(eq.total).toBe(1)
@@ -184,7 +212,7 @@ describe('rollupRecentOutcomes', () => {
   it('limits to most recent N', () => {
     const db = freshDb()
     for (let i = 0; i < 30; i++) {
-      insertRollupCase(db, { id: `c${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.01, outcome: 'win', created_at: 1000 + i })
+      insertRollupCase(db, { id: `c${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 10, outcome: 'win', created_at: 1000 + i })
     }
     const result = rollupRecentOutcomes(db, 'equity', 20)
     expect(result.total).toBe(20)
@@ -192,9 +220,9 @@ describe('rollupRecentOutcomes', () => {
 
   it('groups by symbol with trade count', () => {
     const db = freshDb()
-    insertRollupCase(db, { id: 'a1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.01, outcome: 'win', created_at: 1000 })
-    insertRollupCase(db, { id: 'a2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 0.02, outcome: 'win', created_at: 2000 })
-    insertRollupCase(db, { id: 't1', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: -0.01, outcome: 'loss', created_at: 3000 })
+    insertRollupCase(db, { id: 'a1', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 10, outcome: 'win', created_at: 1000 })
+    insertRollupCase(db, { id: 'a2', asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: 20, outcome: 'win', created_at: 2000 })
+    insertRollupCase(db, { id: 't1', asset: 'TSLA', side: 'sell', strategy: 'eq-mom', pnl_net: -10, outcome: 'loss', created_at: 3000 })
     const result = rollupRecentOutcomes(db, 'equity', 20)
     expect(result.bySymbol.AAPL).toMatch(/2 trades/)
     expect(result.bySymbol.TSLA).toMatch(/1 trade/)
@@ -203,7 +231,7 @@ describe('rollupRecentOutcomes', () => {
   it('handles all-loss scenario with warning text', () => {
     const db = freshDb()
     for (let i = 0; i < 5; i++) {
-      insertRollupCase(db, { id: `l${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -0.02, outcome: 'loss', created_at: 1000 + i })
+      insertRollupCase(db, { id: `l${i}`, asset: 'AAPL', side: 'buy', strategy: 'eq-mom', pnl_net: -20, outcome: 'loss', created_at: 1000 + i })
     }
     const result = rollupRecentOutcomes(db, 'equity', 20)
     expect(result.winRate).toBe(0)

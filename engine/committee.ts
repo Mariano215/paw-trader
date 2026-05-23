@@ -575,7 +575,14 @@ export async function runCommittee(
   // The gate is skipped when the LLM failed to parse (fail-closed stays).
   if (riskVerdict) {
     const markov = parseMarkovRegime(signal.enrichment_json)
-    const avgConf = coordinator?.avg_confidence ?? 0
+    // When coordinator is null (parse failed), use 0.44 -- just below the
+    // no-Markov floor of 0.45.  This means:
+    //   - If Markov data IS present, Markov gate runs normally (no confidence veto).
+    //   - If Markov data is ALSO missing, the no-Markov veto fires (0.44 < 0.45),
+    //     blocking the trade when we have neither coordinator nor regime data.
+    // Using 0.5 silently passed the no-Markov gate with zero confidence data.
+    // Using 0 fired the hard-veto (< 0.30) on every coordinator parse failure.
+    const avgConf = coordinator?.avg_confidence ?? 0.44
     // Proposed action comes from the coordinator direction; fall back to signal side.
     const proposedAction: 'buy' | 'sell' =
       coordinator?.consensus_direction === 'buy' || coordinator?.consensus_direction === 'sell'

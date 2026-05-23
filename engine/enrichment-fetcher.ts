@@ -160,11 +160,17 @@ export async function enrichPendingSignals(
         priceCache.set(asset, [])
       }
 
-      const markov = await client.getMarkovRegime(asset)
-      markovCache.set(asset, markov)
-      if (markov != null) {
-        logger.debug({ asset, state: markov.current_state }, 'enrichment: markov regime fetched')
+      let markov: MarkovRegimePayload | null = null
+      try {
+        markov = await client.getMarkovRegime(asset)
+        if (markov != null) {
+          logger.debug({ asset, state: markov.current_state }, 'enrichment: markov regime fetched')
+        }
+      } catch (err) {
+        logger.warn({ err, asset }, 'enrichment: markov regime fetch failed; falling back to null')
+        markov = null
       }
+      markovCache.set(asset, markov)
     }),
   )
 

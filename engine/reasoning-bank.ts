@@ -132,9 +132,12 @@ export interface RollupResult {
   wins: number
   losses: number
   winRate: number
-  avgPnLPct: number
-  worstDrawdownPct: number
-  bestTradePct: number
+  /** Average net PnL in USD (not a percentage -- pnl_net is stored as a dollar value). */
+  avgPnLUsd: number
+  /** Worst single-trade net PnL in USD (most negative value in the window). */
+  worstDrawdownUsd: number
+  /** Best single-trade net PnL in USD. */
+  bestTradeUsd: number
   bySymbol: Record<string, string>
   formatted: string
 }
@@ -162,35 +165,49 @@ export function rollupRecentOutcomes(
 
   if (rows.length === 0) {
     return {
-      total: 0, wins: 0, losses: 0, winRate: 0, avgPnLPct: 0,
-      worstDrawdownPct: 0, bestTradePct: 0, bySymbol: {},
+      total: 0, wins: 0, losses: 0, winRate: 0, avgPnLUsd: 0,
+      worstDrawdownUsd: 0, bestTradeUsd: 0, bySymbol: {},
       formatted: 'No prior paper trades yet -- calibration phase.',
     }
   }
 
   let wins = 0
   let losses = 0
+  // pnl_net is stored as a USD dollar value in trader_reasoning_bank.
   const pnls: number[] = []
   const bySymbolPnLs: Record<string, number[]> = {}
   for (const r of rows) {
-    const pnlPct = (r.pnl_net ?? 0) * 100
-    pnls.push(pnlPct)
-    if ((r.outcome ?? '').toLowerCase() === 'win') wins++
-    else if ((r.outcome ?? '').toLowerCase() === 'loss') losses++
+    const outcome = (r.outcome ?? '').toLowerCase()
+    // Skip rows where outcome is still pending/unknown: they have no resolved
+    // win/loss classification and their pnl_net=null (defaulted to 0) would
+    // dilute winRate and avgPnLUsd, making a profitable strategy look worse.
+    if (outcome !== 'win' && outcome !== 'loss') continue
+    const pnlUsd = r.pnl_net ?? 0
+    pnls.push(pnlUsd)
+    if (outcome === 'win') wins++
+    else losses++
     if (!bySymbolPnLs[r.asset]) bySymbolPnLs[r.asset] = []
-    bySymbolPnLs[r.asset].push(pnlPct)
+    bySymbolPnLs[r.asset].push(pnlUsd)
   }
-  const total = rows.length
-  const winRate = total === 0 ? 0 : wins / total
-  const avgPnLPct = pnls.reduce((s, x) => s + x, 0) / total
-  const worstDrawdownPct = Math.min(...pnls)
-  const bestTradePct = Math.max(...pnls)
+  const total = wins + losses
+  if (total === 0) {
+    return {
+      total: 0, wins: 0, losses: 0, winRate: 0, avgPnLUsd: 0,
+      worstDrawdownUsd: 0, bestTradeUsd: 0, bySymbol: {},
+      formatted: 'No resolved paper trades yet -- calibration phase.',
+    }
+  }
+  const winRate = wins / total
+  const avgPnLUsd = pnls.reduce((s, x) => s + x, 0) / total
+  // Use reduce instead of spread to avoid RangeError on very large arrays.
+  const worstDrawdownUsd = pnls.reduce((min, x) => x < min ? x : min, pnls[0])
+  const bestTradeUsd = pnls.reduce((max, x) => x > max ? x : max, pnls[0])
 
   const bySymbol: Record<string, string> = {}
   for (const [sym, vals] of Object.entries(bySymbolPnLs)) {
     const avg = vals.reduce((s, x) => s + x, 0) / vals.length
     const label = vals.length === 1 ? '1 trade' : `${vals.length} trades`
-    bySymbol[sym] = `${avg >= 0 ? '+' : ''}${avg.toFixed(2)}% (${label})`
+    bySymbol[sym] = `${avg >= 0 ? '+' : ''}$${avg.toFixed(2)} (${label})`
   }
 
   const symbolList = Object.entries(bySymbol)
@@ -203,16 +220,16 @@ export function rollupRecentOutcomes(
 
   const formatted = [
     `Last ${total} paper trades (${assetClass}): ${wins}W/${losses}L (${(winRate * 100).toFixed(0)}%).`,
-    `Avg ${avgPnLPct >= 0 ? '+' : ''}${avgPnLPct.toFixed(2)}%. ` +
-      `Best ${bestTradePct >= 0 ? '+' : ''}${bestTradePct.toFixed(2)}%. ` +
-      `Worst ${worstDrawdownPct.toFixed(2)}%.`,
+    `Avg ${avgPnLUsd >= 0 ? '+' : ''}$${avgPnLUsd.toFixed(2)}. ` +
+      `Best ${bestTradeUsd >= 0 ? '+' : ''}$${bestTradeUsd.toFixed(2)}. ` +
+      `Worst $${worstDrawdownUsd.toFixed(2)}.`,
     'By symbol:',
     symbolList + warning,
   ].join('\n')
 
   return {
-    total, wins, losses, winRate, avgPnLPct,
-    worstDrawdownPct, bestTradePct, bySymbol, formatted,
+    total, wins, losses, winRate, avgPnLUsd,
+    worstDrawdownUsd, bestTradeUsd, bySymbol, formatted,
   }
 }
 

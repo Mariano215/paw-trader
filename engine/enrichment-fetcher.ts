@@ -39,6 +39,48 @@ export interface SignalEnrichment {
   fetched_at: number
   /** Markov regime payload from GET /signals/markov/{asset}. Null when unavailable. */
   markov_regime: MarkovRegimePayload | null
+  /**
+   * Age in calendar days of the Markov regime training data (as_of → now).
+   * Null when Markov is unavailable. Values > 30 indicate stale regime data
+   * and are surfaced to the committee so the quant specialist can discount
+   * the regime confidence accordingly.
+   */
+  markov_data_age_days: number | null
+}
+
+// ---------------------------------------------------------------------------
+// CoinGecko fallback for crypto price bars
+// The engine's /prices endpoint is Alpaca-backed (equity only). Crypto pairs
+// have no price bars from the engine; CoinGecko free API fills the gap.
+// ---------------------------------------------------------------------------
+
+const COINGECKO_IDS: Record<string, string> = {
+  'BTC/USD':  'bitcoin',
+  'ETH/USD':  'ethereum',
+  'SOL/USD':  'solana',
+  'AVAX/USD': 'avalanche-2',
+  'DOGE/USD': 'dogecoin',
+  'LINK/USD': 'chainlink',
+}
+
+async function fetchCoinGeckoPrices(asset: string): Promise<number[]> {
+  const coinId = COINGECKO_IDS[asset.toUpperCase()]
+  if (!coinId) return []
+
+  const url =
+    `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart` +
+    `?vs_currency=usd&days=35&interval=daily`
+
+  const resp = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!resp.ok) throw new Error(`CoinGecko HTTP ${resp.status} for ${asset}`)
+
+  const data = await resp.json() as { prices?: [number, number][] }
+  return (data.prices ?? [])
+    .map(([, price]) => price)
+    .filter((p): p is number => typeof p === 'number' && isFinite(p))
 }
 
 /**
@@ -73,6 +115,14 @@ function pctChange(from: number, to: number): number {
   return round2(((to - from) / from) * 100)
 }
 
+/** Days since the Markov training data as_of date. Null when unavailable. */
+function markovDataAgeDays(markov: MarkovRegimePayload | null): number | null {
+  if (!markov?.as_of) return null
+  const asOfMs = new Date(markov.as_of as string).getTime()
+  if (isNaN(asOfMs)) return null
+  return Math.floor((Date.now() - asOfMs) / (24 * 60 * 60 * 1000))
+}
+
 function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null): SignalEnrichment {
   const n = closes.length
   const now = Date.now()
@@ -90,6 +140,7 @@ function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null)
       bars_fetched: 0,
       fetched_at: now,
       markov_regime: markov,
+      markov_data_age_days: markovDataAgeDays(markov),
     }
   }
 
@@ -113,6 +164,7 @@ function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null)
     bars_fetched:         n,
     fetched_at:           now,
     markov_regime:        markov,
+    markov_data_age_days: markovDataAgeDays(markov),
   }
 }
 
@@ -158,6 +210,23 @@ export async function enrichPendingSignals(
       } catch (err) {
         logger.warn({ err, asset }, 'enrichment: price fetch failed; signal stays unenriched')
         priceCache.set(asset, [])
+      }
+
+      // CoinGecko fallback: crypto pairs (asset contains '/') have no bars on
+      // the engine's Alpaca-backed /prices endpoint. Try CoinGecko free API so
+      // the committee has current RSI and momentum context.
+      if ((priceCache.get(asset) ?? []).length === 0 && asset.includes('/')) {
+        try {
+          const closes = await fetchCoinGeckoPrices(asset)
+          if (closes.length > 0) {
+            priceCache.set(asset, closes)
+            logger.info({ asset, bars: closes.length }, 'enrichment: CoinGecko fallback price bars fetched')
+          } else {
+            logger.warn({ asset }, 'enrichment: CoinGecko returned 0 bars for crypto asset')
+          }
+        } catch (err) {
+          logger.warn({ err, asset }, 'enrichment: CoinGecko fallback failed; using Markov-only enrichment')
+        }
       }
 
       let markov: MarkovRegimePayload | null = null

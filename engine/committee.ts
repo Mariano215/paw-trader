@@ -464,8 +464,15 @@ export async function runCommittee(
   // fundamentalist/macro/sentiment add mixed-direction noise on pure
   // technical momentum signals, driving committee abstain without adding
   // edge. Full committee for individual stocks and crypto.
+  // Lean-committee assets: quant-only instead of the full four-specialist panel.
+  // Index ETFs: fundamentalist/macro/sentiment add mixed-direction noise on pure
+  // technical momentum signals for liquid index products.
+  // Crypto pairs (asset contains '/'): engine serves no price bars so specialists
+  // receive Markov-only enrichment — only quant can usefully evaluate that signal.
   const INDEX_ETFS = new Set(['SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO'])
-  const specialistRoles: SpecialistRole[] = INDEX_ETFS.has((signal.asset ?? '').toUpperCase())
+  const asset = signal.asset ?? ''
+  const isLeanAsset = INDEX_ETFS.has(asset.toUpperCase()) || asset.includes('/')
+  const specialistRoles: SpecialistRole[] = isLeanAsset
     ? ['quant']
     : ['quant', 'fundamentalist', 'macro', 'sentiment']
 

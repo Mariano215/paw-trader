@@ -180,9 +180,12 @@ export async function enrichPendingSignals(
   const persist = db.transaction(() => {
     for (const signal of signals) {
       const closes = priceCache.get(signal.asset) ?? []
-      // Skip if engine returned no bars (offline or asset not tracked)
-      if (closes.length === 0) continue
       const markov = markovCache.get(signal.asset) ?? null
+      // Skip only when both bars AND Markov are missing — no useful data at all.
+      // Crypto assets (e.g. BTC/USD) have Markov from the engine but no price
+      // bars on the /prices endpoint; write Markov-only enrichment so the
+      // committee can use regime signal instead of seeing "(none)".
+      if (closes.length === 0 && markov == null) continue
       const data = computeEnrichment(closes, markov)
       update.run(JSON.stringify(data), signal.id)
       enriched++

@@ -5,14 +5,116 @@ import type { EngineClient } from './engine-client.js'
 
 const SCORE_THRESHOLD = TRADER_SIGNAL_SCORE_THRESHOLD
 
+// ---------------------------------------------------------------------------
+// NYSE holiday helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Easter Sunday for a given year, Gregorian calendar.
+ * Anonymous Gregorian algorithm (Meeus/Jones/Butcher).
+ */
+function easterSunday(year: number): { month: number; day: number } {
+  const a = year % 19
+  const b = Math.floor(year / 100)
+  const c = year % 100
+  const d = Math.floor(b / 4)
+  const e = b % 4
+  const f = Math.floor((b + 8) / 25)
+  const g = Math.floor((b - f + 1) / 3)
+  const h = (19 * a + b - d - g + 15) % 30
+  const i = Math.floor(c / 4)
+  const k = c % 4
+  const l = (32 + 2 * e + 2 * i - h - k) % 7
+  const m = Math.floor((a + 11 * h + 22 * l) / 451)
+  const month = Math.floor((h + l - 7 * m + 114) / 31)
+  const day = ((h + l - 7 * m + 114) % 31) + 1
+  return { month, day }
+}
+
+/**
+ * Apply Sat→Fri / Sun→Mon observation rule to a fixed holiday.
+ * Uses local Date arithmetic (no timezone needed — purely calendar).
+ */
+function observed(year: number, month: number, day: number): { month: number; day: number } {
+  const dow = new Date(year, month - 1, day).getDay()  // 0=Sun, 6=Sat
+  const shift = dow === 6 ? -1 : dow === 0 ? 1 : 0
+  if (shift === 0) return { month, day }
+  const d = new Date(year, month - 1, day + shift)
+  return { month: d.getMonth() + 1, day: d.getDate() }
+}
+
+/** Day-of-month for the Nth occurrence of `weekday` (0=Sun…6=Sat) in a month. */
+function nthWeekday(n: number, weekday: number, month: number, year: number): number {
+  const firstDow = new Date(year, month - 1, 1).getDay()
+  return 1 + ((weekday - firstDow + 7) % 7) + (n - 1) * 7
+}
+
+/** Day-of-month for the last occurrence of `weekday` in a month. */
+function lastWeekday(weekday: number, month: number, year: number): number {
+  const lastDay = new Date(year, month, 0).getDate()
+  const lastDow = new Date(year, month - 1, lastDay).getDay()
+  return lastDay - ((lastDow - weekday + 7) % 7)
+}
+
+/**
+ * Returns true when the ET calendar date is an NYSE market holiday.
+ * Covers all 10 holidays NYSE currently observes.
+ */
+export function isNyseHoliday(year: number, month: number, day: number): boolean {
+  // 1. New Year's Day — Jan 1 (observed)
+  const ny = observed(year, 1, 1)
+  if (month === ny.month && day === ny.day) return true
+
+  // 2. MLK Day — 3rd Monday in January
+  if (month === 1 && day === nthWeekday(3, 1, 1, year)) return true
+
+  // 3. Presidents' Day — 3rd Monday in February
+  if (month === 2 && day === nthWeekday(3, 1, 2, year)) return true
+
+  // 4. Good Friday — 2 days before Easter Sunday
+  const easter = easterSunday(year)
+  const gf = new Date(year, easter.month - 1, easter.day - 2)
+  if (month === gf.getMonth() + 1 && day === gf.getDate()) return true
+
+  // 5. Memorial Day — last Monday in May
+  if (month === 5 && day === lastWeekday(1, 5, year)) return true
+
+  // 6. Juneteenth — Jun 19 (observed), NYSE adopted 2022
+  if (year >= 2022) {
+    const jt = observed(year, 6, 19)
+    if (month === jt.month && day === jt.day) return true
+  }
+
+  // 7. Independence Day — Jul 4 (observed)
+  const id4 = observed(year, 7, 4)
+  if (month === id4.month && day === id4.day) return true
+
+  // 8. Labor Day — 1st Monday in September
+  if (month === 9 && day === nthWeekday(1, 1, 9, year)) return true
+
+  // 9. Thanksgiving — 4th Thursday in November
+  if (month === 11 && day === nthWeekday(4, 4, 11, year)) return true
+
+  // 10. Christmas — Dec 25 (observed)
+  const xmas = observed(year, 12, 25)
+  if (month === xmas.month && day === xmas.day) return true
+
+  return false
+}
+
+// ---------------------------------------------------------------------------
+
 /**
  * Returns true when the given timestamp falls within NYSE regular
- * trading hours: Mon-Fri 09:30-16:00 America/New_York.
+ * trading hours: Mon-Fri 09:30-16:00 America/New_York, excluding NYSE holidays.
  * Crypto assets (asset.includes('/')) bypass this check entirely.
  */
 export function isEquityMarketHours(tsMs: number = Date.now()): boolean {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
     hour: 'numeric',
     minute: 'numeric',
     weekday: 'short',
@@ -22,6 +124,11 @@ export function isEquityMarketHours(tsMs: number = Date.now()): boolean {
   const get = (type: string) => parts.find(p => p.type === type)?.value ?? '0'
   const weekday = get('weekday')
   if (weekday === 'Sat' || weekday === 'Sun') return false
+
+  const year  = parseInt(get('year'), 10)
+  const month = parseInt(get('month'), 10)
+  const day   = parseInt(get('day'), 10)
+  if (isNyseHoliday(year, month, day)) return false
 
   const mins = parseInt(get('hour'), 10) * 60 + parseInt(get('minute'), 10)
   return mins >= 9 * 60 + 30 && mins < 16 * 60

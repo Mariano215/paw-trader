@@ -10,6 +10,7 @@ import {
   getPendingSignals,
   resolveStrategyId,
   isEquityMarketHours,
+  isNyseHoliday,
 } from './signal-poller.js'
 import type { EngineClient } from './engine-client.js'
 
@@ -175,6 +176,68 @@ describe('isEquityMarketHours', () => {
     // 2026-04-21 16:00 ET = 20:00 UTC
     const ts = new Date('2026-04-21T20:00:00Z').getTime()
     expect(isEquityMarketHours(ts)).toBe(false)
+  })
+
+  // NYSE holiday cases
+  it('returns false on Memorial Day 2026 (Mon May 25 10:00 ET)', () => {
+    const ts = new Date('2026-05-25T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Good Friday 2026 (Fri Apr 3 10:00 ET)', () => {
+    const ts = new Date('2026-04-03T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Christmas 2026 (Fri Dec 25 10:00 ET)', () => {
+    const ts = new Date('2026-12-25T15:00:00Z').getTime()  // EST = UTC-5
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Thanksgiving 2026 (Thu Nov 26 10:00 ET)', () => {
+    const ts = new Date('2026-11-26T15:00:00Z').getTime()  // EST = UTC-5
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Independence Day 2025 (Fri Jul 4 10:00 ET)', () => {
+    const ts = new Date('2025-07-04T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Juneteenth 2026 (Fri Jun 19 10:00 ET)', () => {
+    const ts = new Date('2026-06-19T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns true on the day after Memorial Day (Tue May 26 10:00 ET)', () => {
+    const ts = new Date('2026-05-26T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(true)
+  })
+})
+
+describe('isNyseHoliday', () => {
+  it('Memorial Day 2026 — last Mon in May', () => {
+    expect(isNyseHoliday(2026, 5, 25)).toBe(true)
+  })
+  it('Good Friday 2026 — Apr 3 (2 days before Easter Apr 5)', () => {
+    expect(isNyseHoliday(2026, 4, 3)).toBe(true)
+  })
+  it('New Year\'s Day 2026 — Jan 1 (Thursday, no shift)', () => {
+    expect(isNyseHoliday(2026, 1, 1)).toBe(true)
+  })
+  it('Christmas 2026 — Dec 25 (Friday, no shift)', () => {
+    expect(isNyseHoliday(2026, 12, 25)).toBe(true)
+  })
+  it('Juneteenth 2026 — Jun 19 (Friday)', () => {
+    expect(isNyseHoliday(2026, 6, 19)).toBe(true)
+  })
+  it('Labor Day 2026 — 1st Mon in Sep (Sep 7)', () => {
+    expect(isNyseHoliday(2026, 9, 7)).toBe(true)
+  })
+  it('Thanksgiving 2026 — 4th Thu in Nov (Nov 26)', () => {
+    expect(isNyseHoliday(2026, 11, 26)).toBe(true)
+  })
+  it('regular trading day is not a holiday', () => {
+    expect(isNyseHoliday(2026, 4, 21)).toBe(false)  // Tuesday Apr 21
+  })
+  it('Christmas observed Mon when Dec 25 falls on Sun (2022)', () => {
+    // Dec 25, 2022 = Sunday → observed Mon Dec 26
+    expect(isNyseHoliday(2022, 12, 25)).toBe(false)
+    expect(isNyseHoliday(2022, 12, 26)).toBe(true)
   })
 })
 

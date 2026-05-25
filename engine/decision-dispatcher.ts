@@ -350,6 +350,34 @@ export async function autoDispatchPendingSignals(
         continue
       }
 
+      // Gate 0: Markov regime pre-filter (deterministic, no LLM cost).
+      // If the Markov regime strongly contradicts the signal direction
+      // (markov_signal <= -0.30 for a buy, >= 0.30 for a sell) the committee
+      // would veto it anyway -- skip the 6 LLM calls and suppress now.
+      // Signals without enrichment data bypass this gate (no regime info).
+      if (signal.enrichment_json) {
+        try {
+          const enrichment = JSON.parse(signal.enrichment_json) as Record<string, unknown>
+          const regime = enrichment?.markov_regime as { markov_signal?: number } | undefined
+          const markovSignal = typeof regime?.markov_signal === 'number' ? regime.markov_signal : null
+          if (markovSignal !== null) {
+            const isBuy = signal.side === 'buy'
+            const regimeConflict = (isBuy && markovSignal <= -0.30) || (!isBuy && markovSignal >= 0.30)
+            if (regimeConflict) {
+              logger.info(
+                { signalId: signal.id, asset: signal.asset, side: signal.side, markovSignal },
+                'Trader: Markov pre-gate suppressed signal',
+              )
+              db.prepare("UPDATE trader_signals SET status = 'suppressed_markov_gate' WHERE id = ?")
+                .run(signal.id)
+              continue
+            }
+          }
+        } catch {
+          // Malformed enrichment JSON -- skip the gate, let committee decide.
+        }
+      }
+
       const committeeInput: CommitteeSignalInput = {
         id:              signal.id,
         asset:           signal.asset,

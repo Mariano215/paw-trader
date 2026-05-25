@@ -459,8 +459,15 @@ export async function runCommittee(
   const assetClass = assetClassForStrategy(deps.db, (signal as any).strategy_id ?? null)
   const rollupBlock = buildRollupBlock(deps.db, assetClass)
 
-  // ---- Round 1: four specialists in parallel ----
-  const specialistRoles: SpecialistRole[] = ['quant', 'fundamentalist', 'macro', 'sentiment']
+  // ---- Round 1: specialists in parallel ----
+  // Index ETFs (liquid momentum signals on SPY/QQQ/etc.) use quant-only:
+  // fundamentalist/macro/sentiment add mixed-direction noise on pure
+  // technical momentum signals, driving committee abstain without adding
+  // edge. Full committee for individual stocks and crypto.
+  const INDEX_ETFS = new Set(['SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO'])
+  const specialistRoles: SpecialistRole[] = INDEX_ETFS.has((signal.asset ?? '').toUpperCase())
+    ? ['quant']
+    : ['quant', 'fundamentalist', 'macro', 'sentiment']
 
   const specialistResults = await Promise.all(
     specialistRoles.map(async (role) => {
@@ -479,7 +486,10 @@ export async function runCommittee(
 
   // If fewer than half the specialists produced usable opinions, abstain.
   // A blind committee call is worse than no trade.
-  if (round1.length < 2) {
+  // Quorum is relative to how many specialists were requested so that the
+  // quant-only path (1 specialist) does not always fail this check.
+  const quorumNeeded = Math.ceil(specialistRoles.length / 2)
+  if (round1.length < quorumNeeded) {
     return buildAbstainResult({
       signal,
       reason: 'Committee could not reach quorum (too few specialist opinions).',

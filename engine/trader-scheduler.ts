@@ -244,7 +244,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         _haltAlertSent = true
         const reason = health.halt_reason ?? 'no reason provided'
         logger.error({ halt_reason: reason }, 'Trader engine reconciler halted')
-        await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. No new orders will reconcile until cleared.`)
+        // Detect "broker shows qty=X but local has no record" pattern and give
+        // the operator an actionable fix command rather than a bare alert.
+        const brokerOnlyMatch = reason.match(/^(\w+): broker shows qty=[\d.]+ but local has no record/)
+        const fixHint = brokerOnlyMatch
+          ? ` To fix: POST /positions/${brokerOnlyMatch[1]}/adopt-from-broker on the engine.`
+          : ''
+        await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}.${fixHint} No new orders will reconcile until cleared.`)
       }
     } else if (health) {
       // Reconciler recovered -- reset flag so we alert again on the next halt

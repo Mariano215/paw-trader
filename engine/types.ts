@@ -23,6 +23,11 @@ export interface EnginePosition {
   updated_at: number;  // ms
 }
 
+export interface AdoptPositionResult {
+  adopted: EnginePosition;
+  reconcile_cleared: boolean;
+}
+
 export interface EngineOrder {
   client_order_id: string;
   broker_order_id: string | null;

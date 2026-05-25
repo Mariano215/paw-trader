@@ -1,6 +1,7 @@
 import type {
   HealthResponse,
   EnginePosition,
+  AdoptPositionResult,
   EngineOrder,
   ReconcileResult,
   Candidate,
@@ -134,6 +135,19 @@ export class EngineClient {
 
   async getPositions(): Promise<EnginePosition[]> {
     return this.request<EnginePosition[]>("/positions");
+  }
+
+  /**
+   * POST /positions/{asset}/adopt-from-broker
+   * Pulls the broker-side position for `asset` into the local engine DB and
+   * writes a clean reconcile log row.  Use to clear a reconciler halt caused
+   * by "broker shows qty=X but local has no record".
+   */
+  async adoptBrokerPosition(asset: string): Promise<AdoptPositionResult> {
+    return this.request<AdoptPositionResult>(
+      `/positions/${encodeURIComponent(asset)}/adopt-from-broker`,
+      { method: "POST" },
+    );
   }
 
   async getOrders(): Promise<EngineOrder[]> {

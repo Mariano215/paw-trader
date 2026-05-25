@@ -178,6 +178,12 @@ export function initTraderTables(db: Database.Database): void {
   // cap lift so partially trained strategies stay at $200.
   addColumnIfMissing(db, 'trader_strategies', 'max_size_usd', 'REAL')
 
+  // Phase 5 Task 3 -- broker order ID written by auto-dispatch after the
+  // engine accepts a submission. Used as a duplicate guard: if a decision
+  // row already has engine_order_id IS NOT NULL the signal is already at
+  // the broker and auto-dispatch skips re-submission on the next tick.
+  addColumnIfMissing(db, 'trader_decisions', 'engine_order_id', 'TEXT')
+
   // Phase 5 Task 2 -- monitor alert state. Holds one row per alert_id
   // with the last_alerted_at timestamp (ms) so the monitor can dedup
   // alerts that otherwise fire every tick. The sharpe-flip alert

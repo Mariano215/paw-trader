@@ -1,20 +1,22 @@
 /**
  * trader-routes/verdicts.ts
  *
- * Two per-strategy verdict endpoints:
- *   GET /api/v1/trader/strategies/:id/verdicts       -- paginated JSON list
- *   GET /api/v1/trader/strategies/:id/verdicts.csv   -- admin CSV export
+ * Three verdict endpoints:
+ *   GET /api/v1/trader/strategies/:id/verdicts       -- paginated JSON list (per-strategy)
+ *   GET /api/v1/trader/strategies/:id/verdicts.csv   -- admin CSV export (per-strategy)
+ *   GET /api/v1/trader/verdicts                      -- paginated JSON list (all strategies)
  *
- * Both read the same three-table join (trader_verdicts x trader_decisions
- * x trader_signals) filtered by strategy_id. The JSON endpoint uses a
- * compound (closed_at, id) cursor for deterministic pagination; the CSV
- * export dumps the whole history with no pagination cap.
+ * All three read the same three-table join (trader_verdicts x trader_decisions
+ * x trader_signals). The per-strategy endpoints filter by strategy_id; the
+ * cross-strategy endpoint omits that filter. The JSON endpoints use a compound
+ * (closed_at, id) cursor for deterministic pagination; the CSV export dumps
+ * the whole history with no pagination cap.
  */
 
 import { Router, type Request, type Response } from 'express'
 import { getBotDb } from '../db.js'
 import { logger } from '../logger.js'
-import { requireAdmin } from '../auth.js'
+import { authenticate, requireAdmin } from '../auth.js'
 import { strategyExists, strategyStatus } from './shared.js'
 
 const router = Router()
@@ -198,6 +200,59 @@ router.get('/api/v1/trader/strategies/:id/verdicts.csv', requireAdmin, (req: Req
   } catch (err) {
     logger.warn({ err, strategyId }, 'trader: verdict csv export failed')
     res.status(500).json({ error: 'failed to export verdict csv' })
+  }
+})
+
+// GET /api/v1/trader/verdicts?limit=N&before_closed_at=MS&before_id=ID
+// Cross-strategy verdict list — same pagination shape as the per-strategy
+// endpoint but without the strategy_id filter, so it covers all strategies.
+router.get('/api/v1/trader/verdicts', authenticate, async (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) {
+    res.status(503).json({ error: 'bot database unavailable' })
+    return
+  }
+  const rawLimit = Number(req.query.limit)
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 200) : 20
+  const rawBefore = Number(req.query.before_closed_at)
+  const before = Number.isFinite(rawBefore) && rawBefore > 0 ? Math.floor(rawBefore) : null
+  const beforeIdRaw = req.query.before_id
+  const beforeId = typeof beforeIdRaw === 'string' && beforeIdRaw.length > 0 ? beforeIdRaw : null
+  try {
+    const selectCols = `v.id, v.decision_id, d.asset, s.side,
+                        v.pnl_gross, v.pnl_net, v.bench_return, v.hold_drawdown,
+                        v.thesis_grade, v.closed_at`
+    const joins = `FROM trader_verdicts v
+                   JOIN trader_decisions d ON d.id = v.decision_id
+                   JOIN trader_signals   s ON s.id = d.signal_id`
+    const orderLimit = `ORDER BY v.closed_at DESC, v.id DESC LIMIT ?`
+    const rows = (before != null && beforeId != null
+      ? bdb.prepare(
+          `SELECT ${selectCols} ${joins}
+           WHERE (v.closed_at < ? OR (v.closed_at = ? AND v.id < ?))
+           ${orderLimit}`,
+        ).all(before, before, beforeId, limit)
+      : before != null
+        ? bdb.prepare(
+            `SELECT ${selectCols} ${joins}
+             WHERE v.closed_at < ?
+             ${orderLimit}`,
+          ).all(before, limit)
+        : bdb.prepare(
+            `SELECT ${selectCols} ${joins}
+             ${orderLimit}`,
+          ).all(limit)
+    ) as TraderVerdictHistoryRow[]
+
+    const next = rows.length === limit ? rows[rows.length - 1] : null
+    res.json({
+      verdicts: rows,
+      nextBeforeClosedAt: next?.closed_at ?? null,
+      nextBeforeId: next?.id ?? null,
+    })
+  } catch (err) {
+    logger.warn({ err }, 'trader: cross-strategy verdict list failed')
+    res.status(500).json({ error: 'failed to list verdicts' })
   }
 })
 

@@ -88,7 +88,7 @@ var TRADER_STATE = {
   decisions: [],      // open decisions
   trackRecords: [],   // strategy track records
   reconcilerStatus: null,
-  verdictCursor: { beforeClosedAt: null, beforeId: null, exhausted: false },
+  verdictCursor: { beforeClosedAt: null, beforeId: null, exhausted: false, loaded: false },
 };
 
 function makeInfoBtn(title, body, example, align) {
@@ -107,7 +107,18 @@ function makeInfoBtn(title, body, example, align) {
 
 function ensureTraderPageDOM() {
   var page = document.getElementById('page-trader');
-  if (!page) return;
+  if (!page) {
+    // Create the page section dynamically (it is not in index.html)
+    var main = document.querySelector('.main-content');
+    if (!main) return;
+    page = document.createElement('section');
+    page.id = 'page-trader';
+    page.className = 'page';
+    page.setAttribute('data-page-title', 'Trader');
+    page.setAttribute('aria-label', 'Paw Trader');
+    page.hidden = true;
+    main.appendChild(page);
+  }
   if (document.getElementById('trader-kpi-strip')) return; // already built
 
   page.innerHTML = '';
@@ -149,7 +160,14 @@ function ensureTraderPageDOM() {
 
   var guideStrip = document.createElement('div');
   guideStrip.className = 'trader-guide-strip';
-  guideStrip.innerHTML = '<span>New to trading? <button class="trader-guide-btn" onclick="openTraderGuide()">Open Guide →</button></span>';
+  var guideStripLabel = document.createElement('span');
+  guideStripLabel.textContent = 'New to trading? ';
+  var guideStripBtn = document.createElement('button');
+  guideStripBtn.className = 'trader-guide-btn';
+  guideStripBtn.textContent = 'Open Guide →';
+  guideStripBtn.onclick = openTraderGuide;
+  guideStripLabel.appendChild(guideStripBtn);
+  guideStrip.appendChild(guideStripLabel);
   footer.appendChild(guideStrip);
 
   // Bypass progress card placeholder (rendered by refreshTraderBypassProgress)
@@ -158,9 +176,15 @@ function ensureTraderPageDOM() {
   bypassCard.className = 'stat-card';
   footer.appendChild(bypassCard);
 
-  // Halt button placeholder (rendered by engineKillSwitch)
+  // Halt button
   var haltWrap = document.createElement('div');
   haltWrap.id = 'trader-halt-wrap';
+  haltWrap.style.cssText = 'margin-top:16px;';
+  var haltBtn = document.createElement('button');
+  haltBtn.className = 'trader-btn-danger';
+  haltBtn.textContent = '⚡ Halt Engine';
+  haltBtn.onclick = engineKillSwitch;
+  haltWrap.appendChild(haltBtn);
   footer.appendChild(haltWrap);
 }
 
@@ -176,7 +200,6 @@ function initTraderPage() {
   refreshTraderCol2();
   refreshTraderCol3();
   refreshTraderBypassProgress();
-  engineKillSwitch();
 
   // Polling (match existing intervals from spec)
   if (!_traderPollStarted) {
@@ -225,7 +248,7 @@ function _renderKpiCell(id, label, value, sub, infoTitle, infoBody, infoExample)
 
 async function refreshTraderKPI_nav() {
   try {
-    var data = await apiFetch('/api/v1/trader/overview');
+    var data = await fetchFromAPI('/api/v1/trader/overview');
     TRADER_STATE.nav = data;
     _renderKpiNavCells(data);
   } catch (e) {
@@ -233,12 +256,12 @@ async function refreshTraderKPI_nav() {
   }
   // also refresh committee accuracy (same 60s interval)
   try {
-    var cr = await apiFetch('/api/v1/trader/committee-report');
+    var cr = await fetchFromAPI('/api/v1/trader/committee-report');
     TRADER_STATE.committeeReport = cr;
   } catch (_) { /* non-fatal */ }
   // also refresh track records
   try {
-    var tr = await apiFetch('/api/v1/trader/track-records');
+    var tr = await fetchFromAPI('/api/v1/trader/track-records');
     TRADER_STATE.trackRecords = tr.records || [];
     _renderWinRates(TRADER_STATE.trackRecords);
   } catch (_) { /* non-fatal */ }
@@ -246,7 +269,7 @@ async function refreshTraderKPI_nav() {
 
 async function refreshTraderKPI_engine() {
   try {
-    var st = await apiFetch('/api/v1/trader/status');
+    var st = await fetchFromAPI('/api/v1/trader/status');
     _renderKpiEngineCell(st);
   } catch (e) {
     _renderKpiEngineCell(null);
@@ -294,11 +317,11 @@ function _renderKpiNavCells(data) {
 }
 
 function _renderKpiEngineCell(st) {
-  var mode   = (st && st.mode)   ? st.mode   : 'unknown';
-  var broker = (st && st.broker) ? st.broker : '';
+  var mode   = (st && st.alpaca_mode) ? st.alpaca_mode : 'unknown';
   var live   = mode === 'live';
   var pill   = '<span class="status-pill ' + (live ? 'pill-live' : 'pill-paper') + '">' + (live ? '● Live' : '○ Paper') + '</span>';
-  var brokerHtml = broker ? ' <small style="font-size:10px;opacity:0.6">' + broker + '</small>' : '';
+  var brokerLabel = (st && st.alpaca_connected) ? 'Alpaca' : '';
+  var brokerHtml = brokerLabel ? ' <small style="font-size:10px;opacity:0.6">' + brokerLabel + '</small>' : '';
   _renderKpiCell('kpi-engine', 'ENGINE', pill + brokerHtml, null, null, null, null);
 }
 
@@ -308,7 +331,7 @@ function _renderKpiEngineCell(st) {
 
 async function refreshTraderCol1() {
   try {
-    var posData = await apiFetch('/api/v1/trader/positions');
+    var posData = await fetchFromAPI('/api/v1/trader/positions');
     TRADER_STATE.positions = (posData && posData.positions) ? posData.positions : (Array.isArray(posData) ? posData : []);
   } catch (_) {
     TRADER_STATE.positions = [];
@@ -326,7 +349,7 @@ async function refreshTraderCol1() {
   // fetch verdicts on first load only (pagination handles the rest)
   if (!TRADER_STATE.verdictCursor.loaded) {
     try {
-      var vd = await apiFetch('/api/v1/trader/verdicts?limit=20');
+      var vd = await fetchFromAPI('/api/v1/trader/verdicts?limit=20');
       TRADER_STATE.verdicts = (vd && vd.verdicts) ? vd.verdicts : [];
       TRADER_STATE.verdictCursor.beforeClosedAt = vd.nextBeforeClosedAt;
       TRADER_STATE.verdictCursor.beforeId = vd.nextBeforeId;
@@ -471,12 +494,12 @@ async function _loadMoreVerdicts() {
 
 async function refreshTraderCol2() {
   try {
-    var sq = await apiFetch('/api/v1/trader/signals');
+    var sq = await fetchFromAPI('/api/v1/trader/signals');
     TRADER_STATE.signals = (sq && sq.signals) ? sq.signals : (Array.isArray(sq) ? sq : []);
   } catch (_) { TRADER_STATE.signals = []; }
 
   try {
-    var dq = await apiFetch('/api/v1/trader/decisions?status=open');
+    var dq = await fetchFromAPI('/api/v1/trader/decisions?status=open');
     TRADER_STATE.decisions = (dq && dq.decisions) ? dq.decisions : (Array.isArray(dq) ? dq : []);
   } catch (_) { TRADER_STATE.decisions = []; }
 
@@ -676,7 +699,7 @@ async function refreshTraderCol3() {
   var reconcilerData = null;
 
   try {
-    riskData = await apiFetch('/api/v1/trader/risk');
+    riskData = await fetchFromAPI('/api/v1/trader/risk');
     TRADER_STATE.risk = riskData;
   } catch (_) {}
 
@@ -684,7 +707,7 @@ async function refreshTraderCol3() {
   var commitData = TRADER_STATE.committeeReport || null;
 
   try {
-    var st = await apiFetch('/api/v1/trader/status');
+    var st = await fetchFromAPI('/api/v1/trader/status');
     reconcilerData = st;
     TRADER_STATE.engineStatus = st;
     _renderKpiEngineCell(st);
@@ -800,9 +823,10 @@ function _renderCol3Reconciler(col, data) {
   ));
   col.appendChild(header);
 
-  var lastCheck = (data && data.reconciler_last_check != null) ? data.reconciler_last_check : ((data && data.last_reconcile != null) ? data.last_reconcile : null);
-  var drift     = (data && data.reconciler_drift)  ? data.reconciler_drift  : ((data && data.drift_detected) ? data.drift_detected : false);
-  var halted    = (data && data.trading_halted)    ? data.trading_halted    : false;
+  var reconcile = (data && data.last_reconcile) ? data.last_reconcile : null;
+  var lastCheck = reconcile ? reconcile.ran_at : null;
+  var drift     = reconcile ? (reconcile.drift_detected || false) : false;
+  var halted    = (data && data.trading_halted) ? data.trading_halted : false;
 
   var minAgo = lastCheck ? Math.round((Date.now() - lastCheck) / 60000) : null;
 
@@ -859,16 +883,46 @@ function openTraderGuide() {
     modal.className = 'trader-guide-modal';
     modal.setAttribute('role', 'dialog');
     modal.setAttribute('aria-modal', 'true');
-    modal.innerHTML =
-      '<div class="trader-guide-inner">' +
-        '<button class="trader-guide-close" onclick="closeTraderGuide()" aria-label="Close guide">&times;</button>' +
-        '<div id="trader-guide-content" class="trader-guide-content"></div>' +
-        '<div class="trader-guide-nav">' +
-          '<button id="trader-guide-prev" class="trader-guide-navbtn" onclick="_goToGuideSlide(_guideCurrentSlide - 1)">&#8592;</button>' +
-          '<div id="trader-guide-dots" class="trader-guide-dots"></div>' +
-          '<button id="trader-guide-next" class="trader-guide-navbtn" onclick="_goToGuideSlide(_guideCurrentSlide + 1)">&#8594;</button>' +
-        '</div>' +
-      '</div>';
+    var inner = document.createElement('div');
+    inner.className = 'trader-guide-inner';
+
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'trader-guide-close';
+    closeBtn.setAttribute('aria-label', 'Close guide');
+    closeBtn.textContent = '×';
+    closeBtn.onclick = closeTraderGuide;
+    inner.appendChild(closeBtn);
+
+    var content = document.createElement('div');
+    content.id = 'trader-guide-content';
+    content.className = 'trader-guide-content';
+    inner.appendChild(content);
+
+    var nav = document.createElement('div');
+    nav.className = 'trader-guide-nav';
+
+    var prevBtn = document.createElement('button');
+    prevBtn.id = 'trader-guide-prev';
+    prevBtn.className = 'trader-guide-navbtn';
+    prevBtn.innerHTML = '&#8592;';
+    prevBtn.onclick = function() { _goToGuideSlide(_guideCurrentSlide - 1); };
+
+    var dots = document.createElement('div');
+    dots.id = 'trader-guide-dots';
+    dots.className = 'trader-guide-dots';
+
+    var nextBtn = document.createElement('button');
+    nextBtn.id = 'trader-guide-next';
+    nextBtn.className = 'trader-guide-navbtn';
+    nextBtn.innerHTML = '&#8594;';
+    nextBtn.onclick = function() { _goToGuideSlide(_guideCurrentSlide + 1); };
+
+    nav.appendChild(prevBtn);
+    nav.appendChild(dots);
+    nav.appendChild(nextBtn);
+    inner.appendChild(nav);
+    modal.appendChild(inner);
+
     document.body.appendChild(modal);
     document.addEventListener('keydown', _guideKeyHandler);
   }
@@ -1144,6 +1198,7 @@ function renderTraderLineChart(svg, series, opts) {
 // series is small (<400 rows); fetching 365 rows is cheap.
 // ---------------------------------------------------------------------------
 
+var TRADER_NAV_STATE = { snapshots: [], windowDays: 90 };
 // removed in trader-dashboard-redesign (Task 10)
 async function refreshTraderOverview() {}
 

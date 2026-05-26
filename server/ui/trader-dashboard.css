@@ -1059,7 +1059,7 @@
 
 .trader-kpi-cell {
   flex: 1;
-  background: var(--bg-card);
+  background: var(--bg-raised);
   padding: 10px 12px;
   min-width: 0;
 }
@@ -1098,7 +1098,7 @@
 }
 
 .trader-col {
-  background: var(--bg-card);
+  background: var(--bg-raised);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 12px;
@@ -1110,7 +1110,7 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-accent);
+  color: var(--accent);
   margin-bottom: 10px;
   display: flex;
   align-items: center;
@@ -1164,15 +1164,15 @@
   letter-spacing: 0.04em;
 }
 
-.trader-grid-pnl--up { color: var(--color-success); font-feature-settings: 'tnum'; }
-.trader-grid-pnl--dn { color: var(--color-danger);  font-feature-settings: 'tnum'; }
+.trader-grid-pnl--up { color: var(--green); font-feature-settings: 'tnum'; }
+.trader-grid-pnl--dn { color: var(--red);  font-feature-settings: 'tnum'; }
 
 .trader-load-more {
   text-align: center;
   padding: 8px 0 4px;
   font-size: 11px;
 }
-.trader-load-more a { color: var(--color-accent); }
+.trader-load-more a { color: var(--accent); }
 
 /* Signal Badges */
 .trader-signal-list { font-size: 12px; }
@@ -1186,8 +1186,8 @@
   letter-spacing: 0.06em;
 }
 
-.trader-signal-badge--buy     { background: rgba(0,255,159,0.15); color: var(--color-success); }
-.trader-signal-badge--sell    { background: rgba(255,80,80,0.15);  color: var(--color-danger); }
+.trader-signal-badge--buy     { background: rgba(0,255,159,0.15); color: var(--green); }
+.trader-signal-badge--sell    { background: rgba(255,80,80,0.15);  color: var(--red); }
 .trader-signal-badge--queued  { background: rgba(255,255,255,0.08); color: var(--text-secondary); }
 .trader-signal-badge--voting  { background: rgba(255,200,0,0.15);  color: #ffc800; }
 
@@ -1202,7 +1202,7 @@
 
 .trader-sparkline-bar {
   flex: 1;
-  background: var(--color-accent);
+  background: var(--accent);
   opacity: 0.45;
   border-radius: 1px 1px 0 0;
   min-height: 4px;
@@ -1235,7 +1235,7 @@
   transition: width 0.3s ease;
 }
 
-.trader-winrate-bar-fill--ok   { background: var(--color-success); }
+.trader-winrate-bar-fill--ok   { background: var(--green); }
 .trader-winrate-bar-fill--warn { background: #ffc800; }
 
 /* Risk Badges (circuit breakers) */
@@ -1247,13 +1247,13 @@
   font-weight: 600;
   background: rgba(0,255,159,0.1);
   border: 1px solid rgba(0,255,159,0.25);
-  color: var(--color-success);
+  color: var(--green);
 }
 
 .trader-risk-badge--tripped {
   background: rgba(255,80,80,0.15);
   border-color: rgba(255,80,80,0.4);
-  color: var(--color-danger);
+  color: var(--red);
 }
 
 /* Committee / Role Bars */
@@ -1274,7 +1274,7 @@
 
 .trader-role-bar-fill {
   height: 100%;
-  background: var(--color-accent);
+  background: var(--accent);
   border-radius: 3px;
   opacity: 0.7;
   transition: width 0.3s ease;
@@ -1296,9 +1296,9 @@
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  border: 1px solid var(--color-accent);
+  border: 1px solid var(--accent);
   font-size: 9px;
-  color: var(--color-accent);
+  color: var(--accent);
   cursor: pointer;
   opacity: 0.7;
   transition: opacity 0.15s;
@@ -1316,17 +1316,17 @@
   left: 50%;
   transform: translateX(-50%);
   width: 220px;
-  background: var(--bg-deep, #0a0a0a);
-  border: 1px solid var(--color-accent);
+  background: #111118;
+  border: 1px solid var(--accent, #00ff9f);
   border-radius: 6px;
   padding: 10px 12px;
   z-index: 9999;
-  box-shadow: 0 0 16px rgba(0,255,159,0.2);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.6);
   pointer-events: none;
   font-size: 11px;
   line-height: 1.5;
   font-weight: 400;
-  color: var(--text-primary);
+  color: #e8e8f0;
   white-space: normal;
   text-transform: none;
   letter-spacing: 0;
@@ -1343,18 +1343,18 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--color-accent);
+  color: var(--accent, #00ff9f);
   margin-bottom: 5px;
 }
 
-.trader-tooltip-body { color: var(--text-primary); }
+.trader-tooltip-body { color: #e8e8f0; }
 
 .trader-tooltip-example {
   margin-top: 6px;
   font-size: 10px;
   font-style: italic;
-  color: var(--text-secondary);
-  background: rgba(255,255,255,0.04);
+  color: #9898b8;
+  background: rgba(255,255,255,0.06);
   border-radius: 3px;
   padding: 4px 6px;
 }
@@ -1372,8 +1372,8 @@
 
 .trader-guide-btn {
   background: none;
-  border: 1px solid var(--color-accent);
-  color: var(--color-accent);
+  border: 1px solid var(--accent);
+  color: var(--accent);
   padding: 4px 10px;
   border-radius: 4px;
   font-size: 11px;
@@ -1396,8 +1396,8 @@
 }
 
 .trader-guide-inner {
-  background: var(--bg-card);
-  border: 1px solid var(--color-accent);
+  background: var(--bg-raised);
+  border: 1px solid var(--accent);
   border-radius: 10px;
   padding: 28px 32px;
   max-width: 560px;
@@ -1427,7 +1427,7 @@
 .trader-guide-slide-title {
   font-size: 18px;
   font-weight: 700;
-  color: var(--color-accent);
+  color: var(--accent);
   margin-bottom: 16px;
 }
 
@@ -1459,7 +1459,7 @@
   transition: border-color 0.15s;
 }
 
-.trader-guide-navbtn:hover:not(:disabled) { border-color: var(--color-accent); color: var(--color-accent); }
+.trader-guide-navbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .trader-guide-navbtn:disabled { opacity: 0.3; cursor: default; }
 
 .trader-guide-dots {
@@ -1477,7 +1477,7 @@
   transition: background 0.15s;
 }
 
-.trader-guide-dot--active { background: var(--color-accent); }
+.trader-guide-dot--active { background: var(--accent); }
 
 /* Status Pills */
 .status-pill {
@@ -1488,7 +1488,7 @@
   font-weight: 700;
 }
 
-.pill-live  { background: rgba(0,255,159,0.15); color: var(--color-success); border: 1px solid rgba(0,255,159,0.3); }
+.pill-live  { background: rgba(0,255,159,0.15); color: var(--green); border: 1px solid rgba(0,255,159,0.3); }
 .pill-paper { background: rgba(255,255,255,0.06); color: var(--text-secondary); border: 1px solid rgba(255,255,255,0.12); }
 
 /* Responsive breakpoints */

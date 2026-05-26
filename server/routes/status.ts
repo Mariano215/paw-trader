@@ -181,6 +181,42 @@ router.get('/api/v1/trader/nav-snapshots', async (req: Request, res: Response) =
   }
 })
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/trader/overview
+//
+// Aggregated KPI data for the dashboard strip: current NAV, today P&L, and
+// rolling 7-day P&L.  Derived from the last 7 nav snapshots so no new engine
+// endpoint is required.  Snapshots are expected newest-first from the engine.
+// Always returns 200 with null fields on engine failure.
+// ---------------------------------------------------------------------------
+
+interface NavSnapshot {
+  nav_close?: number
+  pnl_day?: number
+  [key: string]: unknown
+}
+
+router.get('/api/v1/trader/overview', async (_req: Request, res: Response) => {
+  const cfg = getEngineConfig()
+  if (!cfg) {
+    res.json({ nav: null, today_pnl: null, week_pnl: null })
+    return
+  }
+  try {
+    const snapshots = await engineFetch<NavSnapshot[]>(cfg, '/nav/snapshots?limit=7')
+    const arr = Array.isArray(snapshots) ? snapshots : []
+    const latest = arr[0] ?? null
+    const nav       = latest?.nav_close  ?? null
+    const today_pnl = latest?.pnl_day    ?? null
+    const week_pnl  = arr.length > 0
+      ? arr.reduce((sum, s) => sum + (typeof s.pnl_day === 'number' ? s.pnl_day : 0), 0)
+      : null
+    res.json({ nav, today_pnl, week_pnl })
+  } catch {
+    res.json({ nav: null, today_pnl: null, week_pnl: null })
+  }
+})
+
 router.post('/api/v1/trader/clear-breaker', requireAdmin, async (req: Request, res: Response) => {
   const cfg = getEngineConfig()
   if (!cfg) {

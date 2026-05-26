@@ -44,6 +44,12 @@ export interface TraderSchedulerDeps {
   sendWithKeyboard: (text: string, keyboard: TraderApprovalKeyboard) => Promise<void>
   /** Tick interval override. Defaults to DEFAULT_TICK_MS (5 min). */
   tickMs?: number
+  /**
+   * Fire-and-forget SSH restart for the trader engine.
+   * Called after ENGINE_RESTART_THRESHOLD consecutive health failures during
+   * market hours. Wired in index.ts; omit in tests to skip the SSH call.
+   */
+  restartEngineAsync?: () => void
 }
 
 let intervalHandle: NodeJS.Timeout | null = null
@@ -76,7 +82,9 @@ let _tickInProgress = false
  */
 let _healthCheckConsecutiveFailures = 0
 let _engineUnreachableAlertSent = false
+let _engineRestartAttempted = false
 const ENGINE_UNREACHABLE_THRESHOLD = 3  // 3 × 5-min ticks = 15 min before alerting
+const ENGINE_RESTART_THRESHOLD = 1      // 1 × 5-min tick = restart after first failure (market hours only)
 
 /**
  * Consecutive zero-fetched poll counter.  Incremented each tick that the
@@ -234,6 +242,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       logger.info({ was: _healthCheckConsecutiveFailures }, 'Trader engine reachable again')
     }
     _healthCheckConsecutiveFailures = 0
+    _engineRestartAttempted = false
     if (_engineUnreachableAlertSent) {
       _engineUnreachableAlertSent = false
       await deps.send('TRADER: Engine back online. Signal polling resumed.')
@@ -294,6 +303,20 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     // while the underlying halt condition is still active.
     if (_haltAlertSent) reconcilerHalted = true
     logger.warn({ err, consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader tick: health check failed')
+    // Auto-restart: after ENGINE_RESTART_THRESHOLD failures during market hours,
+    // SSH-restart the engine once per outage event. Fires before the alert so
+    // the operator message can reflect the restart attempt.
+    if (
+      _healthCheckConsecutiveFailures >= ENGINE_RESTART_THRESHOLD &&
+      !_engineRestartAttempted &&
+      deps.restartEngineAsync &&
+      isEquityMarketHours()
+    ) {
+      _engineRestartAttempted = true
+      logger.warn({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: attempting SSH restart')
+      deps.restartEngineAsync()
+      await deps.send(`TRADER: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} min. SSH restart issued — will confirm next tick.`)
+    }
     if (_healthCheckConsecutiveFailures >= ENGINE_UNREACHABLE_THRESHOLD && !_engineUnreachableAlertSent) {
       _engineUnreachableAlertSent = true
       logger.error({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: sending alert')

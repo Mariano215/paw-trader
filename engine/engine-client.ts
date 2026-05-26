@@ -358,3 +358,10 @@ export function getEngineClient(): EngineClient {
   }
   return _engineInstance
 }
+
+/** Returns the engine base URL from credentials (e.g. "http://100.x.x.x:8200"). */
+export function getEngineBaseUrl(): string {
+  const url = getCredential('trader', 'engine', 'url')
+  if (!url) throw new Error('Trader engine URL not configured')
+  return url
+}

@@ -191,8 +191,9 @@ router.get('/api/v1/trader/nav-snapshots', async (req: Request, res: Response) =
 // ---------------------------------------------------------------------------
 
 interface NavSnapshot {
-  nav_close?: number
-  pnl_day?: number
+  nav?: number
+  period?: string
+  recorded_at?: number
   [key: string]: unknown
 }
 
@@ -203,14 +204,18 @@ router.get('/api/v1/trader/overview', async (_req: Request, res: Response) => {
     return
   }
   try {
-    const snapshots = await engineFetch<NavSnapshot[]>(cfg, '/nav/snapshots?limit=7')
+    // Engine returns snapshots newest-first with mixed periods
+    // (day_open, day_close, week_open). NAV is the newest snapshot's
+    // value; today P&L is current NAV minus the most recent day_open;
+    // week P&L is current NAV minus the most recent week_open. Limit 30
+    // keeps the latest day_open and week_open in range.
+    const snapshots = await engineFetch<NavSnapshot[]>(cfg, '/nav/snapshots?limit=30')
     const arr = Array.isArray(snapshots) ? snapshots : []
-    const latest = arr[0] ?? null
-    const nav       = latest?.nav_close  ?? null
-    const today_pnl = latest?.pnl_day    ?? null
-    const week_pnl  = arr.length > 0
-      ? arr.reduce((sum, s) => sum + (typeof s.pnl_day === 'number' ? s.pnl_day : 0), 0)
-      : null
+    const nav = arr[0]?.nav ?? null
+    const dayOpen = arr.find((s) => s.period === 'day_open')?.nav
+    const weekOpen = arr.find((s) => s.period === 'week_open')?.nav
+    const today_pnl = (nav != null && dayOpen != null) ? nav - dayOpen : null
+    const week_pnl = (nav != null && weekOpen != null) ? nav - weekOpen : null
     res.json({ nav, today_pnl, week_pnl })
   } catch {
     res.json({ nav: null, today_pnl: null, week_pnl: null })

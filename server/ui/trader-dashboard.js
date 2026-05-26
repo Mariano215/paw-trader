@@ -83,6 +83,7 @@ var _traderPollStarted = false;
 // Shared state object — populated by refresh fns, read by KPI render
 var TRADER_STATE = {
   nav: null,          // latest NAV value from /trader/overview
+  navHistory: [],     // day_close snapshots for the NAV chart
   positions: [],      // latest positions array
   signals: [],        // pending signals
   decisions: [],      // open decisions
@@ -254,6 +255,16 @@ async function refreshTraderKPI_nav() {
   } catch (e) {
     console.warn('trader KPI nav refresh failed', e);
   }
+  // NAV history for the chart — one point per day (day_close), oldest first
+  try {
+    var navSnap = await fetchFromAPI('/api/v1/trader/nav-snapshots?limit=120');
+    var snaps = (navSnap && navSnap.snapshots) ? navSnap.snapshots : [];
+    var closes = snaps.filter(function(s) { return s.period === 'day_close'; });
+    closes.sort(function(a, b) { return (a.recorded_at || 0) - (b.recorded_at || 0); });
+    TRADER_STATE.navHistory = closes;
+    var sparkWrap = document.getElementById('trader-sparkline-wrap');
+    if (sparkWrap) _renderNavSparkline(sparkWrap);
+  } catch (_) { /* non-fatal */ }
   // also refresh committee accuracy (same 60s interval)
   try {
     var cr = await fetchFromAPI('/api/v1/trader/committee-report');
@@ -262,7 +273,7 @@ async function refreshTraderKPI_nav() {
   // also refresh track records
   try {
     var tr = await fetchFromAPI('/api/v1/trader/track-records');
-    TRADER_STATE.trackRecords = tr.records || [];
+    TRADER_STATE.trackRecords = (tr && tr.track_records) ? tr.track_records : ((tr && tr.records) ? tr.records : []);
     _renderWinRates(TRADER_STATE.trackRecords);
   } catch (_) { /* non-fatal */ }
 }
@@ -495,7 +506,7 @@ async function _loadMoreVerdicts() {
 async function refreshTraderCol2() {
   try {
     var sq = await fetchFromAPI('/api/v1/trader/signals');
-    TRADER_STATE.signals = (sq && sq.signals) ? sq.signals : (Array.isArray(sq) ? sq : []);
+    TRADER_STATE.signals = (sq && sq.pending) ? sq.pending : ((sq && sq.signals) ? sq.signals : (Array.isArray(sq) ? sq : []));
   } catch (_) { TRADER_STATE.signals = []; }
 
   try {
@@ -620,12 +631,12 @@ function _renderCol2() {
 }
 
 function _renderNavSparkline(container) {
-  var navData = TRADER_STATE.nav;
-  if (!navData || !navData.history || navData.history.length === 0) {
+  var history = TRADER_STATE.navHistory || [];
+  if (history.length === 0) {
     container.innerHTML = '<div class="trader-empty">No NAV history yet</div>';
     return;
   }
-  var points = navData.history.slice(-30);
+  var points = history.slice(-30);
   var vals = points.map(function(p) { return p.nav != null ? p.nav : (p.value != null ? p.value : (p.y != null ? p.y : 0)); });
   var max = Math.max.apply(null, vals);
   var min = Math.min.apply(null, vals);
@@ -675,7 +686,8 @@ function _renderWinRates(records, container) {
   }
   for (var i = 0; i < records.length; i++) {
     var r = records[i];
-    var pct = r.win_rate != null ? Math.round(r.win_rate * 100) : 0;
+    var pct = r.win_rate != null ? Math.round(r.win_rate * 100)
+            : (r.trade_count ? Math.round((r.win_count / r.trade_count) * 100) : 0);
     var ok  = pct >= 50;
     var row = document.createElement('div');
     row.className = 'trader-grid-row';

@@ -244,13 +244,35 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         _haltAlertSent = true
         const reason = health.halt_reason ?? 'no reason provided'
         logger.error({ halt_reason: reason }, 'Trader engine reconciler halted')
-        // Detect "broker shows qty=X but local has no record" pattern and give
-        // the operator an actionable fix command rather than a bare alert.
-        const brokerOnlyMatch = reason.match(/^(\w+): broker shows qty=[\d.]+ but local has no record/)
-        const fixHint = brokerOnlyMatch
-          ? ` To fix: POST /positions/${brokerOnlyMatch[1]}/adopt-from-broker on the engine.`
-          : ''
-        await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}.${fixHint} No new orders will reconcile until cleared.`)
+
+        // Auto-heal: "broker shows qty=X but local has no record" is always safe
+        // to fix automatically — broker is source of truth for actual positions.
+        // "local has qty=X but broker shows no record" is NOT auto-healed (needs
+        // operator review — could indicate a phantom position or fill failure).
+        const brokerOnlyAssets = [...reason.matchAll(/(\w[\w/]*):\s*broker shows qty=[\d.]+ but local has no record/g)].map(m => m[1])
+        const hasUnsafePattern = /local (?:has qty|qty=)[\d.]+ but broker shows no/i.test(reason)
+
+        if (brokerOnlyAssets.length > 0 && !hasUnsafePattern) {
+          logger.info({ assets: brokerOnlyAssets }, 'Trader: auto-adopting broker positions to clear halt')
+          try {
+            const client = deps.getEngineClient()
+            for (const asset of brokerOnlyAssets) {
+              const result = await client.adoptBrokerPosition(asset)
+              logger.info({ asset, result }, 'Trader: auto-adopted broker position')
+            }
+            await client.clearReconcilerHalt()
+            reconcilerHalted = false
+            _haltAlertSent = false
+            logger.info('Trader: reconciler halt auto-cleared')
+            await deps.send(`TRADER: Reconciler auto-healed. Adopted broker positions: ${brokerOnlyAssets.join(', ')}. Trading resumed.`)
+          } catch (err) {
+            logger.error({ err }, 'Trader: auto-adopt failed, falling back to manual alert')
+            await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. Auto-heal failed — run: npx tsx scripts/trader-diagnose.ts --fix`)
+          }
+        } else {
+          // Unsafe pattern or unparseable — require manual intervention
+          await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. No new orders will reconcile until cleared.`)
+        }
       }
     } else if (health) {
       // Reconciler recovered -- reset flag so we alert again on the next halt

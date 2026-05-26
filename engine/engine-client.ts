@@ -205,6 +205,13 @@ export class EngineClient {
     });
   }
 
+  /** POST /risk/clear-halt — clears the reconciler halt flag on the engine. */
+  async clearReconcilerHalt(): Promise<{ status: string }> {
+    return this.request<{ status: string }>("/risk/clear-halt", {
+      method: "POST",
+    });
+  }
+
   /**
    * GET /nav/snapshots?limit=N.  Returns the snapshot array on 2xx, an
    * empty array on 404 (older engine builds without the route), and an

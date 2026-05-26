@@ -245,11 +245,16 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         const reason = health.halt_reason ?? 'no reason provided'
         logger.error({ halt_reason: reason }, 'Trader engine reconciler halted')
 
-        // Auto-heal: "broker shows qty=X but local has no record" is always safe
-        // to fix automatically — broker is source of truth for actual positions.
-        // "local has qty=X but broker shows no record" is NOT auto-healed (needs
-        // operator review — could indicate a phantom position or fill failure).
-        const brokerOnlyAssets = [...reason.matchAll(/(\w[\w/]*):\s*broker shows qty=[\d.]+ but local has no record/g)].map(m => m[1])
+        // Auto-heal safe patterns (broker is source of truth):
+        //   1. "broker shows qty=X but local has no record" — new position engine missed
+        //   2. "qty mismatch local=X broker=Y" where broker > local — fill landed, engine didn't update
+        // NOT auto-healed: "local qty=X but broker shows no record" — phantom position, needs review.
+        const brokerOnlyAssets = [
+          ...[...reason.matchAll(/(\w[\w/]*):\s*broker shows qty=[\d.]+ but local has no record/g)].map(m => m[1]),
+          ...[...reason.matchAll(/(\w[\w/]*):\s*qty mismatch local=([\d.]+) broker=([\d.]+)/g)]
+            .filter(m => parseFloat(m[3]) > parseFloat(m[2]))  // only when broker > local
+            .map(m => m[1]),
+        ]
         const hasUnsafePattern = /local (?:has qty|qty=)[\d.]+ but broker shows no/i.test(reason)
 
         if (brokerOnlyAssets.length > 0 && !hasUnsafePattern) {

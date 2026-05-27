@@ -31,6 +31,99 @@ interface TraderTranscriptRow {
   created_at: number
 }
 
+// ---------------------------------------------------------------------------
+// Recent committee deliberations -- per-role vote summary.
+//
+// The "AI Committee" dashboard card historically only rendered the per-role
+// ACCURACY report (trader_verdicts.agent_attribution_json), which stays blank
+// until trades close and are graded -- so a system with hundreds of live
+// deliberations but no closed round-trips showed five empty bars. This
+// surfaces the actual committee ACTIVITY: the latest deliberations with each
+// specialist's confidence, parsed from the stored transcript_json. Pure
+// function so it is unit-testable without the DB/HTTP harness.
+// ---------------------------------------------------------------------------
+
+export interface CommitteeRoleVote {
+  role: string
+  round1_confidence: number | null
+  final_confidence: number | null
+}
+
+export interface CommitteeDeliberationSummary {
+  id: string
+  signal_id: string
+  asset: string | null
+  side: string | null
+  created_at: number
+  rounds: number
+  consensus_direction: string | null
+  avg_confidence: number | null
+  roles: CommitteeRoleVote[]
+}
+
+interface CommitteeTranscriptMeta {
+  id: string
+  signal_id: string
+  asset: string | null
+  side: string | null
+  rounds: number
+  created_at: number
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+export function summarizeCommitteeTranscript(
+  rawJson: string,
+  meta: CommitteeTranscriptMeta,
+): CommitteeDeliberationSummary {
+  let body: Record<string, unknown> | null = null
+  try {
+    const parsed = JSON.parse(rawJson) as unknown
+    body = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
+  } catch {
+    body = null
+  }
+
+  const round1 = Array.isArray(body?.round_1) ? (body!.round_1 as Record<string, unknown>[]) : []
+  const round2 = Array.isArray(body?.round_2) ? (body!.round_2 as Record<string, unknown>[]) : []
+  const coordinator =
+    body?.coordinator && typeof body.coordinator === 'object'
+      ? (body.coordinator as Record<string, unknown>)
+      : null
+
+  const byRole = new Map<string, CommitteeRoleVote>()
+  for (const op of round1) {
+    if (!op || typeof op.role !== 'string') continue
+    const conf = asNumber(op.confidence)
+    byRole.set(op.role, { role: op.role, round1_confidence: conf, final_confidence: conf })
+  }
+  for (const resp of round2) {
+    if (!resp || typeof resp.role !== 'string') continue
+    const existing =
+      byRole.get(resp.role) ?? { role: resp.role, round1_confidence: null, final_confidence: null }
+    const updated = asNumber(resp.updated_confidence)
+    if (updated !== null) existing.final_confidence = updated
+    byRole.set(resp.role, existing)
+  }
+
+  return {
+    id: meta.id,
+    signal_id: meta.signal_id,
+    asset: meta.asset,
+    side: meta.side,
+    created_at: meta.created_at,
+    rounds: meta.rounds,
+    consensus_direction:
+      coordinator && typeof coordinator.consensus_direction === 'string'
+        ? coordinator.consensus_direction
+        : null,
+    avg_confidence: coordinator ? asNumber(coordinator.avg_confidence) : null,
+    roles: [...byRole.values()],
+  }
+}
+
 // GET /api/v1/trader/decisions?limit=N
 // Returns the most recent decisions (newest first), default 25, max 200.
 router.get('/api/v1/trader/decisions', async (req: Request, res: Response) => {
@@ -41,16 +134,37 @@ router.get('/api/v1/trader/decisions', async (req: Request, res: Response) => {
   }
   const rawLimit = Number(req.query.limit)
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 200) : 25
+  // Optional status filter. `status=open` is a pseudo-status meaning
+  // "still in the committee pipeline" -- it excludes terminal outcomes so
+  // the dashboard's "In Review" list does not show abstained/executed/
+  // rejected decisions as if they were still being voted on. An exact
+  // status string filters to that status verbatim.
+  const status = typeof req.query.status === 'string' ? req.query.status : null
+  const TERMINAL_STATUSES = [
+    'committee_abstain', 'executed', 'filled', 'rejected', 'closed',
+    'approved', 'order_placed', 'cancelled', 'expired',
+  ]
+  let where = ''
+  const params: unknown[] = []
+  if (status === 'open') {
+    where = `WHERE status NOT IN (${TERMINAL_STATUSES.map(() => '?').join(', ')})`
+    params.push(...TERMINAL_STATUSES)
+  } else if (status) {
+    where = 'WHERE status = ?'
+    params.push(status)
+  }
+  params.push(limit)
   try {
     const rows = bdb
       .prepare(
         `SELECT id, signal_id, action, asset, size_usd, entry_type, thesis,
                 confidence, committee_transcript_id, decided_at, status
          FROM trader_decisions
+         ${where}
          ORDER BY decided_at DESC
          LIMIT ?`,
       )
-      .all(limit) as TraderDecisionRow[]
+      .all(...params) as TraderDecisionRow[]
     res.json({ decisions: rows })
   } catch (err) {
     logger.warn({ err }, 'trader: list decisions failed')
@@ -119,6 +233,47 @@ router.get('/api/v1/trader/decisions/:id/transcript', async (req: Request, res: 
   } catch (err) {
     logger.warn({ err, decisionId }, 'trader: get transcript failed')
     res.status(500).json({ error: 'failed to load transcript' })
+  }
+})
+
+// GET /api/v1/trader/committee-recent?limit=N
+// Most recent committee deliberations (newest first) with per-role votes
+// parsed from transcript_json. Joins trader_signals for asset/side context.
+// Bot-DB only -- unaffected by engine outages. Default 8, max 50.
+router.get('/api/v1/trader/committee-recent', async (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) {
+    res.status(503).json({ error: 'bot database unavailable' })
+    return
+  }
+  const rawLimit = Number(req.query.limit)
+  const limit =
+    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 50) : 8
+  try {
+    const rows = bdb
+      .prepare(
+        `SELECT t.id, t.signal_id, t.transcript_json, t.rounds, t.created_at,
+                s.asset AS asset, s.side AS side
+         FROM trader_committee_transcripts t
+         LEFT JOIN trader_signals s ON s.id = t.signal_id
+         ORDER BY t.created_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as (TraderTranscriptRow & { asset: string | null; side: string | null })[]
+    const deliberations = rows.map((r) =>
+      summarizeCommitteeTranscript(r.transcript_json, {
+        id: r.id,
+        signal_id: r.signal_id,
+        asset: r.asset ?? null,
+        side: r.side ?? null,
+        rounds: r.rounds,
+        created_at: r.created_at,
+      }),
+    )
+    res.json({ deliberations })
+  } catch (err) {
+    logger.warn({ err }, 'trader: committee-recent query failed')
+    res.status(500).json({ error: 'failed to list recent committee votes' })
   }
 })
 

@@ -85,7 +85,7 @@ beforeAll(async () => {
   app.use(traderRouter)
 
   await new Promise<void>((resolve) => {
-    server = app.listen(0, resolve)
+    server = app.listen(0, () => resolve())
   })
   const addr = server.address() as { port: number }
   baseUrl = `http://127.0.0.1:${addr.port}`

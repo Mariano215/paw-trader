@@ -88,6 +88,7 @@ var TRADER_STATE = {
   signals: [],        // pending signals
   decisions: [],      // open decisions
   trackRecords: [],   // strategy track records
+  committeeRecent: [], // recent committee deliberations (per-role votes)
   reconcilerStatus: null,
   verdictCursor: { beforeClosedAt: null, beforeId: null, exhausted: false, loaded: false },
 };
@@ -123,6 +124,14 @@ function ensureTraderPageDOM() {
   if (document.getElementById('trader-kpi-strip')) return; // already built
 
   page.innerHTML = '';
+
+  // Ticker tape — scrolling portfolio snapshot. Delayed data from the engine,
+  // NOT a live market feed (no quote API, no per-request cost).
+  var ticker = document.createElement('div');
+  ticker.id = 'trader-ticker';
+  ticker.className = 'trader-ticker';
+  ticker.setAttribute('aria-label', 'Portfolio ticker — delayed data, not a live market feed');
+  page.appendChild(ticker);
 
   // KPI strip
   var strip = document.createElement('div');
@@ -201,6 +210,7 @@ function initTraderPage() {
   refreshTraderCol2();
   refreshTraderCol3();
   refreshTraderBypassProgress();
+  _renderTraderTicker();
 
   // Polling (match existing intervals from spec)
   if (!_traderPollStarted) {
@@ -270,12 +280,18 @@ async function refreshTraderKPI_nav() {
     var cr = await fetchFromAPI('/api/v1/trader/committee-report');
     TRADER_STATE.committeeReport = cr;
   } catch (_) { /* non-fatal */ }
+  // recent committee deliberations (per-role votes) — engine-independent
+  try {
+    var crec = await fetchFromAPI('/api/v1/trader/committee-recent?limit=6');
+    TRADER_STATE.committeeRecent = (crec && crec.deliberations) ? crec.deliberations : [];
+  } catch (_) { /* non-fatal */ }
   // also refresh track records
   try {
     var tr = await fetchFromAPI('/api/v1/trader/track-records');
     TRADER_STATE.trackRecords = (tr && tr.track_records) ? tr.track_records : ((tr && tr.records) ? tr.records : []);
     _renderWinRates(TRADER_STATE.trackRecords);
   } catch (_) { /* non-fatal */ }
+  _renderTraderTicker();
 }
 
 async function refreshTraderKPI_engine() {
@@ -337,6 +353,111 @@ function _renderKpiEngineCell(st) {
 }
 
 // ---------------------------------------------------------------------------
+// TRADER — Ticker tape (delayed portfolio snapshot, not a live market feed)
+// ---------------------------------------------------------------------------
+
+// Builds one copy of the ticker item set into `target` from cached state.
+function _buildTickerItems(target) {
+  var st = TRADER_STATE;
+
+  function pnlSpan(v) {
+    var s = document.createElement('span');
+    s.className = v >= 0 ? 'trader-ticker-up' : 'trader-ticker-dn';
+    s.textContent = (v >= 0 ? '▲ +$' : '▼ -$') + Math.abs(Number(v) || 0).toFixed(2);
+    return s;
+  }
+  function addItem(extraClass, build) {
+    var item = document.createElement('span');
+    item.className = 'trader-ticker-item' + (extraClass ? ' ' + extraClass : '');
+    build(item);
+    target.appendChild(item);
+  }
+  function addSym(item, label) {
+    var sym = document.createElement('span');
+    sym.className = 'trader-ticker-sym';
+    sym.textContent = label;
+    item.appendChild(sym);
+  }
+
+  var ov = st.nav || {};
+  var nav = ov.current_nav != null ? ov.current_nav : (ov.nav != null ? ov.nav : null);
+  if (nav != null) {
+    addItem('', function (item) {
+      addSym(item, 'NAV');
+      var v = document.createElement('span');
+      v.textContent = ' $' + Number(nav).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      item.appendChild(v);
+    });
+  }
+  var today = ov.today_pnl != null ? ov.today_pnl : (ov.pnl_today != null ? ov.pnl_today : null);
+  if (today != null) {
+    addItem('', function (item) { addSym(item, 'TODAY '); item.appendChild(pnlSpan(today)); });
+  }
+  var week = ov.week_pnl != null ? ov.week_pnl : (ov.pnl_week != null ? ov.pnl_week : null);
+  if (week != null) {
+    addItem('', function (item) { addSym(item, 'WEEK '); item.appendChild(pnlSpan(week)); });
+  }
+
+  var positions = st.positions || [];
+  for (var i = 0; i < positions.length; i++) {
+    (function (p) {
+      addItem('', function (item) {
+        addSym(item, p.asset || p.symbol || '--');
+        var mv = (p.market_value != null) ? p.market_value : null;
+        if (mv != null) {
+          var m = document.createElement('span');
+          m.textContent = ' $' + Number(mv).toFixed(2);
+          item.appendChild(m);
+        }
+        item.appendChild(document.createTextNode(' '));
+        item.appendChild(pnlSpan(p.unrealized_pnl || 0));
+      });
+    })(positions[i]);
+  }
+  if (positions.length === 0) {
+    addItem('trader-ticker-disclaimer', function (item) { item.textContent = 'No open positions'; });
+  }
+
+  addItem('trader-ticker-disclaimer', function (item) {
+    item.textContent = 'Delayed snapshot from trader-engine — not a live market feed';
+  });
+}
+
+// Renders/updates the ticker. Structure is built once so the CSS marquee
+// keeps running; only the track contents are replaced on refresh.
+function _renderTraderTicker() {
+  var ticker = document.getElementById('trader-ticker');
+  if (!ticker) return;
+
+  var track = ticker.querySelector('.trader-ticker-track');
+  if (!track) {
+    var badge = document.createElement('span');
+    badge.className = 'trader-ticker-badge';
+    badge.textContent = '◷ Delayed · Not live';
+    badge.title = 'Snapshot from the trader engine, refreshed on a delay. Not a live market data feed.';
+    var viewport = document.createElement('div');
+    viewport.className = 'trader-ticker-viewport';
+    track = document.createElement('div');
+    track.className = 'trader-ticker-track';
+    viewport.appendChild(track);
+    ticker.appendChild(badge);
+    ticker.appendChild(viewport);
+  }
+
+  // Two identical halves so the -50% keyframe loops seamlessly.
+  while (track.firstChild) track.removeChild(track.firstChild);
+  var half1 = document.createElement('span');
+  half1.className = 'trader-ticker-half';
+  var half2 = document.createElement('span');
+  half2.className = 'trader-ticker-half';
+  half2.setAttribute('aria-hidden', 'true');
+  _buildTickerItems(half1);
+  _buildTickerItems(half2);
+  track.appendChild(half1);
+  track.appendChild(half2);
+}
+
+// ---------------------------------------------------------------------------
 // TRADER — Col 1: Open Positions + Trade History
 // ---------------------------------------------------------------------------
 
@@ -372,6 +493,7 @@ async function refreshTraderCol1() {
   }
 
   _renderCol1();
+  _renderTraderTicker();
 }
 
 function _renderCol1() {
@@ -803,25 +925,122 @@ function _renderCol3Committee(col, data) {
     { key: 'risk',         label: 'Risk Officer' },
   ];
 
-  var wrap = document.createElement('div');
-  wrap.style.marginTop = '8px';
-
+  // --- Accuracy bars: only when graded verdict data actually exists ---
+  var hasAccuracy = false;
   for (var i = 0; i < ROLES.length; i++) {
-    var role = ROLES[i];
-    var roleData = (data && data.roles && data.roles[role.key]) ? data.roles[role.key] : ((data && data[role.key]) ? data[role.key] : null);
-    var acc = roleData ? roleData.accuracy : null;
-    var pct = acc != null ? Math.round(acc * 100) : null;
-    var row = document.createElement('div');
-    row.className = 'trader-role-row';
-    row.innerHTML =
-      '<span style="font-size:10px;min-width:80px">' + role.label + '</span>' +
-      '<div class="trader-role-bar" style="flex:1;margin:0 8px">' +
-        '<div class="trader-role-bar-fill" style="width:' + (pct || 0) + '%"></div>' +
-      '</div>' +
-      '<span class="trader-role-pct">' + (pct != null ? pct + '%' : '--') + '</span>';
-    wrap.appendChild(row);
+    var rd0 = (data && data.roles && data.roles[ROLES[i].key]) ? data.roles[ROLES[i].key] : ((data && data[ROLES[i].key]) ? data[ROLES[i].key] : null);
+    if (rd0 && rd0.accuracy != null) { hasAccuracy = true; break; }
   }
-  col.appendChild(wrap);
+  var verdictCount = (data && typeof data.verdict_count === 'number') ? data.verdict_count : 0;
+
+  if (hasAccuracy) {
+    var wrap = document.createElement('div');
+    wrap.style.marginTop = '8px';
+    for (var j = 0; j < ROLES.length; j++) {
+      var role = ROLES[j];
+      var roleData = (data && data.roles && data.roles[role.key]) ? data.roles[role.key] : ((data && data[role.key]) ? data[role.key] : null);
+      var acc = roleData ? roleData.accuracy : null;
+      var pct = acc != null ? Math.round(acc * 100) : null;
+      var row = document.createElement('div');
+      row.className = 'trader-role-row';
+      var lbl = document.createElement('span');
+      lbl.style.cssText = 'font-size:10px;min-width:80px';
+      lbl.textContent = role.label;
+      var bar = document.createElement('div');
+      bar.className = 'trader-role-bar';
+      bar.style.cssText = 'flex:1;margin:0 8px';
+      var fill = document.createElement('div');
+      fill.className = 'trader-role-bar-fill';
+      fill.style.width = (pct || 0) + '%';
+      bar.appendChild(fill);
+      var pctEl = document.createElement('span');
+      pctEl.className = 'trader-role-pct';
+      pctEl.textContent = pct != null ? pct + '%' : '--';
+      row.appendChild(lbl); row.appendChild(bar); row.appendChild(pctEl);
+      wrap.appendChild(row);
+    }
+    col.appendChild(wrap);
+  } else {
+    var note = document.createElement('div');
+    note.className = 'trader-empty';
+    note.style.marginTop = '6px';
+    note.textContent = verdictCount > 0
+      ? 'Accuracy scoring starts after trades close (' + verdictCount + ' graded so far)'
+      : 'Accuracy unlocks once trades close and are graded';
+    col.appendChild(note);
+  }
+
+  // --- Recent votes: live committee activity parsed from transcripts ---
+  var votesHeader = document.createElement('div');
+  votesHeader.className = 'trader-col-subtitle';
+  votesHeader.textContent = 'Recent Votes';
+  col.appendChild(votesHeader);
+
+  var recent = TRADER_STATE.committeeRecent || [];
+  if (recent.length === 0) {
+    var emptyVotes = document.createElement('div');
+    emptyVotes.className = 'trader-empty';
+    emptyVotes.textContent = 'No committee votes yet';
+    col.appendChild(emptyVotes);
+    return;
+  }
+
+  var ABBR = { quant: 'Qua', macro: 'Mac', sentiment: 'Sen', fundamentals: 'Fun', fundamentalist: 'Fun', risk: 'Rsk', coordinator: 'Crd' };
+  var list = document.createElement('div');
+  list.className = 'trader-committee-votes';
+  for (var k = 0; k < recent.length; k++) {
+    var d = recent[k];
+    var dir = (d.consensus_direction || '').toUpperCase();
+    var dirCls = (dir === 'BUY') ? 'trader-grid-pnl--up' : ((dir === 'SELL' || dir === 'SKIP' || dir === 'ABSTAIN') ? 'trader-grid-pnl--dn' : '');
+    var conf = (d.avg_confidence != null) ? Math.round(d.avg_confidence * 100) + '%' : '--';
+    var side = (d.side || '').toUpperCase();
+    var when = d.created_at ? timeAgo(d.created_at) : '';
+
+    var voteRow = document.createElement('div');
+    voteRow.className = 'trader-vote-row';
+
+    var head = document.createElement('div');
+    head.className = 'trader-vote-head';
+    var symEl = document.createElement('span');
+    symEl.className = 'trader-grid-sym';
+    symEl.textContent = d.asset || '--';
+    head.appendChild(symEl);
+    if (side) {
+      var sideEl = document.createElement('span');
+      sideEl.className = 'trader-vote-side';
+      sideEl.textContent = side;
+      head.appendChild(sideEl);
+    }
+    var consEl = document.createElement('span');
+    consEl.className = 'trader-vote-consensus ' + dirCls;
+    consEl.textContent = (dir || '--') + ' ' + conf;
+    head.appendChild(consEl);
+    var whenEl = document.createElement('span');
+    whenEl.className = 'trader-vote-when';
+    whenEl.textContent = when;
+    head.appendChild(whenEl);
+    voteRow.appendChild(head);
+
+    var roles = d.roles || [];
+    if (roles.length) {
+      var chipsWrap = document.createElement('div');
+      chipsWrap.className = 'trader-vote-chips';
+      for (var r = 0; r < roles.length; r++) {
+        var rr = roles[r];
+        var c = (rr.final_confidence != null) ? Math.round(rr.final_confidence * 100) : null;
+        var chipCls = (c == null) ? '' : (c >= 60 ? 'trader-vote-chip--up' : (c < 45 ? 'trader-vote-chip--dn' : ''));
+        var ab = ABBR[rr.role] || (rr.role ? String(rr.role).slice(0, 3) : '?');
+        var chip = document.createElement('span');
+        chip.className = 'trader-vote-chip ' + chipCls;
+        chip.title = rr.role || '';
+        chip.textContent = ab + ' ' + (c != null ? c : '--');
+        chipsWrap.appendChild(chip);
+      }
+      voteRow.appendChild(chipsWrap);
+    }
+    list.appendChild(voteRow);
+  }
+  col.appendChild(list);
 }
 
 function _renderCol3Reconciler(col, data) {

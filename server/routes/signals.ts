@@ -237,4 +237,62 @@ router.post('/api/v1/trader/signals/:id/action', requireAdmin, (req: Request, re
   res.status(202).json({ accepted: true })
 })
 
+// ---------------------------------------------------------------------------
+// Signal funnel — conversion stages from generation to execution.
+//
+// GET /api/v1/trader/signal-funnel
+//
+// Response:
+//   {
+//     generated: number,          // total signals ever generated
+//     pre_filtered: number,       // suppressed before committee (no material change / stale / low score / skipped)
+//     went_to_committee: number,  // signals that reached committee review
+//     committee_abstained: number,
+//     executed: number,
+//     failed: number,
+//     pending: number,
+//     conversion_rate: number,    // executed / went_to_committee * 100, one decimal
+//     by_status: Record<string, number>,
+//   }
+// ---------------------------------------------------------------------------
+
+router.get('/api/v1/trader/signal-funnel', (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) { res.status(503).json({ error: 'bot database unavailable' }); return }
+  try {
+    const rows = bdb.prepare(
+      `SELECT status, COUNT(*) AS cnt FROM trader_signals GROUP BY status`
+    ).all() as Array<{ status: string; cnt: number }>
+
+    const byStatus: Record<string, number> = {}
+    let total = 0
+    for (const r of rows) { byStatus[r.status] = r.cnt; total += r.cnt }
+
+    const get = (k: string) => byStatus[k] ?? 0
+    const preFiltered =
+      get('suppressed_no_material_change') +
+      get('suppressed_stale') +
+      get('suppressed_blind_low_score') +
+      get('skipped')
+    const pending = get('pending')
+    const wentToCommittee = total - preFiltered - pending
+    const executed = get('executed')
+
+    res.json({
+      generated: total,
+      pre_filtered: preFiltered,
+      went_to_committee: wentToCommittee,
+      committee_abstained: get('suppressed_committee_abstain'),
+      executed,
+      failed: get('failed'),
+      pending,
+      conversion_rate: wentToCommittee > 0 ? Math.round(1000 * executed / wentToCommittee) / 10 : 0,
+      by_status: byStatus,
+    })
+  } catch (err) {
+    logger.warn({ err }, 'trader: signal-funnel query failed')
+    res.status(500).json({ error: 'failed to compute signal funnel' })
+  }
+})
+
 export default router

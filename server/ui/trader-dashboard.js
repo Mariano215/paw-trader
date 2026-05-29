@@ -89,6 +89,8 @@ var TRADER_STATE = {
   decisions: [],      // open decisions
   trackRecords: [],   // strategy track records
   committeeRecent: [], // recent committee deliberations (per-role votes)
+  committeeHealth: null, // abstain rate + per-asset breakdown
+  signalFunnel: null,    // generation → committee → executed conversion
   reconcilerStatus: null,
   verdictCursor: { beforeClosedAt: null, beforeId: null, exhausted: false, loaded: false },
 };
@@ -163,6 +165,32 @@ function ensureTraderPageDOM() {
   col3.className = 'trader-col';
   grid.appendChild(col3);
 
+  // Row 2 — full-width bottom band
+  var row2 = document.createElement('div');
+  row2.id = 'trader-row-2';
+  row2.className = 'trader-row-2';
+  grid.appendChild(row2);
+
+  var bottomGrid = document.createElement('div');
+  bottomGrid.id = 'trader-bottom-grid';
+  bottomGrid.className = 'trader-bottom-grid';
+  row2.appendChild(bottomGrid);
+
+  var bc1 = document.createElement('div');
+  bc1.id = 'trader-bottom-col-1';
+  bc1.className = 'trader-bottom-col';
+  bottomGrid.appendChild(bc1);
+
+  var bc2 = document.createElement('div');
+  bc2.id = 'trader-bottom-col-2';
+  bc2.className = 'trader-bottom-col';
+  bottomGrid.appendChild(bc2);
+
+  var bc3 = document.createElement('div');
+  bc3.id = 'trader-bottom-col-3';
+  bc3.className = 'trader-bottom-col';
+  bottomGrid.appendChild(bc3);
+
   // Guide strip + bypass card container
   var footer = document.createElement('div');
   footer.id = 'trader-footer';
@@ -211,6 +239,7 @@ function initTraderPage() {
   refreshTraderCol3();
   refreshTraderBypassProgress();
   _renderTraderTicker();
+  _renderBottomRow();
 
   // Polling (match existing intervals from spec)
   if (!_traderPollStarted) {
@@ -602,6 +631,12 @@ function _renderCol1() {
       col.appendChild(moreDiv);
     }
   }
+
+  // ---- Circuit Breakers ----
+  var cbDivider = document.createElement('div');
+  cbDivider.className = 'trader-col-divider';
+  col.appendChild(cbDivider);
+  _renderCol3CircuitBreakers(col, TRADER_STATE.risk);
 }
 
 async function _loadMoreVerdicts() {
@@ -646,6 +681,7 @@ async function refreshTraderCol2() {
   }
 
   _renderCol2();
+  _renderBottomRow();
 }
 
 function _renderCol2() {
@@ -714,42 +750,51 @@ function _renderCol2() {
     col.appendChild(list);
   }
 
-  // ---- Divider ----
-  var divider1 = document.createElement('div');
-  divider1.className = 'trader-col-divider';
-  col.appendChild(divider1);
+  // ---- AI Committee ----
+  var acDivider = document.createElement('div');
+  acDivider.className = 'trader-col-divider';
+  col.appendChild(acDivider);
+  _renderCol3Committee(col, TRADER_STATE.committeeReport);
+}
 
-  // ---- NAV Sparkline ----
-  var navHeader = document.createElement('div');
-  navHeader.className = 'trader-col-title';
-  navHeader.textContent = 'NAV Chart ';
-  navHeader.appendChild(makeInfoBtn(
-    'NAV Chart',
-    'Your account value over 30 days. Going up = bot is making money overall.',
-    null, 'left'
-  ));
-  col.appendChild(navHeader);
-  var sparkWrap = document.createElement('div');
-  sparkWrap.id = 'trader-sparkline-wrap';
-  col.appendChild(sparkWrap);
-  _renderNavSparkline(sparkWrap);
+function _renderBottomRow() {
+  // --- NAV Chart (col 1) ---
+  var bc1 = document.getElementById('trader-bottom-col-1');
+  if (bc1) {
+    bc1.innerHTML = '';
+    var navH = document.createElement('div');
+    navH.className = 'trader-col-title';
+    navH.textContent = 'NAV Chart ';
+    navH.appendChild(makeInfoBtn('NAV Chart', 'Your account value over 30 days. Going up = bot is making money overall.', null, 'left'));
+    bc1.appendChild(navH);
+    var sparkWrap = document.createElement('div');
+    sparkWrap.id = 'trader-sparkline-wrap';
+    bc1.appendChild(sparkWrap);
+    _renderNavSparkline(sparkWrap);
+  }
 
-  // ---- Divider ----
-  var divider2 = document.createElement('div');
-  divider2.className = 'trader-col-divider';
-  col.appendChild(divider2);
+  // --- Committee Health (col 2) ---
+  var bc2 = document.getElementById('trader-bottom-col-2');
+  if (bc2) {
+    bc2.innerHTML = '';
+    _renderCol3CommitteeHealth(bc2, TRADER_STATE.committeeHealth);
+  }
 
-  // ---- Strategy Win Rates ----
-  var wrHeader = document.createElement('div');
-  wrHeader.className = 'trader-col-title';
-  wrHeader.textContent = 'Strategy Win Rates ';
-  wrHeader.appendChild(makeInfoBtn(
-    'Strategy Win Rates',
-    '% of each strategy\'s trades that were profitable.',
-    null, 'left'
-  ));
-  col.appendChild(wrHeader);
-  _renderWinRates(TRADER_STATE.trackRecords || [], col);
+  // --- Win Rates + Recent Votes (col 3) ---
+  var bc3 = document.getElementById('trader-bottom-col-3');
+  if (bc3) {
+    bc3.innerHTML = '';
+    var wrH = document.createElement('div');
+    wrH.className = 'trader-col-title';
+    wrH.textContent = 'Strategy Win Rates ';
+    wrH.appendChild(makeInfoBtn('Strategy Win Rates', '% of each strategy\'s trades that were profitable.', null, 'left'));
+    bc3.appendChild(wrH);
+    _renderWinRates(TRADER_STATE.trackRecords || [], bc3);
+    var wrDiv = document.createElement('div');
+    wrDiv.className = 'trader-col-divider';
+    bc3.appendChild(wrDiv);
+    _renderCommitteeVotes(bc3, TRADER_STATE.committeeRecent || []);
+  }
 }
 
 function _renderNavSparkline(container) {
@@ -847,6 +892,16 @@ async function refreshTraderCol3() {
     _renderKpiEngineCell(st);
   } catch (_) {}
 
+  try {
+    var health = await fetchFromAPI('/api/v1/trader/committee-health');
+    TRADER_STATE.committeeHealth = health;
+  } catch (_) {}
+
+  try {
+    var funnel = await fetchFromAPI('/api/v1/trader/signal-funnel');
+    TRADER_STATE.signalFunnel = funnel;
+  } catch (_) {}
+
   _renderCol3(riskData, commitData, reconcilerData);
 }
 
@@ -854,15 +909,12 @@ function _renderCol3(riskData, commitData, reconcilerData) {
   var col = document.getElementById('trader-col-3');
   if (!col) return;
   col.innerHTML = '';
-  _renderCol3CircuitBreakers(col, riskData);
-  var div1 = document.createElement('div');
-  div1.className = 'trader-col-divider';
-  col.appendChild(div1);
-  _renderCol3Committee(col, commitData);
-  var div2 = document.createElement('div');
-  div2.className = 'trader-col-divider';
-  col.appendChild(div2);
+  _renderCol3SignalFunnel(col, TRADER_STATE.signalFunnel);
+  var div3 = document.createElement('div');
+  div3.className = 'trader-col-divider';
+  col.appendChild(div3);
   _renderCol3Reconciler(col, reconcilerData);
+  _renderBottomRow();
 }
 
 function _renderCol3CircuitBreakers(col, data) {
@@ -970,14 +1022,15 @@ function _renderCol3Committee(col, data) {
     col.appendChild(note);
   }
 
-  // --- Recent votes: live committee activity parsed from transcripts ---
+}
+
+function _renderCommitteeVotes(col, recent) {
   var votesHeader = document.createElement('div');
   votesHeader.className = 'trader-col-subtitle';
   votesHeader.textContent = 'Recent Votes';
   col.appendChild(votesHeader);
 
-  var recent = TRADER_STATE.committeeRecent || [];
-  if (recent.length === 0) {
+  if (!recent || recent.length === 0) {
     var emptyVotes = document.createElement('div');
     emptyVotes.className = 'trader-empty';
     emptyVotes.textContent = 'No committee votes yet';
@@ -1072,6 +1125,174 @@ function _renderCol3Reconciler(col, data) {
       ' &nbsp;·&nbsp; ' + statusTxt +
     '</span>';
   col.appendChild(row);
+}
+
+// ---------------------------------------------------------------------------
+// TRADER — Committee Health card
+// Shows overall abstain rate + per-asset suppression breakdown.
+// ---------------------------------------------------------------------------
+
+function _renderCol3CommitteeHealth(col, data) {
+  var header = document.createElement('div');
+  header.className = 'trader-col-title';
+  header.textContent = 'Committee Health ';
+  header.appendChild(makeInfoBtn(
+    'Committee Health',
+    'How often the AI committee abstains instead of approving a trade. High abstain rate = committee is blocking signals.',
+    null, 'right'
+  ));
+  col.appendChild(header);
+
+  if (!data) {
+    var empty = document.createElement('div');
+    empty.className = 'trader-empty';
+    empty.textContent = 'No data';
+    col.appendChild(empty);
+    return;
+  }
+
+  // Big abstain rate number, color-coded
+  var rate = data.abstain_rate || 0;
+  var rateColor = rate >= 85 ? 'var(--color-danger)' : rate >= 60 ? 'var(--color-warning, #f5a623)' : 'var(--color-success)';
+  var summary = document.createElement('div');
+  summary.style.cssText = 'display:flex;align-items:baseline;gap:10px;margin:6px 0 10px';
+  var bigNum = document.createElement('span');
+  bigNum.style.cssText = 'font-size:22px;font-weight:700;color:' + rateColor;
+  bigNum.textContent = rate + '%';
+  var bigLabel = document.createElement('span');
+  bigLabel.style.cssText = 'font-size:11px;opacity:0.6';
+  bigLabel.textContent = 'abstain rate (' + (data.abstained || 0) + ' of ' + (data.total_signals || 0) + ' signals)';
+  summary.appendChild(bigNum);
+  summary.appendChild(bigLabel);
+  col.appendChild(summary);
+
+  if (data.last_executed_at) {
+    var lastEx = document.createElement('div');
+    lastEx.style.cssText = 'font-size:11px;opacity:0.55;margin-bottom:8px';
+    lastEx.textContent = 'Last executed: ' + timeAgo(data.last_executed_at);
+    col.appendChild(lastEx);
+  }
+
+  // Per-asset rows
+  var assets = data.by_asset || [];
+  for (var i = 0; i < assets.length; i++) {
+    var a = assets[i];
+    var pct = a.abstain_pct || 0;
+    var row = document.createElement('div');
+    row.className = 'trader-role-row';
+    row.style.marginBottom = '4px';
+
+    var sym = document.createElement('span');
+    sym.className = 'trader-grid-sym';
+    sym.style.minWidth = '60px';
+    sym.textContent = a.asset;
+
+    var bar = document.createElement('div');
+    bar.className = 'trader-role-bar';
+    bar.style.cssText = 'flex:1;margin:0 8px';
+    var fill = document.createElement('div');
+    fill.className = 'trader-role-bar-fill';
+    fill.style.cssText = 'width:' + pct + '%;background:' + (pct >= 85 ? 'var(--color-danger)' : pct >= 60 ? 'var(--color-warning,#f5a623)' : 'var(--color-success)');
+    bar.appendChild(fill);
+
+    var pctEl = document.createElement('span');
+    pctEl.className = 'trader-role-pct';
+    pctEl.textContent = pct + '%';
+
+    var execEl = document.createElement('span');
+    execEl.style.cssText = 'font-size:10px;opacity:0.5;margin-left:6px;min-width:40px;text-align:right';
+    execEl.textContent = a.executed + ' exec';
+
+    row.appendChild(sym);
+    row.appendChild(bar);
+    row.appendChild(pctEl);
+    row.appendChild(execEl);
+    col.appendChild(row);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TRADER — Signal Funnel card
+// Shows generated → committee → executed conversion pipeline.
+// ---------------------------------------------------------------------------
+
+function _renderCol3SignalFunnel(col, data) {
+  var header = document.createElement('div');
+  header.className = 'trader-col-title';
+  header.textContent = 'Signal Funnel ';
+  header.appendChild(makeInfoBtn(
+    'Signal Funnel',
+    'How signals flow from generation to execution. Shows where signals are being dropped.',
+    null, 'right'
+  ));
+  col.appendChild(header);
+
+  if (!data) {
+    var empty = document.createElement('div');
+    empty.className = 'trader-empty';
+    empty.textContent = 'No data';
+    col.appendChild(empty);
+    return;
+  }
+
+  var generated = data.generated || 0;
+  var stages = [
+    { label: 'Generated',  count: generated,               pct: 100 },
+    { label: 'Committee',  count: data.went_to_committee || 0, pct: generated > 0 ? Math.round(100 * (data.went_to_committee || 0) / generated) : 0 },
+    { label: 'Executed',   count: data.executed || 0,       pct: generated > 0 ? Math.round(100 * (data.executed || 0) / generated) : 0 },
+  ];
+
+  var wrap = document.createElement('div');
+  wrap.style.marginTop = '8px';
+
+  for (var i = 0; i < stages.length; i++) {
+    var s = stages[i];
+    var row = document.createElement('div');
+    row.style.cssText = 'margin-bottom:6px';
+
+    var labelRow = document.createElement('div');
+    labelRow.style.cssText = 'display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px';
+    var lbl = document.createElement('span');
+    lbl.style.opacity = '0.7';
+    lbl.textContent = s.label;
+    var cnt = document.createElement('span');
+    cnt.style.cssText = 'font-weight:600';
+    cnt.textContent = s.count + (i > 0 ? ' (' + s.pct + '%)' : '');
+    labelRow.appendChild(lbl);
+    labelRow.appendChild(cnt);
+
+    var track = document.createElement('div');
+    track.className = 'trader-role-bar';
+    var fill = document.createElement('div');
+    fill.className = 'trader-role-bar-fill';
+    // Funnel narrows: first bar is accent, subsequent bars green or red by conversion
+    var fillColor = i === 0 ? 'var(--accent, var(--color-primary))' :
+                    i === 2 ? (s.pct < 5 ? 'var(--color-danger)' : 'var(--color-success)') :
+                    'var(--accent, var(--color-primary))';
+    fill.style.cssText = 'width:' + s.pct + '%;background:' + fillColor;
+    track.appendChild(fill);
+
+    row.appendChild(labelRow);
+    row.appendChild(track);
+    wrap.appendChild(row);
+  }
+
+  // Conversion rate callout
+  var conv = document.createElement('div');
+  conv.style.cssText = 'margin-top:8px;font-size:11px;opacity:0.6;text-align:right';
+  conv.textContent = (data.conversion_rate || 0) + '% committee → execution rate';
+  wrap.appendChild(conv);
+
+  // Pre-filter + abstain summary
+  var detail = document.createElement('div');
+  detail.style.cssText = 'margin-top:6px;font-size:10px;opacity:0.45;line-height:1.6';
+  detail.textContent =
+    'Pre-filtered: ' + (data.pre_filtered || 0) +
+    ' · Abstained: ' + (data.committee_abstained || 0) +
+    (data.failed ? ' · Failed: ' + data.failed : '');
+  wrap.appendChild(detail);
+
+  col.appendChild(wrap);
 }
 
 // ---------------------------------------------------------------------------

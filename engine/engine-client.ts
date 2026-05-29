@@ -44,7 +44,9 @@ export class EngineClient {
         "Content-Type": "application/json",
         ...(init?.headers ?? {}),
       },
-      signal: AbortSignal.timeout(this.timeoutMs),
+      // Caller-supplied signal takes precedence (e.g. submitDecision uses 30s
+      // because the engine makes an outbound Alpaca price-fetch on entry_price=0).
+      signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
     });
     if (!resp.ok) {
       // Capture response body so 4xx validation errors and 5xx engine errors
@@ -168,9 +170,12 @@ export class EngineClient {
   }
 
   async submitDecision(decision: DecisionRequest): Promise<SubmitDecisionResult> {
+    // 30s timeout: engine makes an outbound Alpaca price-fetch when entry_price=0,
+    // which can exceed the default 10s under API latency.
     return this.request<SubmitDecisionResult>("/decisions/submit", {
       method: "POST",
       body: JSON.stringify(decision),
+      signal: AbortSignal.timeout(30_000),
     });
   }
 

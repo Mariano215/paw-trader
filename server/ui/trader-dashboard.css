@@ -1053,7 +1053,9 @@
   background: var(--border-subtle);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  /* overflow: visible — lets .trader-tooltip escape the strip boundary.
+     Border-radius on first/last cells handles corner clipping instead. */
+  overflow: visible;
   margin-bottom: 12px;
 }
 
@@ -1062,7 +1064,11 @@
   background: var(--bg-raised);
   padding: 10px 12px;
   min-width: 0;
+  position: relative; /* stacking context for tooltip z-index */
 }
+
+.trader-kpi-cell:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.trader-kpi-cell:last-child  { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
 
 .trader-kpi-label {
   font-size: 9px;
@@ -1103,6 +1109,31 @@
   border-radius: var(--radius-sm);
   padding: 12px;
   min-width: 0;
+}
+
+.trader-row-2 {
+  grid-column: 1 / -1;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  min-width: 0;
+}
+
+.trader-bottom-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.trader-bottom-col {
+  min-width: 0;
+}
+
+.trader-bottom-col + .trader-bottom-col {
+  border-left: 1px solid var(--border-subtle);
+  padding-left: 16px;
 }
 
 .trader-col-title {
@@ -1659,6 +1690,7 @@
 /* Tablet: 2-column (Col 3 wraps below) */
 @media (max-width: 899px) {
   .trader-grid { grid-template-columns: 1fr 1fr; }
+  .trader-bottom-grid { grid-template-columns: 1fr 1fr; }
 }
 
 /* Mobile: single column, KPI wraps 2x3 */
@@ -1666,4 +1698,5 @@
   .trader-grid { grid-template-columns: 1fr; }
   .trader-kpi-strip { flex-wrap: wrap; }
   .trader-kpi-cell { flex: 0 0 calc(50% - 1px); }
+  .trader-bottom-grid { grid-template-columns: 1fr; }
 }

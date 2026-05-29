@@ -142,7 +142,7 @@ router.get('/api/v1/trader/decisions', async (req: Request, res: Response) => {
   const status = typeof req.query.status === 'string' ? req.query.status : null
   const TERMINAL_STATUSES = [
     'committee_abstain', 'executed', 'filled', 'rejected', 'closed',
-    'approved', 'order_placed', 'cancelled', 'expired',
+    'approved', 'order_placed', 'cancelled', 'expired', 'failed',
   ]
   let where = ''
   const params: unknown[] = []
@@ -467,6 +467,83 @@ router.get('/api/v1/trader/committee-trend', async (req: Request, res: Response)
   } catch (err) {
     logger.warn({ err }, 'trader: committee-trend query failed')
     res.status(500).json({ error: 'failed to compute committee trend' })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Committee health summary — abstain rate + per-asset breakdown.
+//
+// GET /api/v1/trader/committee-health
+//
+// Response:
+//   {
+//     total_signals: number,
+//     executed: number,
+//     abstained: number,
+//     abstain_rate: number,      // 0-100, one decimal
+//     last_executed_at: number | null,  // ms epoch of most recent executed decision
+//     by_asset: Array<{
+//       asset: string,
+//       total: number,
+//       abstains: number,
+//       executed: number,
+//       abstain_pct: number,
+//     }>
+//   }
+// ---------------------------------------------------------------------------
+
+interface CommitteeHealthAssetRow {
+  asset: string
+  total: number
+  abstains: number
+  executed: number
+  last_signal_at: number
+}
+
+router.get('/api/v1/trader/committee-health', (req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) { res.status(503).json({ error: 'bot database unavailable' }); return }
+  try {
+    const rows = bdb.prepare(`
+      SELECT
+        asset,
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'suppressed_committee_abstain' THEN 1 ELSE 0 END) AS abstains,
+        SUM(CASE WHEN status = 'executed' THEN 1 ELSE 0 END) AS executed,
+        MAX(generated_at) AS last_signal_at
+      FROM trader_signals
+      GROUP BY asset
+      ORDER BY abstains DESC
+    `).all() as CommitteeHealthAssetRow[]
+
+    const totals = rows.reduce(
+      (acc, r) => { acc.total += r.total; acc.abstains += r.abstains; acc.executed += r.executed; return acc },
+      { total: 0, abstains: 0, executed: 0 }
+    )
+
+    const lastExec = bdb.prepare(
+      `SELECT decided_at FROM trader_decisions WHERE status = 'executed' ORDER BY decided_at DESC LIMIT 1`
+    ).get() as { decided_at: number } | undefined
+
+    const byAsset = rows.map(r => ({
+      asset: r.asset,
+      total: r.total,
+      abstains: r.abstains,
+      executed: r.executed,
+      abstain_pct: r.total > 0 ? Math.round(1000 * r.abstains / r.total) / 10 : 0,
+    }))
+
+    res.json({
+      total_signals: totals.total,
+      executed: totals.executed,
+      abstained: totals.abstains,
+      abstain_rate: totals.total > 0 ? Math.round(1000 * totals.abstains / totals.total) / 10 : 0,
+      last_executed_at: lastExec?.decided_at ?? null,
+      by_asset: byAsset,
+    })
+  } catch (err) {
+    logger.warn({ err }, 'trader: committee-health query failed')
+    res.status(500).json({ error: 'failed to compute committee health' })
   }
 })
 

@@ -101,6 +101,7 @@ describe('decision-dispatcher kill-switch gate', () => {
       submitDecision: vi.fn(),
       getRiskState: vi.fn(),
       getNav: vi.fn().mockResolvedValue(null),
+      getPositions: vi.fn().mockResolvedValue([]),
     }
     vi.restoreAllMocks()
   })
@@ -156,11 +157,12 @@ describe('decision-dispatcher kill-switch gate', () => {
 
     // And the dispatcher still records an audit trail -- either an
     // abstain row or nothing beyond the original signal. Either is
-    // correct; what matters is the DB never records status='executed'.
-    const executed = db.prepare(
-      "SELECT COUNT(*) AS n FROM trader_decisions WHERE signal_id = ? AND status = 'executed'",
+    // correct; what matters is the DB never records a submitted order
+    // (submitDecision was never called, so no submitted row can exist).
+    const submitted = db.prepare(
+      "SELECT COUNT(*) AS n FROM trader_decisions WHERE signal_id = ? AND status = 'submitted'",
     ).get(signalId) as { n: number }
-    expect(executed.n).toBe(0)
+    expect(submitted.n).toBe(0)
   })
 
   // -------------------------------------------------------------------------
@@ -210,7 +212,7 @@ describe('decision-dispatcher kill-switch gate', () => {
     expect(msg).toContain('placed')
 
     const row = db.prepare("SELECT status FROM trader_decisions WHERE signal_id = ?").get(signalId) as any
-    expect(row.status).toBe('executed')
+    expect(row.status).toBe('submitted')
   })
 
 })

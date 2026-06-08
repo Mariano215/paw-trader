@@ -366,15 +366,10 @@ function applyDeterministicRiskGate(
     return null
   }
 
-  // No Markov: raise the floor to 0.45.  Only add a veto; never clear the LLM.
-  if (avgConfidence < 0.45) {
-    return {
-      role: 'risk_officer',
-      veto: true,
-      reason: `No Markov data; avg confidence ${avgConfidence.toFixed(2)} below no-Markov floor of 0.45.`,
-      concerns: [`risk_officer_no_markov_confidence_${avgConfidence.toFixed(2)}`],
-    }
-  }
+  // No Markov data: the single hard floor (0.30, checked above) already
+  // governs. Do not stack a second, higher floor here -- four independent
+  // 0..1 specialist confidences average 0.30-0.50, so a 0.45 floor vetoed
+  // the majority of valid signals. The LLM risk officer keeps soft judgment.
 
   // No Markov, confidence acceptable -- no deterministic override.
   return null
@@ -469,9 +464,58 @@ export async function runCommittee(
   // technical momentum signals for liquid index products.
   // Crypto pairs (asset contains '/'): engine serves no price bars so specialists
   // receive Markov-only enrichment — only quant can usefully evaluate that signal.
+  // NOTE: This list is intentionally narrower than CLUSTER_MAP in correlation-gate.ts.
+  // INDEX_ETFS gates the committee fast-path (lean assets skip the LLM panel).
+  // CLUSTER_MAP gates gross-exposure per cluster (includes single stocks AAPL/MSFT/NVDA
+  // which move with SPY/QQQ). Two separate concerns; keep them in sync deliberately,
+  // not automatically. If you add a ticker here, ask whether it also belongs in CLUSTER_MAP.
   const INDEX_ETFS = new Set(['SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO'])
   const asset = signal.asset ?? ''
   const isLeanAsset = INDEX_ETFS.has(asset.toUpperCase()) || asset.includes('/')
+
+  // Deterministic momentum gate: clean, strong buys on lean assets skip the
+  // LLM panel entirely (faster, cheaper, no parse-failure abstains). Only
+  // ambiguous cases ('escalate') fall through to the committee below.
+  if (isLeanAsset && signal.side === 'buy') {
+    const { evaluateMomentumGate } = await import('./momentum-gate.js')
+    const gate = evaluateMomentumGate(signal as typeof signal & { side: 'buy' })
+    if (gate.outcome === 'deterministic-approve') {
+      const finishedAt = Date.now()
+      const transcript: CommitteeTranscript = {
+        signal_id: signal.id,
+        started_at: startedAt,
+        finished_at: finishedAt,
+        rounds_executed: 0,
+        round_1: [],
+        risk_officer: { role: 'risk_officer', veto: false, reason: `deterministic momentum gate: ${gate.reason}`, concerns: [] },
+        trader: { role: 'trader', action: 'buy', thesis: gate.reason, confidence: gate.confidence, size_multiplier: 1 },
+        errors: [],
+      }
+      return {
+        decision: 'approve',
+        action: 'buy',
+        thesis: `Deterministic momentum entry. ${gate.reason}`,
+        confidence: gate.confidence,
+        size_usd: Math.min(deps.maxSizeUsd, deps.defaultSizeUsd),
+        transcript_id: randomUUID(),
+        transcript,
+      }
+    }
+    if (gate.outcome === 'deterministic-abstain') {
+      return buildAbstainResult({
+        signal,
+        reason: `Deterministic momentum gate abstain: ${gate.reason}`,
+        round1: [],
+        round2: undefined,
+        coordinator: undefined,
+        errors,
+        startedAt,
+        defaultSizeUsd: deps.defaultSizeUsd,
+      })
+    }
+    // gate.outcome === 'escalate' -> fall through to the LLM committee.
+  }
+
   const specialistRoles: SpecialistRole[] = isLeanAsset
     ? ['quant']
     : ['quant', 'fundamentalist', 'macro', 'sentiment']
@@ -592,14 +636,11 @@ export async function runCommittee(
   // The gate is skipped when the LLM failed to parse (fail-closed stays).
   if (riskVerdict) {
     const markov = parseMarkovRegime(signal.enrichment_json)
-    // When coordinator is null (parse failed), use 0.44 -- just below the
-    // no-Markov floor of 0.45.  This means:
-    //   - If Markov data IS present, Markov gate runs normally (no confidence veto).
-    //   - If Markov data is ALSO missing, the no-Markov veto fires (0.44 < 0.45),
-    //     blocking the trade when we have neither coordinator nor regime data.
-    // Using 0.5 silently passed the no-Markov gate with zero confidence data.
-    // Using 0 fired the hard-veto (< 0.30) on every coordinator parse failure.
-    const avgConf = coordinator?.avg_confidence ?? 0.44
+    // When coordinator is null (parse failed), use 0.30 -- the single hard
+    // floor. avgConfidence < 0.30 still hard-vetoes; >= 0.30 defers to the
+    // Markov gate (if regime data present) and the LLM risk officer verdict.
+    // Coordinator parse failure must not auto-abstain via a fabricated default.
+    const avgConf = coordinator?.avg_confidence ?? 0.30
     // Proposed action comes from the coordinator direction; fall back to signal side.
     const proposedAction: 'buy' | 'sell' =
       coordinator?.consensus_direction === 'buy' || coordinator?.consensus_direction === 'sell'

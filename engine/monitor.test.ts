@@ -15,6 +15,7 @@ import { initTraderTables } from './db.js'
 import { seedAllStrategies } from './strategy-manager.js'
 import {
   checkAbstainDigest,
+  checkAbstainRate,
   checkSignalDrought,
   evaluateAndRecordSharpeFlip,
   evaluateAndRecordCoinbaseHealth,
@@ -785,5 +786,47 @@ describe('monitor: checkSignalDrought (off-hours gate)', () => {
     `).run(SIGNAL_DROUGHT_ALERT_ID, DURING_HOURS_MS - 30 * 60 * 1000) // 30 min ago
     const result = checkSignalDrought(db, DURING_HOURS_MS, 20)
     expect(result.fire).toBe(false)
+  })
+})
+
+describe('monitor: checkAbstainRate', () => {
+  let db: ReturnType<typeof makeDb>
+  const NOW = 1_700_000_000_000
+
+  beforeEach(() => { db = makeDb() })
+
+  it('fires the abstain-rate alert above threshold with enough volume', () => {
+    // 6 abstains, 6 executed = 50% rate over 12 decisions.
+    for (let i = 0; i < 6; i++) {
+      insertSignal(db, `sa${i}`)
+      db.prepare("INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .run(`a${i}`, `sa${i}`, 'abstain', 'SPY', 0, 'none', 'x', 0.3, NOW, 'committee_abstain')
+    }
+    for (let i = 0; i < 6; i++) {
+      insertSignal(db, `se${i}`)
+      db.prepare("INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .run(`e${i}`, `se${i}`, 'buy', 'SPY', 100, 'market', 'x', 0.6, NOW, 'executed')
+    }
+    const r = checkAbstainRate(db, NOW)
+    expect(r.fired).toBe(true)
+    expect(r.rate).toBeCloseTo(0.5, 5)
+  })
+
+  it('does not fire below the volume minimum', () => {
+    insertSignal(db, 'sa0')
+    db.prepare("INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run('a0', 'sa0', 'abstain', 'SPY', 0, 'none', 'x', 0.3, NOW, 'committee_abstain')
+    const r = checkAbstainRate(db, NOW)
+    expect(r.fired).toBe(false)
+  })
+
+  it('dedups repeat fires within the window', () => {
+    for (let i = 0; i < 12; i++) {
+      insertSignal(db, `sd${i}`)
+      db.prepare("INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .run(`d${i}`, `sd${i}`, 'abstain', 'SPY', 0, 'none', 'x', 0.3, NOW, 'committee_abstain')
+    }
+    expect(checkAbstainRate(db, NOW).fired).toBe(true)
+    expect(checkAbstainRate(db, NOW + 1000).fired).toBe(false)
   })
 })

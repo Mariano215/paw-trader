@@ -24,6 +24,7 @@ vi.mock('./engine-client.js', () => ({
     }),
     getRiskState: vi.fn(),
     getNav: vi.fn().mockResolvedValue(null),
+    getPositions: vi.fn().mockResolvedValue([]),
   })),
 }))
 

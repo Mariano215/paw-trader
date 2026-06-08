@@ -283,6 +283,8 @@ router.get('/api/v1/trader/signal-funnel', (req: Request, res: Response) => {
       pre_filtered: preFiltered,
       went_to_committee: wentToCommittee,
       committee_abstained: get('suppressed_committee_abstain'),
+      suppressed_cluster_cap: get('suppressed_cluster_cap'),
+      suppressed_portfolio_heat: get('suppressed_portfolio_heat'),
       executed,
       failed: get('failed'),
       pending,

@@ -3,11 +3,15 @@ import type { EngineClient } from './engine-client.js'
 import { pollAndStoreSignals, isEquityMarketHours } from './signal-poller.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+import { reconcileOpenOrders } from './order-reconciler.js'
+import { runRetrySweep } from './order-retry.js'
 import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
+import { runExitSweep } from './exit-evaluator.js'
 import { maybeFireWeeklyReport } from './weekly-report.js'
 import {
   checkAbstainDigest,
+  checkAbstainRate,
   evaluateAndRecordSharpeFlip,
   evaluateAndRecordCoinbaseHealth,
   evaluateAndRecordNavDrop,
@@ -152,6 +156,21 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
     logger.warn({ err }, 'Trader scheduler: submitting-row cleanup failed (non-fatal)')
   }
 
+  // Crash recovery: engine_down is a park, not a grave. On boot, return
+  // those decisions to retry_pending so the first healthy tick resumes
+  // them. submitted / pending_fill / retry_pending are left alone -- the
+  // reconcile and retry phases reconcile them against the broker each tick.
+  try {
+    const revived = deps.db
+      .prepare("UPDATE trader_decisions SET status = 'retry_pending', next_retry_at = ? WHERE status = 'engine_down'")
+      .run(Date.now())
+    if (revived.changes > 0) {
+      logger.warn({ count: revived.changes }, 'Trader scheduler: revived engine_down decisions to retry_pending on startup')
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader scheduler: engine_down revival failed (non-fatal)')
+  }
+
   logger.info({ tickMs }, 'Trader scheduler started')
 
   const tick = () => {
@@ -206,6 +225,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   timedOut: number
   reconcilerHalted: boolean
   closedOut: number
+  exited: number
+  exitErrors: number
   weeklyReportFired: boolean
   skipped?: boolean
 }> {
@@ -217,6 +238,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       timedOut: 0,
       reconcilerHalted: false,
       closedOut: 0,
+      exited: 0,
+      exitErrors: 0,
       weeklyReportFired: false,
       skipped: true,
     }
@@ -228,6 +251,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   let timedOut = 0
   let reconcilerHalted = false
   let closedOut = 0
+  let exited = 0
+  let exitErrors = 0
   let weeklyReportFired = false
 
   try {
@@ -363,6 +388,42 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   }
 
+  // 1c. Reconcile open orders against the broker BEFORE placing new ones.
+  //     Promotes submitted -> executed on confirmed fills, advances
+  //     submitted -> pending_fill while live, marks canceled/rejected as
+  //     failed. Engine-unreachable is a no-op (no mutation). Source of
+  //     truth is GET /orders. Skipped when the reconciler is halted, same
+  //     gate as auto-dispatch below.
+  if (!reconcilerHalted) {
+    try {
+      const client = deps.getEngineClient()
+      const rec = await reconcileOpenOrders(deps.db, client, deps.send)
+      if (rec.promotedToFilled > 0 || rec.canceledOrRejected > 0) {
+        logger.info(rec, 'Trader tick: order reconcile applied transitions')
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Trader tick: order reconcile failed')
+    }
+  }
+
+  // 1d. Retry sweep for transient submit failures. Runs after reconcile so
+  //     any order that actually reached the broker is already tracked and
+  //     never resent. engineHealthy gates the engine_down resume: a healthy
+  //     engine (health check reset _healthCheckConsecutiveFailures to 0)
+  //     un-parks engine_down rows so they resume cleanly.
+  if (!reconcilerHalted) {
+    try {
+      const client = deps.getEngineClient()
+      const engineHealthy = _healthCheckConsecutiveFailures === 0
+      const rs = await runRetrySweep(deps.db, client, Date.now(), engineHealthy)
+      if (rs.resubmitted > 0 || rs.parkedEngineDown > 0 || rs.resumedFromEngineDown > 0) {
+        logger.info(rs, 'Trader tick: retry sweep applied transitions')
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Trader tick: retry sweep failed')
+    }
+  }
+
   // 2. Auto-dispatch pending signals through the committee.
   // Skipped when the reconciler is halted: dispatching signals while the engine
   // cannot reconcile orders would push approvals that can never execute, which
@@ -420,6 +481,28 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   } catch (err) {
     logger.warn({ err }, 'Trader tick: close-out sweep failed')
+  }
+
+  // 4b. Exit sweep -- close positions that hit a stop / target / time-stop
+  //     / momentum-decay trigger. Deterministic, no LLM. This is the only
+  //     phase that emits a sell. Skipped when the reconciler is halted for
+  //     the same reason auto-dispatch is: an exit that cannot reconcile is
+  //     worse than waiting one tick. Engine-unreachable is tolerated (the
+  //     sweep returns errors=1 and we log + move on).
+  if (reconcilerHalted) {
+    logger.info('Trader tick: skipping exit sweep because reconciler is halted')
+  } else {
+    try {
+      const client = deps.getEngineClient()
+      const sweep = await runExitSweep(deps.db, client, deps.send)
+      exited = sweep.exited
+      exitErrors = sweep.errors
+      if (sweep.exited > 0 || sweep.errors > 0) {
+        logger.warn({ exited: sweep.exited, checked: sweep.checked, errors: sweep.errors }, 'Trader tick: exit sweep closed positions')
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Trader tick: exit sweep failed')
+    }
   }
 
   // 5. Weekly report gate (Phase 4 Task C). Fires at most once per week
@@ -481,7 +564,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //    -- a sync failure never stalls the tick or surfaces to the operator.
   void syncTraderTablesToServer(deps.db)
 
-  return { polled, sent, timedOut, reconcilerHalted, closedOut, weeklyReportFired }
+  return { polled, sent, timedOut, reconcilerHalted, closedOut, exited, exitErrors, weeklyReportFired }
   } finally {
     _tickInProgress = false
   }
@@ -570,6 +653,18 @@ async function runMonitorPhase(deps: TraderSchedulerDeps): Promise<void> {
     }
   } catch (err) {
     logger.error({ err }, 'Trader tick: abstain digest check failed')
+  }
+
+  // 1b. Abstain rate -- fires when abstains / decisions >= 40% over 24h with
+  //     minimum volume. Dedup row written inside checkAbstainRate on fire.
+  try {
+    const rr = checkAbstainRate(deps.db, nowMs)
+    if (rr.fired && rr.message) {
+      await deps.send(rr.message)
+      logger.info({ rate: rr.rate, abstains: rr.abstains, decisions: rr.decisions }, 'Trader tick: abstain rate alert sent')
+    }
+  } catch (err) {
+    logger.error({ err }, 'Trader tick: abstain rate check failed')
   }
 
   // 2. Sharpe flip -- self-records the per-strategy sign every call.

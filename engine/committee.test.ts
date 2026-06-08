@@ -13,6 +13,7 @@ import {
 } from './committee.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { MOMENTUM_ABS_MIN_SCORE, MOMENTUM_CLEAR_MULTIPLE } from './momentum-gate.js'
 import type { RollupResult } from './reasoning-bank.js'
 
 const baseSignal: CommitteeSignalInput = {
@@ -503,7 +504,7 @@ describe('committee -- Markov regime gate', () => {
   })
 
   it('Markov absent + avg confidence 0.50 + mild split → goes through', async () => {
-    // No markov_regime in enrichment; avg conf 0.50 >= 0.45 fallback floor.
+    // No markov_regime in enrichment; avg conf 0.50 >= 0.30 hard floor.
     // With no Markov, the gate only adds vetoes -- it does not clear LLM vetoes.
     // So the LLM must say veto:false for the trade to proceed.
     const signal: CommitteeSignalInput = {
@@ -520,7 +521,9 @@ describe('committee -- Markov regime gate', () => {
     expect(result.transcript.risk_officer.veto).toBe(false)
   })
 
-  it('Markov absent + avg confidence 0.40 + mild split → still vetoes (below 0.45 fallback floor)', async () => {
+  it('Markov absent + avg confidence 0.40 + mild split → goes through (single 0.30 floor only)', async () => {
+    // With the 0.45 floor removed, 0.40 >= 0.30 and the LLM says veto:false,
+    // so the trade should proceed.
     const signal: CommitteeSignalInput = {
       ...baseSignal,
       enrichment_json: null,
@@ -530,9 +533,8 @@ describe('committee -- Markov regime gate', () => {
       'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"Borderline but ok","concerns":[]}',
     }
     const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
-    expect(result.decision).toBe('abstain')
-    expect(result.transcript.risk_officer.veto).toBe(true)
-    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('no_markov_confidence'))).toBe(true)
+    expect(result.decision).toBe('approve')
+    expect(result.transcript.risk_officer.veto).toBe(false)
   })
 
   it('Hard veto: avg confidence 0.20 → veto regardless of Markov', async () => {
@@ -649,5 +651,66 @@ describe('committee -- rollup injection', () => {
     await runCommittee(signal as any, deps(fakeRunAgent, { db }))
 
     expect(promptCaptures.every((p) => !p.includes('RECENT PAPER TRADE OUTCOMES'))).toBe(true)
+  })
+})
+
+describe('committee -- single 0.30 confidence floor (Task 1)', () => {
+  it('does not abstain at avg confidence 0.40 with no Markov data (single 0.30 floor)', async () => {
+    const script: Record<string, string | null> = {
+      'committee-quant': JSON.stringify({ role: 'quant', opinion: 'ok', confidence: 0.40, concerns: [] }),
+      'committee-fundamentalist': JSON.stringify({ role: 'fundamentalist', opinion: 'ok', confidence: 0.40, concerns: [] }),
+      'committee-macro': JSON.stringify({ role: 'macro', opinion: 'ok', confidence: 0.40, concerns: [] }),
+      'committee-sentiment': JSON.stringify({ role: 'sentiment', opinion: 'ok', confidence: 0.40, concerns: [] }),
+      'committee-coordinator': JSON.stringify({ role: 'coordinator', consensus_direction: 'buy', avg_confidence: 0.40, skip_round_2: true, challenges: [] }),
+      'committee-risk-officer': JSON.stringify({ role: 'risk_officer', veto: false, reason: 'clear', concerns: [], category: 'none' }),
+      'committee-trader': JSON.stringify({ role: 'trader', action: 'buy', thesis: 'momentum entry', confidence: 0.40, size_multiplier: 1 }),
+    }
+    const db = makeDb()
+    const result = await runCommittee(baseSignal, deps(scriptedRunAgent(script), { db }))
+    expect(result.decision).toBe('approve')
+  })
+
+  it('still hard-vetoes below the 0.30 floor', async () => {
+    const script: Record<string, string | null> = {
+      'committee-quant': JSON.stringify({ role: 'quant', opinion: 'weak', confidence: 0.20, concerns: [] }),
+      'committee-fundamentalist': JSON.stringify({ role: 'fundamentalist', opinion: 'weak', confidence: 0.20, concerns: [] }),
+      'committee-macro': JSON.stringify({ role: 'macro', opinion: 'weak', confidence: 0.20, concerns: [] }),
+      'committee-sentiment': JSON.stringify({ role: 'sentiment', opinion: 'weak', confidence: 0.20, concerns: [] }),
+      'committee-coordinator': JSON.stringify({ role: 'coordinator', consensus_direction: 'buy', avg_confidence: 0.20, skip_round_2: true, challenges: [] }),
+      'committee-risk-officer': JSON.stringify({ role: 'risk_officer', veto: false, reason: 'clear', concerns: [], category: 'none' }),
+      'committee-trader': JSON.stringify({ role: 'trader', action: 'buy', thesis: 'x', confidence: 0.20, size_multiplier: 1 }),
+    }
+    const db = makeDb()
+    const result = await runCommittee(baseSignal, deps(scriptedRunAgent(script), { db }))
+    expect(result.decision).toBe('abstain')
+  })
+})
+
+describe('committee -- deterministic momentum gate (Task 2)', () => {
+  it('skips the LLM panel for a clean strong momentum buy on a lean asset', async () => {
+    let calls = 0
+    const runAgent: CommitteeDeps['runAgent'] = async () => { calls++; return agentResult('{}') }
+    const db = makeDb()
+    // Score must clear both the 3x multiple bar AND the 0.15 absolute floor.
+    const clearScore = Math.max(TRADER_SIGNAL_SCORE_THRESHOLD * MOMENTUM_CLEAR_MULTIPLE, MOMENTUM_ABS_MIN_SCORE) * 1.5
+    const strongSpy: CommitteeSignalInput = {
+      id: 'sig-spy-strong', asset: 'SPY', side: 'buy',
+      raw_score: clearScore, horizon_days: 20, enrichment_json: null,
+    }
+    const result = await runCommittee(strongSpy, deps(runAgent, { db }))
+    expect(result.decision).toBe('approve')
+    expect(calls).toBe(0)
+  })
+
+  it('still runs the LLM panel for an ambiguous lean-asset score', async () => {
+    let calls = 0
+    const runAgent: CommitteeDeps['runAgent'] = async () => { calls++; return agentResult(null) }
+    const db = makeDb()
+    const midSpy: CommitteeSignalInput = {
+      id: 'sig-spy-mid', asset: 'SPY', side: 'buy',
+      raw_score: TRADER_SIGNAL_SCORE_THRESHOLD * 2, horizon_days: 20, enrichment_json: null,
+    }
+    await runCommittee(midSpy, deps(runAgent, { db }))
+    expect(calls).toBeGreaterThan(0)
   })
 })

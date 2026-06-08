@@ -735,14 +735,14 @@ describe('trader-scheduler', () => {
       initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
       await new Promise((resolve) => setTimeout(resolve, 10))
 
-      // Each tick makes up to 6 getEngineClient() calls across its phases
-      // (health check, signal poll, close-out sweep, weekly-report gate,
-      // monitor coinbase check, monitor NAV drop check).  The second init
-      // should be a no-op; we tolerate a small slack in case the first
-      // tick's async chain finishes after firstCount is captured.  If a
-      // second init did leak through we would see another full tick's
-      // worth of calls (+6 or more).
-      expect(getEngineClientMock.mock.calls.length).toBeLessThanOrEqual(firstCount + 5)
+      // Each tick makes up to 9 getEngineClient() calls across its phases
+      // (health check, signal poll, order reconcile, retry sweep, close-out
+      // sweep, exit sweep, weekly-report gate, monitor coinbase check, monitor
+      // NAV drop check).  The second init should be a no-op; we tolerate a
+      // small slack in case the first tick's async chain finishes after
+      // firstCount is captured.  If a second init did leak through we would
+      // see another full tick's worth of calls (+9 or more).
+      expect(getEngineClientMock.mock.calls.length).toBeLessThanOrEqual(firstCount + 8)
     })
 
     it('stopTraderScheduler halts future ticks', async () => {
@@ -776,6 +776,45 @@ describe('trader-scheduler', () => {
       }
 
       expect(getEngineClientMock.mock.calls.length).toBe(countAfterInitial)
+    })
+
+    it('revives engine_down decisions to retry_pending on startup', () => {
+      // Seed an engine_down decision (foreign_keys = OFF so signal_id can dangle).
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, submit_attempts)
+        VALUES ('d-down','s-ghost','buy','AAPL',150,'market','t',0.7,?, 'engine_down', 2)`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      const row = db.prepare("SELECT status FROM trader_decisions WHERE id='d-down'").get() as any
+      expect(row.status).toBe('retry_pending')
+    })
+
+    it('exit sweep phase fires and counts exits when a position breaches its stop', async () => {
+      // Seed an open executed buy decision with a stop that the mock price will breach.
+      db.prepare(`INSERT INTO trader_signals
+        (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('s-exit','momentum-stocks','AAPL','buy',0.8,20,?,'executed')`).run(Date.now())
+      db.prepare(`INSERT INTO trader_decisions
+        (id,signal_id,action,asset,size_usd,entry_type,entry_price,stop_loss,take_profit,thesis,confidence,decided_at,status)
+        VALUES ('d-exit','s-exit','buy','AAPL',150,'market',100,92,116,'t',0.7,?,'executed')`).run(Date.now())
+
+      const submitDecision = vi.fn().mockResolvedValue({
+        client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 91,
+      })
+      // Override the shared engineClient mock for this test.
+      engineClient.getPositions = vi.fn().mockResolvedValue([
+        { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 91, unrealized_pnl: -9, source: 'broker', updated_at: Date.now() },
+      ])
+      engineClient.getPrices = vi.fn().mockResolvedValue([
+        { date: '2026-06-07', close: 91, ts_ms: Date.now() },
+      ])
+      engineClient.submitDecision = submitDecision
+
+      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(result.exited).toBe(1)
+      expect(submitDecision.mock.calls.some((c: any[]) => c[0].side === 'sell')).toBe(true)
     })
   })
 })

@@ -214,6 +214,78 @@ export function checkAbstainDigest(
   }
 }
 
+/** Abstain RATE threshold: fire when abstains / decisions in the window meet
+ *  or exceed this. 0.40 catches the 55% pathology while tolerating normal
+ *  selectivity. */
+export const ABSTAIN_RATE_THRESHOLD = 0.40
+
+/** Minimum decisions in the window before the rate alert can fire, so a
+ *  2-of-3 morning does not page on a 0.67 rate with no volume. */
+export const ABSTAIN_RATE_MIN_DECISIONS = 10
+
+/** Dedup gap for the rate alert. 12 hours. */
+export const ABSTAIN_RATE_DEDUP_MS = 12 * 60 * 60 * 1000
+
+const ABSTAIN_RATE_ALERT_ID = 'abstain_rate'
+
+export interface AbstainRateResult {
+  fired: boolean
+  rate: number
+  abstains: number
+  decisions: number
+  message: string | null
+}
+
+/**
+ * 2c. Abstain-rate alert. Counts committee_abstain decisions vs ALL terminal
+ * decisions (executed + failed + committee_abstain) in the window and fires
+ * when the rate is too high AND volume clears the minimum.
+ */
+export function checkAbstainRate(
+  db: Database.Database,
+  nowMs = Date.now(),
+): AbstainRateResult {
+  const since = nowMs - ABSTAIN_WINDOW_MS
+  const row = db.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'committee_abstain' THEN 1 ELSE 0 END) AS abstains,
+      COUNT(*) AS decisions
+    FROM trader_decisions
+    WHERE decided_at >= ?
+      AND status IN ('committee_abstain', 'executed', 'failed')
+  `).get(since) as { abstains: number | null; decisions: number | null }
+
+  const abstains = row.abstains ?? 0
+  const decisions = row.decisions ?? 0
+  const rate = decisions > 0 ? abstains / decisions : 0
+
+  if (decisions < ABSTAIN_RATE_MIN_DECISIONS || rate < ABSTAIN_RATE_THRESHOLD) {
+    return { fired: false, rate, abstains, decisions, message: null }
+  }
+
+  const stateRow = db.prepare(`
+    SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?
+  `).get(ABSTAIN_RATE_ALERT_ID) as { last_alerted_at: number } | undefined
+
+  if (stateRow && nowMs - stateRow.last_alerted_at < ABSTAIN_RATE_DEDUP_MS) {
+    return { fired: false, rate, abstains, decisions, message: null }
+  }
+
+  db.prepare(`
+    INSERT INTO trader_alert_state (alert_id, last_alerted_at)
+    VALUES (?, ?)
+    ON CONFLICT(alert_id) DO UPDATE SET last_alerted_at = excluded.last_alerted_at
+  `).run(ABSTAIN_RATE_ALERT_ID, nowMs)
+
+  return {
+    fired: true,
+    rate,
+    abstains,
+    decisions,
+    message: `Trader abstain rate ${(rate * 100).toFixed(0)}% over 24h (${abstains}/${decisions}). Above ${(ABSTAIN_RATE_THRESHOLD * 100).toFixed(0)}% threshold.`,
+  }
+}
+
 /**
  * 2b. Scans every active strategy with trade_count >= SHARPE_FLIP_MIN_TRADES.
  * For each, compares the current sign of rolling_sharpe against the

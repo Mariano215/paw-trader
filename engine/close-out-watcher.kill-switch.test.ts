@@ -205,8 +205,9 @@ describe('close-out watcher kill-switch behavior (reconciliation path must not b
     await runCloseOutSweep(db, engine)
 
     // The sweep must fetch engine state even with the switch tripped;
-    // a call here is reconciliation, not spend.
-    expect(engine.getPositions).toHaveBeenCalledTimes(1)
+    // a call here is reconciliation, not spend. getPositions is called
+    // once in the close-out loop and once in writeDailySnapshot (open MTM).
+    expect(engine.getPositions).toHaveBeenCalledTimes(2)
     expect(engine.getOrders).toHaveBeenCalledTimes(1)
   })
 })

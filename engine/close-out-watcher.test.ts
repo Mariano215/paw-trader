@@ -20,6 +20,7 @@ import type { OpenDecisionRow, PriceFetchResult } from './close-out-watcher.js'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import type { CommitteeTranscript } from './committee.js'
+import { recordFill } from './audit-log.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -327,13 +328,17 @@ describe('runCloseOutSweep', () => {
     // close-out-watcher treats "no bars" as success=false and leaves
     // placeholders in place, which matches the original assertions.
     getPrices = vi.fn().mockResolvedValue([])
-    engine = { getPositions, getOrders, getPrices } as unknown as EngineClient
+    // P5: writeDailySnapshot calls getNavLatest every tick; stub so tests
+    // that don't care about NAV don't throw inside the snapshot writer.
+    const getNavLatest = vi.fn().mockResolvedValue(null)
+    engine = { getPositions, getOrders, getPrices, getNavLatest } as unknown as EngineClient
   })
 
   it('returns zeros when no decisions are open', async () => {
     const result = await runCloseOutSweep(db, engine)
     expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 0 })
-    expect(getPositions).not.toHaveBeenCalled()
+    // getPositions is called by writeDailySnapshot (open MTM); getOrders is
+    // NOT called when open.length === 0 (no close-out processing needed).
     expect(getOrders).not.toHaveBeenCalled()
   })
 
@@ -394,14 +399,86 @@ describe('runCloseOutSweep', () => {
     expect(verdict).toBeDefined()
   })
 
-  it('makes exactly one engine round-trip regardless of decision count', async () => {
+  it('makes exactly one close-out engine round-trip regardless of decision count', async () => {
     for (let i = 0; i < 5; i++) {
       insertSignal(db, `sig-${i}`, { asset: `A${i}` })
       insertExecutedDecision(db, `dec-${i}`, `sig-${i}`, { asset: `A${i}`, decidedAt: 1000 })
     }
     await runCloseOutSweep(db, engine)
-    expect(getPositions).toHaveBeenCalledTimes(1)
+    // getOrders: exactly 1 call (shared across all open decisions in the loop).
     expect(getOrders).toHaveBeenCalledTimes(1)
+    // getPositions: 1 call in the close-out loop + 1 call in writeDailySnapshot.
+    expect(getPositions).toHaveBeenCalledTimes(2)
+  })
+
+  it('writes a daily PnL snapshot even when nothing closes', async () => {
+    // One executed decision whose asset still has a live position -> no close.
+    insertSignal(db, 's-open', { asset: 'AAPL' })
+    insertExecutedDecision(db, 'd-open', 's-open', { asset: 'AAPL', decidedAt: 1000 })
+
+    getPositions.mockResolvedValue([
+      { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 112, unrealized_pnl: 12, source: 'broker', updated_at: Date.now() },
+    ])
+    getOrders.mockResolvedValue([])
+    ;(engine as any).getNavLatest = vi.fn().mockResolvedValue({ date: '2026-06-07', period: 'day_open', nav: 1010, recorded_at: Date.now() })
+
+    const result = await runCloseOutSweep(db, engine)
+    expect(result.processed).toBe(0)
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const snap = db.prepare('SELECT * FROM trader_pnl_snapshots WHERE date = ?').get(today) as any
+    expect(snap).toBeTruthy()
+    expect(snap.open_unrealized_pnl).toBe(12)
+    expect(snap.account_nav).toBe(1010)
+  })
+})
+
+// writeDailySnapshot TZ correctness -------------------------------------------
+
+describe('writeDailySnapshot: verdict-sum uses NY day bounds, not OS localtime', () => {
+  it('counts a verdict whose closed_at is after UTC midnight but still the same NY calendar day', async () => {
+    // 2026-06-08 01:00 UTC = 2026-06-07 21:00 EDT (UTC-4).
+    // A UTC-hosted SQLite 'localtime' modifier treats this as 2026-06-08,
+    // so the bug drops the verdict from that day's sum. The fix uses
+    // America/New_York ms bounds so it is always counted on 2026-06-07.
+    const db = makeDb()
+
+    // Insert the single signal+decision+verdict that must appear in the count.
+    // closed_at = 2026-06-08T01:00:00Z (ms)
+    const closedAtMs = Date.UTC(2026, 5, 8, 1, 0, 0) // June = month 5 (0-indexed)
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('s-tz', 'momentum-stocks', 'AAPL', 'buy', 0.5, 20, ?, 'closed')
+    `).run(closedAtMs)
+    db.prepare(`
+      INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES ('d-tz', 's-tz', 'buy', 'AAPL', 100, 'limit', 't', 0.7, ?, 'closed')
+    `).run(closedAtMs - 86_400_000)
+    db.prepare(`
+      INSERT INTO trader_verdicts
+        (id, decision_id, pnl_gross, pnl_net, bench_return, hold_drawdown, thesis_grade, agent_attribution_json, closed_at, returns_backfilled)
+      VALUES ('v-tz', 'd-tz', 7, 6, 0, 0, 'B', '[]', ?, 1)
+    `).run(closedAtMs)
+
+    // The snapshot writer uses toLocaleDateString('en-CA', {timeZone:'America/New_York'})
+    // on `nowMs` to produce `todayNY`. With nowMs = closedAtMs the NY date is '2026-06-07'.
+    // We inject nowMs via the exported helper so the test does not depend on real wall clock.
+    const getNavLatest = vi.fn().mockResolvedValue(null)
+    const getPositions = vi.fn().mockResolvedValue([])
+    const getOrders = vi.fn().mockResolvedValue([])
+    const getPrices = vi.fn().mockResolvedValue([])
+    const engine = { getNavLatest, getPositions, getOrders, getPrices } as unknown as EngineClient
+
+    // Run the sweep with the injected nowMs so todayNY is deterministic.
+    await runCloseOutSweep(db, engine, { nowMs: closedAtMs })
+
+    // The snapshot date must be the NY calendar day for closedAtMs.
+    const expectedDate = new Date(closedAtMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const snap = db.prepare('SELECT * FROM trader_pnl_snapshots WHERE date = ?').get(expectedDate) as any
+    expect(snap).toBeTruthy()
+    // The verdict (pnl_net=6) must appear in the sum.
+    expect(snap.pnl_day).toBe(6)
+    expect(snap.trades_count).toBe(1)
   })
 })
 
@@ -670,5 +747,62 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
     expect(verdict.returns_backfilled).toBe(0)
     expect(verdict.bench_return).toBe(0)
     expect(verdict.hold_drawdown).toBe(0)
+  })
+
+  it('grades a reconciler-promoted executed decision once the engine reports fills', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('s-rec','momentum-stocks','AAPL','buy',0.7,20,?, 'submitted')`).run(1000)
+    db.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, filled_qty, filled_avg_price)
+      VALUES ('d-rec','s-rec','buy','AAPL',150,'market','t',0.8,1000,'executed',10,100)`).run()
+    const client = {
+      getPositions: vi.fn().mockResolvedValue([]), // closed
+      getOrders: vi.fn().mockResolvedValue([
+        fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+        fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
+      ]),
+      getPrices: vi.fn().mockResolvedValue([]),
+    }
+    const sweep = await runCloseOutSweep(db, client as unknown as EngineClient)
+    expect(sweep.processed).toBe(1)
+    const verdict = db.prepare("SELECT pnl_gross FROM trader_verdicts WHERE decision_id='d-rec'").get() as any
+    expect(verdict).toBeTruthy()
+    expect(verdict.pnl_gross).toBeGreaterThan(0)
+  })
+})
+
+// I1: processClosure must call recomputeRealizedPnl so trader_realized_pnl populates.
+describe('I1: processClosure populates trader_realized_pnl via recomputeRealizedPnl', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it('writes a trader_realized_pnl row after a verdict is committed for a fully-closed decision', () => {
+    insertSignal(db, 'sig-pnl')
+    insertExecutedDecision(db, 'dec-pnl', 'sig-pnl', { decidedAt: 1000 })
+
+    // Seed a trader_fills row directly (as the order-reconciler would have written).
+    recordFill(db, {
+      decisionId: 'dec-pnl', clientOrderId: 'dec-pnl', asset: 'AAPL',
+      side: 'buy', fillQty: 10, fillPrice: 100, fillTsMs: 1100,
+    }, 1100, 'fill-buy-pnl')
+    recordFill(db, {
+      decisionId: 'dec-pnl', clientOrderId: 'dec-pnl', asset: 'AAPL',
+      side: 'sell', fillQty: 10, fillPrice: 115, fillTsMs: 5000,
+    }, 5000, 'fill-sell-pnl')
+
+    const orders: EngineOrder[] = [
+      fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 115, created_at: 5000, updated_at: 5000 }),
+    ]
+    const result = processClosure(db, findOpenDecisions(db).find(d => d.id === 'dec-pnl')!, [], orders)
+    expect(result.reason).toBe('closed')
+
+    const rows = db.prepare(
+      "SELECT pnl_gross, pnl_net, lot_match_rule FROM trader_realized_pnl WHERE decision_id = 'dec-pnl'",
+    ).all() as Array<{ pnl_gross: number; pnl_net: number; lot_match_rule: string }>
+    expect(rows).toHaveLength(1)
+    expect(rows[0].pnl_gross).toBeCloseTo(150, 10)   // (115-100)*10
+    expect(rows[0].lot_match_rule).toBe('FIFO')
   })
 })

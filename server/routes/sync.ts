@@ -85,7 +85,7 @@ const TABLE_MAP: Record<keyof TraderSyncPayload, { table: string; cols: string[]
   },
   pnl_snapshots: {
     table: 'trader_pnl_snapshots',
-    cols: ['date', 'nav_open', 'nav_close', 'pnl_day', 'trades_count', 'bench_return', 'cumulative_pnl'],
+    cols: ['date', 'nav_open', 'nav_close', 'pnl_day', 'trades_count', 'bench_return', 'cumulative_pnl', 'open_unrealized_pnl', 'account_nav'],
   },
   alert_state: {
     table: 'trader_alert_state',

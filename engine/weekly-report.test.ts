@@ -470,6 +470,36 @@ describe('buildReport', () => {
     expect(report.worstTrades).toEqual([])
     expect(report.nav.available).toBe(false)
     expect(report.killSwitchEvents.length).toBeGreaterThan(0)
+    expect(report.openPositions.openCount).toBe(0)
+    expect(report.openMtmAvailable).toBe(false)
+  })
+
+  it('reports open positions with cost basis and unrealized MTM', async () => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-op1', 'momentum-stocks', 'AAPL', 'buy', 0.5, 20, ?, 'executed')
+    `).run(Date.now())
+    db.prepare(`
+      INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES ('dec-op1', 'sig-op1', 'buy', 'AAPL', 100, 'limit', 't', 0.7, ?, 'executed')
+    `).run(Date.now())
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const client = {
+      getNavSnapshots: vi.fn().mockResolvedValue([]),
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 112, unrealized_pnl: 12, source: 'broker', updated_at: Date.now() },
+      ]),
+    } as unknown as EngineClient
+    const report = await buildReport(db, client, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+    expect(report.openPositions.openCount).toBe(1)
+    expect(report.openPositions.totalCostBasisUsd).toBe(100)
+    expect(report.openPositions.totalUnrealizedPnlUsd).toBe(12)
+    expect(report.openMtmAvailable).toBe(true)
+
+    const html = renderReportHtml(report)
+    expect(html).toContain('Open Positions')
+    expect(html).toContain('Realized P&amp;L (closed trades, net of fees when fill data is available)')
+    expect(html).toContain('Account equity change')
   })
 
   it('engine unreachable still renders with NAV unavailable section', async () => {
@@ -512,7 +542,9 @@ describe('renderReportHtml', () => {
     const html = renderReportHtml(report)
 
     expect(html).toContain('Paw Trader Weekly Report')
-    expect(html).toContain('NAV &amp; Equity Curve')
+    expect(html).toContain('Money: Realized, Unrealized, Account Equity')
+    expect(html).toContain('Account Equity (NAV)')
+    expect(html).toContain('Open Positions')
     expect(html).toContain('Per-Strategy Summary')
     expect(html).toContain('Verdict Breakdown')
     expect(html).toContain('Top 3 Best Trades')
@@ -540,6 +572,8 @@ describe('renderReportHtml', () => {
       gradeBreakdown: { A: 0, B: 0, C: 0, D: 0 },
       attribution: {},
       nav: { weekOpen: null, weekClose: null, deltaUsd: null, deltaPct: null, snapshotCount: 0, available: false, unavailableReason: 'test' },
+      openPositions: { openCount: 0, totalCostBasisUsd: 0, totalUnrealizedPnlUsd: 0, totalMarketValueUsd: 0, unmatchedCount: 0, positions: [] },
+      openMtmAvailable: false,
       killSwitchEvents: [],
       killSwitchLog: [],
     }
@@ -582,12 +616,12 @@ describe('renderReportSummary', () => {
     expect(summary).not.toMatch(/^#/m)
   })
 
-  it('leads with NAV and win rate', async () => {
+  it('leads with account equity and win rate', async () => {
     const report = await buildSampleReport()
     const summary = renderReportSummary(report)
-    expect(summary).toContain('NAV:')
+    expect(summary).toContain('Account equity')
     expect(summary).toContain('Win rate:')
-    expect(summary.toLowerCase().indexOf('nav'))
+    expect(summary.toLowerCase().indexOf('account equity'))
       .toBeLessThan(summary.toLowerCase().indexOf('verdicts'))
   })
 

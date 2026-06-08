@@ -34,7 +34,7 @@ import path from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import type Database from 'better-sqlite3'
 import { logger } from '../logger.js'
-import { listTrackRecords, type StrategyTrackRecord } from './track-record.js'
+import { listTrackRecords, listOpenPositions, summarizeOpenPositions, type StrategyTrackRecord, type OpenPositionsSummary } from './track-record.js'
 import type { EngineClient } from './engine-client.js'
 import type { NavSnapshot } from './types.js'
 import { sendEmail } from '../google/gmail.js'
@@ -128,6 +128,15 @@ export interface WeeklyReport {
   gradeBreakdown: { A: number; B: number; C: number; D: number }
   attribution: AttributionTally
   nav: NavDelta
+  /**
+   * Open-position accounting at report time: count, summed cost basis, and
+   * unrealized MTM from the live engine positions. Distinct from `nav`
+   * (account equity) and from realized P&L (closed verdicts). `mtmAvailable`
+   * is false when the engine was unreachable, in which case unrealized/market
+   * value are 0 and the renderer shows "MTM unavailable".
+   */
+  openPositions: OpenPositionsSummary
+  openMtmAvailable: boolean
   killSwitchEvents: KillSwitchEvent[]
   /**
    * Phase 5 Task 3 -- newest-first list of operator toggles inside the
@@ -416,6 +425,40 @@ export async function fetchNavDelta(
 }
 
 // ---------------------------------------------------------------------------
+// Open-positions section builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Assemble the open-position accounting for the report. Always returns the
+ * brain's open-decision count + cost basis (read from the local DB, never
+ * fails the report). Unrealized MTM + market value come from a live
+ * GET /positions; if the engine is unreachable mtmAvailable is false and
+ * those fields are 0 so the renderer prints "MTM unavailable" instead of a
+ * misleading $0 unrealized.
+ */
+export async function buildOpenPositionsSection(
+  db: Database.Database,
+  engineClient: EngineClient | null,
+): Promise<{ summary: OpenPositionsSummary; mtmAvailable: boolean }> {
+  let open: ReturnType<typeof listOpenPositions> = []
+  try {
+    open = listOpenPositions(db)
+  } catch (err) {
+    logger.warn({ err }, 'Weekly report: listOpenPositions failed; continuing with []')
+  }
+  if (!engineClient) {
+    return { summary: summarizeOpenPositions(open, []), mtmAvailable: false }
+  }
+  try {
+    const positions = await engineClient.getPositions()
+    return { summary: summarizeOpenPositions(open, positions), mtmAvailable: true }
+  } catch (err) {
+    logger.warn({ err }, 'Weekly report: getPositions failed; open MTM unavailable')
+    return { summary: summarizeOpenPositions(open, []), mtmAvailable: false }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // buildReport -- the main aggregator
 // ---------------------------------------------------------------------------
 
@@ -459,6 +502,8 @@ export async function buildReport(
   const strategyRollups = safeListTrackRecords(db)
   const attribution = tallyAttribution(verdicts)
   const nav = await fetchNavDelta(engineClient, weekStartMs, weekEndMs)
+  const { summary: openPositions, mtmAvailable: openMtmAvailable } =
+    await buildOpenPositionsSection(db, engineClient)
   const killSwitchEvents = buildKillSwitchEvents(opts.killSwitch ?? null, weekStartMs, weekEndMs)
   const killSwitchLog = await safeFetchKillSwitchLog(deps?.fetchKillSwitchLog, weekStartMs, weekEndMs)
 
@@ -478,6 +523,8 @@ export async function buildReport(
     gradeBreakdown,
     attribution,
     nav,
+    openPositions,
+    openMtmAvailable,
     killSwitchEvents,
     killSwitchLog,
   }
@@ -632,10 +679,17 @@ export function renderReportHtml(report: WeeklyReport): string {
     <div class="kpi"><div class="label">Win rate</div><div class="value">${formatPct(report.winRate)}</div></div>
     <div class="kpi"><div class="label">Net P&amp;L</div><div class="value ${pnlClass(report.totalPnlNet)}">${formatUsd(report.totalPnlNet)}</div></div>
     <div class="kpi"><div class="label">Wins / Losses</div><div class="value">${report.winCount} / ${report.lossCount}</div></div>
+    <div class="kpi"><div class="label">Open Positions</div><div class="value">${report.openPositions.openCount}</div></div>
   </div>
 
-  <h2>NAV &amp; Equity Curve</h2>
+  <h2>Money: Realized, Unrealized, Account Equity</h2>
+  ${renderMoneySummary(report)}
+
+  <h2>Account Equity (NAV)</h2>
   ${renderNavSection(report.nav)}
+
+  <h2>Open Positions</h2>
+  ${renderOpenPositionsTable(report)}
 
   <h2>Per-Strategy Summary</h2>
   ${renderStrategyTable(report.strategyRollups)}
@@ -678,6 +732,54 @@ function renderNavSection(nav: NavDelta): string {
     <tr><th>Delta (%)</th><td class="${deltaClass}">${formatPct(nav.deltaPct ?? 0)}</td></tr>
     <tr><th>Snapshots in window</th><td>${nav.snapshotCount}</td></tr>
   </table>`
+}
+
+/**
+ * The three-line money truth panel. Each line is independently sourced and
+ * labeled so account drift is never mistaken for performance:
+ *   - Realized P&L: net of fees/slippage from CLOSED verdicts in-window.
+ *   - Unrealized MTM: mark-to-market on OPEN positions (live engine), or
+ *     "unavailable" when the engine is unreachable.
+ *   - Account equity change: NAV delta over the week. This includes cash,
+ *     interest, and MTM; it is account drift, NOT strategy performance.
+ */
+function renderMoneySummary(report: WeeklyReport): string {
+  const realized = `<tr><th>Realized P&amp;L (closed trades, net of fees when fill data is available)</th><td class="${pnlClass(report.totalPnlNet)}">${formatUsd(report.totalPnlNet)}</td></tr>`
+  const unrealized = report.openMtmAvailable
+    ? `<tr><th>Unrealized MTM (open positions)</th><td class="${pnlClass(report.openPositions.totalUnrealizedPnlUsd)}">${formatUsd(report.openPositions.totalUnrealizedPnlUsd)}</td></tr>`
+    : `<tr><th>Unrealized MTM (open positions)</th><td>unavailable (engine unreachable)</td></tr>`
+  const navDelta = report.nav.available
+    ? `<tr><th>Account equity change (NAV delta, includes cash/interest)</th><td class="${pnlClass(report.nav.deltaUsd ?? 0)}">${formatUsd(report.nav.deltaUsd)}</td></tr>`
+    : `<tr><th>Account equity change (NAV delta)</th><td>unavailable</td></tr>`
+  return `<table>${realized}${unrealized}${navDelta}</table>
+    <div class="muted">Realized = closed trades only; net of fees when fill data is available. Unrealized = open-position mark-to-market. NAV delta is account drift (cash + interest + MTM), not strategy performance.</div>`
+}
+
+/**
+ * Open-position table: every executed-but-unclosed decision with its cost
+ * basis. When MTM is available, show the aggregate unrealized + market value
+ * at the foot. unmatchedCount > 0 flags decisions the brain thinks are open
+ * but the engine has no live position for (stale / never filled).
+ */
+function renderOpenPositionsTable(report: WeeklyReport): string {
+  const op = report.openPositions
+  if (op.openCount === 0) {
+    return `<div class="muted">No open positions.</div>`
+  }
+  const body = op.positions.map(p => `<tr>
+    <td>${escapeHtml(p.asset)}</td>
+    <td>${escapeHtml(p.side)}</td>
+    <td>${escapeHtml(p.strategy_id)}</td>
+    <td>${formatUsd(p.cost_basis_usd)}</td>
+    <td>${escapeHtml(formatDate(p.decided_at))}</td>
+  </tr>`).join('')
+  const foot = report.openMtmAvailable
+    ? `<div class="muted">Cost basis total: ${formatUsd(op.totalCostBasisUsd)} &middot; Market value: ${formatUsd(op.totalMarketValueUsd)} &middot; Unrealized: ${formatUsd(op.totalUnrealizedPnlUsd)}${op.unmatchedCount > 0 ? ` &middot; ${op.unmatchedCount} with no live engine position` : ''}</div>`
+    : `<div class="muted">Cost basis total: ${formatUsd(op.totalCostBasisUsd)} &middot; MTM unavailable (engine unreachable)</div>`
+  return `<table>
+    <tr><th>Asset</th><th>Side</th><th>Strategy</th><th>Cost basis</th><th>Opened</th></tr>
+    ${body}
+  </table>${foot}`
 }
 
 function renderStrategyTable(rows: StrategyTrackRecord[]): string {
@@ -796,15 +898,21 @@ export function renderReportSummary(report: WeeklyReport): string {
   if (report.nav.available) {
     const delta = formatUsd(report.nav.deltaUsd)
     const pct = formatPct(report.nav.deltaPct ?? 0)
-    parts.push(`NAV: ${delta} (${pct})`)
+    parts.push(`Account equity change: ${delta} (${pct}) [includes cash/interest, not performance]`)
   } else {
-    parts.push('NAV: not yet populated')
+    parts.push('Account equity: not yet populated')
   }
 
   parts.push(
     `Win rate: ${formatPct(report.winRate)} (${report.winCount}W / ${report.lossCount}L)`,
   )
-  parts.push(`Net PnL: ${formatUsd(report.totalPnlNet)}`)
+  parts.push(`Realized PnL (closed, net of fees when available): ${formatUsd(report.totalPnlNet)}`)
+  if (report.openMtmAvailable) {
+    parts.push(`Unrealized MTM (open): ${formatUsd(report.openPositions.totalUnrealizedPnlUsd)}`)
+  } else {
+    parts.push('Unrealized MTM (open): unavailable')
+  }
+  parts.push(`Open positions: ${report.openPositions.openCount}`)
   parts.push(`Verdicts: ${report.verdictCount}`)
 
   const gradesCompact = `A:${report.gradeBreakdown.A} B:${report.gradeBreakdown.B} C:${report.gradeBreakdown.C} D:${report.gradeBreakdown.D}`

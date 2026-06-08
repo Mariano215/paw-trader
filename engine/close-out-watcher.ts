@@ -19,7 +19,8 @@ import type { EngineClient } from './engine-client.js'
 import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
-import { recomputeTrackRecord } from './track-record.js'
+import { recomputeTrackRecord, listOpenPositions, summarizeOpenPositions } from './track-record.js'
+import { recomputeRealizedPnl } from './audit-log.js'
 import { insertPnlSnapshot, getLastCumulativePnl } from './db.js'
 import {
   computeVerdict,
@@ -84,11 +85,13 @@ export interface PriceFetchResult {
 /**
  * Decisions that opened a position and have no verdict yet.
  *
- * The dispatcher writes status='executed' on a successful submit and
- * status='committee_abstain' on an abstain. We only care about the
- * former -- abstains never opened a position.
+ * The order reconciler promotes to status='executed' on confirmed fill
+ * (filled_qty>0). status='committee_abstain' rows are also excluded --
+ * abstains never opened a position.
  */
 export function findOpenDecisions(db: Database.Database): OpenDecisionRow[] {
+  // status='executed' now means CONFIRMED FILLED (set only by the order
+  // reconciler on filled_qty>0). The submit-ACK no longer lands here.
   return db.prepare(`
     SELECT id, signal_id, asset, action, size_usd, thesis, decided_at, committee_transcript_id
     FROM trader_decisions
@@ -265,6 +268,18 @@ export function processClosure(
 
   db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
 
+  // Populate the derived realized-P&L layer from the immutable fills written
+  // by the order-reconciler. Errors must not roll back the verdict -- the
+  // verdict is the source of truth; the P&L layer can be recomputed later.
+  try {
+    recomputeRealizedPnl(db, decision.id)
+  } catch (err) {
+    logger.warn(
+      { err, decisionId: decision.id },
+      'Close-out sweep: recomputeRealizedPnl failed; verdict already persisted',
+    )
+  }
+
   // ReasoningBank insert + track-record recompute. Both must NOT roll
   // back the verdict on failure -- the verdict is the source of truth
   // and the downstream consumers (Phase 2 retrieval, dashboard rollup)
@@ -392,122 +407,79 @@ export async function fetchReturnsForDecision(
 export async function runCloseOutSweep(
   db: Database.Database,
   engineClient: EngineClient,
+  opts: { nowMs?: number } = {},
 ): Promise<{ processed: number; stillOpen: number; errors: number }> {
   const open = findOpenDecisions(db)
-  if (open.length === 0) {
-    return { processed: 0, stillOpen: 0, errors: 0 }
-  }
-
-  let positions: EnginePosition[]
-  let orders: EngineOrder[]
-  try {
-    [positions, orders] = await Promise.all([
-      engineClient.getPositions(),
-      engineClient.getOrders(),
-    ])
-  } catch (err) {
-    logger.warn({ err, openDecisions: open.length }, 'Close-out sweep: engine fetch failed')
-    return { processed: 0, stillOpen: 0, errors: 1 }
-  }
+  const nowMs = opts.nowMs ?? Date.now()
 
   let processed = 0
   let stillOpen = 0
   let errors = 0
-  for (const decision of open) {
-    try {
-      // Only closed decisions actually need a /prices round-trip.
-      // Prescreen with the same logic processClosure uses so we skip
-      // the network call for still-open / no-fills / partial decisions.
-      let priceFetchResult: PriceFetchResult | undefined
-      if (isAssetClosed(decision.asset, positions)) {
-        const relevant = relevantOrders(decision.asset, decision.decided_at, orders)
-        const buys = rollUpFills(relevant, 'buy')
-        const sells = rollUpFills(relevant, 'sell')
-        const side: 'buy' | 'sell' = decision.action === 'sell' ? 'sell' : 'buy'
-        const probableClose = side === 'buy'
-          ? buys.qty > 0 && sells.qty + 1e-9 >= buys.qty
-          : sells.qty > 0 && buys.qty + 1e-9 >= sells.qty
-        if (probableClose) {
-          const closedAtMs = sells.lastFillMs ?? buys.lastFillMs ?? Date.now()
-          const assetClass = lookupAssetClass(db, decision.signal_id)
-          priceFetchResult = await fetchReturnsForDecision(engineClient, {
-            asset: decision.asset,
-            assetClass,
-            decidedAtMs: decision.decided_at,
-            closedAtMs,
-          })
-        }
-      }
 
-      const result = processClosure(db, decision, positions, orders, priceFetchResult)
-      if (result.reason === 'closed') processed += 1
-      else if (result.reason === 'still-open') stillOpen += 1
-      else errors += 1
+  if (open.length > 0) {
+    let positions: EnginePosition[]
+    let orders: EngineOrder[]
+    try {
+      [positions, orders] = await Promise.all([
+        engineClient.getPositions(),
+        engineClient.getOrders(),
+      ])
     } catch (err) {
-      logger.error(
-        { err, decisionId: decision.id },
-        'Close-out sweep: processClosure threw',
-      )
-      errors += 1
+      logger.warn({ err, openDecisions: open.length }, 'Close-out sweep: engine fetch failed')
+      // Still write snapshot even when close-out fetch fails.
+      await writeDailySnapshot(db, engineClient, nowMs)
+      return { processed: 0, stillOpen: 0, errors: 1 }
     }
-  }
-  // Write a daily PnL snapshot when at least one verdict closed this
-  // pass. nav_open/nav_close require the engine; fetch best-effort and
-  // fall back to 0 so the trade-count and pnl_day columns always land.
-  // cumulative_pnl carries forward from the last stored row.
-  if (processed > 0) {
-    try {
-      const todayNY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
 
-      // Sum pnl_net for verdicts closed today -- pull from DB so we
-      // capture verdicts written in prior ticks on the same calendar day,
-      // not just the ones written this pass.
-      const pnlRow = db.prepare(`
-        SELECT COALESCE(SUM(pnl_net), 0) AS total_pnl, COUNT(*) AS cnt
-        FROM trader_verdicts
-        WHERE date(closed_at / 1000, 'unixepoch', 'localtime') = ?
-      `).get(todayNY) as { total_pnl: number; cnt: number }
-
-      let navOpen = 0
-      let navClose = 0
+    for (const decision of open) {
       try {
-        const [openSnap, closeSnap] = await Promise.all([
-          engineClient.getNavLatest('day_open'),
-          engineClient.getNavLatest('day_close'),
-        ])
-        navOpen = openSnap?.nav ?? 0
-        navClose = closeSnap?.nav ?? 0
-      } catch {
-        // engine unreachable -- leave nav at 0, snapshot still useful
+        // Only closed decisions actually need a /prices round-trip.
+        // Prescreen with the same logic processClosure uses so we skip
+        // the network call for still-open / no-fills / partial decisions.
+        let priceFetchResult: PriceFetchResult | undefined
+        if (isAssetClosed(decision.asset, positions)) {
+          const relevant = relevantOrders(decision.asset, decision.decided_at, orders)
+          const buys = rollUpFills(relevant, 'buy')
+          const sells = rollUpFills(relevant, 'sell')
+          const side: 'buy' | 'sell' = decision.action === 'sell' ? 'sell' : 'buy'
+          const probableClose = side === 'buy'
+            ? buys.qty > 0 && sells.qty + 1e-9 >= buys.qty
+            : sells.qty > 0 && buys.qty + 1e-9 >= sells.qty
+          if (probableClose) {
+            const closedAtMs = sells.lastFillMs ?? buys.lastFillMs ?? Date.now()
+            const assetClass = lookupAssetClass(db, decision.signal_id)
+            priceFetchResult = await fetchReturnsForDecision(engineClient, {
+              asset: decision.asset,
+              assetClass,
+              decidedAtMs: decision.decided_at,
+              closedAtMs,
+            })
+          }
+        }
+
+        const result = processClosure(db, decision, positions, orders, priceFetchResult)
+        if (result.reason === 'closed') processed += 1
+        else if (result.reason === 'still-open') stillOpen += 1
+        else errors += 1
+      } catch (err) {
+        logger.error(
+          { err, decisionId: decision.id },
+          'Close-out sweep: processClosure threw',
+        )
+        errors += 1
       }
-
-      const prior = getLastCumulativePnl(db)
-      // Avoid double-counting: subtract any prior cumulative that already
-      // includes today's row (INSERT OR REPLACE will overwrite it).
-      const priorRow = db.prepare(
-        `SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date = ?`,
-      ).get(todayNY) as { cumulative_pnl: number } | undefined
-      const priorToday = priorRow?.cumulative_pnl ?? 0
-      const priorBase = prior - priorToday
-
-      insertPnlSnapshot(db, {
-        date: todayNY,
-        navOpen,
-        navClose,
-        pnlDay: pnlRow.total_pnl,
-        tradesCount: pnlRow.cnt,
-        benchReturn: 0,   // backfilled later when /prices available
-        cumulativePnl: priorBase + pnlRow.total_pnl,
-      })
-
-      logger.info(
-        { date: todayNY, pnlDay: pnlRow.total_pnl, tradesCount: pnlRow.cnt, navOpen, navClose },
-        'Close-out sweep: daily PnL snapshot written',
-      )
-    } catch (err) {
-      logger.warn({ err }, 'Close-out sweep: PnL snapshot write failed; verdicts already persisted')
     }
   }
+
+  // Write a daily PnL snapshot EVERY sweep, not just when something closed.
+  // Previously this was gated on processed > 0; since almost nothing closes
+  // (engine never confirms fills), the table stayed empty and the equity
+  // curve had no data. Now every tick records: realized pnl_day (closed
+  // verdicts today), open unrealized MTM (live positions), and account NAV
+  // (broker equity) in separate columns. nav_open/nav_close + MTM are
+  // best-effort; on engine failure they fall back to 0 and the realized
+  // pnl_day + trade count still land.
+  await writeDailySnapshot(db, engineClient, nowMs)
 
   if (errors > 0) {
     logger.warn(
@@ -517,6 +489,117 @@ export async function runCloseOutSweep(
   }
 
   return { processed, stillOpen, errors }
+}
+
+/**
+ * Write (or overwrite) the daily PnL snapshot row for today (America/New_York
+ * calendar date). Called every sweep so the equity curve has data even when
+ * nothing closes. Best-effort: nav and open-MTM fall back to 0 on engine
+ * failure; the realized pnl_day + trade count always land.
+ *
+ * `nowMs` is injectable for testing; defaults to Date.now(). This also
+ * drives the verdict-sum query so that both the row key (todayNY) and the
+ * verdict filter use exactly the same NY calendar day, regardless of the
+ * host OS timezone (e.g. UTC on Hostinger / CI).
+ */
+async function writeDailySnapshot(
+  db: Database.Database,
+  engineClient: EngineClient,
+  nowMs: number,
+): Promise<void> {
+  try {
+    const todayNY = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+    // Compute the NY calendar day's ms bounds so the verdict-sum query
+    // uses the same America/New_York day basis as todayNY -- not the OS
+    // 'localtime' modifier, which diverges on UTC hosts (Hostinger, CI).
+    //
+    // Strategy: binary-search for the UTC ms that renders as todayNY
+    // midnight in America/New_York. We know NY is UTC-5 (EST) or UTC-4
+    // (EDT). Try both offsets; the one whose NY date string matches
+    // todayNY is correct. DST transitions never fall at midnight so one
+    // of the two will always match.
+    const nyMidnightMs = (() => {
+      for (const offsetH of [4, 5]) {
+        const candidateMs = Date.parse(todayNY + 'T00:00:00Z') + offsetH * 3_600_000
+        if (new Date(candidateMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === todayNY) {
+          return candidateMs
+        }
+      }
+      // Should never happen; fall back to UTC midnight of the date string.
+      return Date.parse(todayNY + 'T00:00:00Z')
+    })()
+    const dayStartMs = nyMidnightMs
+    const dayEndMs = dayStartMs + 86_400_000
+
+    // Sum pnl_net for verdicts closed today -- pull from DB so we
+    // capture verdicts written in prior ticks on the same calendar day,
+    // not just the ones written this pass. Use ms bounds (not OS
+    // 'localtime') so the filter agrees with todayNY on any host TZ.
+    const pnlRow = db.prepare(`
+      SELECT COALESCE(SUM(pnl_net), 0) AS total_pnl, COUNT(*) AS cnt
+      FROM trader_verdicts
+      WHERE closed_at >= ? AND closed_at < ?
+    `).get(dayStartMs, dayEndMs) as { total_pnl: number; cnt: number }
+
+    let navOpen = 0
+    let navClose = 0
+    let accountNav = 0
+    let openUnrealizedPnl = 0
+    try {
+      const [openSnap, closeSnap] = await Promise.all([
+        engineClient.getNavLatest('day_open'),
+        engineClient.getNavLatest('day_close'),
+      ])
+      navOpen = openSnap?.nav ?? 0
+      navClose = closeSnap?.nav ?? 0
+      // account_nav = the freshest broker equity we have. Prefer day_close
+      // (set at 4pm), else day_open. This is account equity, distinct from
+      // realized pnl_day.
+      accountNav = navClose || navOpen
+    } catch {
+      // engine unreachable -- leave nav at 0, snapshot still useful
+    }
+    try {
+      const openDecisions = listOpenPositions(db)
+      // Second getPositions call per tick (the first is in the close-out
+      // loop above). Intentional: the close-out loop may have written new
+      // verdicts that shrink the open set, so we need a fresh snapshot
+      // here to compute open MTM on the post-closure position state.
+      const positions = await engineClient.getPositions()
+      openUnrealizedPnl = summarizeOpenPositions(openDecisions, positions).totalUnrealizedPnlUsd
+    } catch {
+      // engine unreachable -- leave open MTM at 0
+    }
+
+    const prior = getLastCumulativePnl(db)
+    // Avoid double-counting: subtract any prior cumulative that already
+    // includes today's row (INSERT OR REPLACE will overwrite it).
+    const priorRow = db.prepare(
+      `SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date = ?`,
+    ).get(todayNY) as { cumulative_pnl: number } | undefined
+    const priorToday = priorRow?.cumulative_pnl ?? 0
+    const priorBase = prior - priorToday
+
+    insertPnlSnapshot(db, {
+      date: todayNY,
+      navOpen,
+      navClose,
+      pnlDay: pnlRow.total_pnl,
+      tradesCount: pnlRow.cnt,
+      benchReturn: 0,   // backfilled later when /prices available
+      cumulativePnl: priorBase + pnlRow.total_pnl,
+      openUnrealizedPnl,
+      accountNav,
+    })
+
+    logger.info(
+      { date: todayNY, pnlDay: pnlRow.total_pnl, tradesCount: pnlRow.cnt, openUnrealizedPnl, accountNav },
+      'Close-out sweep: daily PnL snapshot written',
+    )
+  } catch (err) {
+    logger.warn({ err }, 'Close-out sweep: PnL snapshot write failed')
+  }
 }
 
 /**

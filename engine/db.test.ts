@@ -160,6 +160,31 @@ describe("trader DB tables", () => {
     expect(row.sent_at).toBe(1776000000000)
   })
 
+  it('adds open_unrealized_pnl and account_nav columns idempotently', () => {
+    const db = new Database(':memory:')
+    initTraderTables(db)
+    initTraderTables(db)  // idempotent
+    const cols = db.prepare('PRAGMA table_info(trader_pnl_snapshots)').all() as any[]
+    const names = cols.map((c) => c.name)
+    expect(names).toContain('open_unrealized_pnl')
+    expect(names).toContain('account_nav')
+  })
+
+  it('insertPnlSnapshot round-trips realized, open MTM, and account NAV separately', async () => {
+    const db = new Database(':memory:')
+    initTraderTables(db)
+    const { insertPnlSnapshot } = await import('./db.js')
+    insertPnlSnapshot(db, {
+      date: '2026-06-07', navOpen: 1000, navClose: 1010, pnlDay: 5,
+      tradesCount: 2, benchReturn: 0, cumulativePnl: 5,
+      openUnrealizedPnl: 12, accountNav: 1010,
+    })
+    const row = db.prepare('SELECT * FROM trader_pnl_snapshots WHERE date = ?').get('2026-06-07') as any
+    expect(row.pnl_day).toBe(5)
+    expect(row.open_unrealized_pnl).toBe(12)
+    expect(row.account_nav).toBe(1010)
+  })
+
   it('rejects inserting two pending signals for the same asset+side', () => {
     const testDb = new Database(':memory:')
     initTraderTables(testDb)

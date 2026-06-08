@@ -240,3 +240,115 @@ export function listTrackRecords(db: Database.Database): StrategyTrackRecord[] {
     ORDER BY strategy_id
   `).all() as StrategyTrackRecord[]
 }
+
+// ---------------------------------------------------------------------------
+// Open-position accounting
+// ---------------------------------------------------------------------------
+
+import type { EnginePosition } from './types.js'
+
+export interface OpenPositionRow {
+  decision_id: string
+  signal_id: string
+  asset: string
+  side: string
+  strategy_id: string
+  cost_basis_usd: number
+  decided_at: number
+}
+
+export interface OpenPositionsSummary {
+  /** Count of executed decisions with no verdict yet (the "Open Positions" KPI). */
+  openCount: number
+  /** Sum of size_usd across all open decisions (committee-approved dollars at risk). */
+  totalCostBasisUsd: number
+  /**
+   * Sum of unrealized_pnl from the live engine positions that match an open
+   * decision by asset. Decisions whose asset has no live engine position
+   * contribute 0 (and are counted in `unmatchedCount` so the report can flag
+   * drift between the brain's open-decision set and the engine's positions).
+   */
+  totalUnrealizedPnlUsd: number
+  /** Sum of market_value from matched live positions; the current dollar value held. */
+  totalMarketValueUsd: number
+  /** Open decisions whose asset has NO live engine position (possible stale/never-filled). */
+  unmatchedCount: number
+  positions: OpenPositionRow[]
+}
+
+/**
+ * Executed decisions that have not produced a verdict yet. This is the brain's
+ * notion of an open position: a buy that fired but has not closed out. The
+ * LEFT JOIN to trader_verdicts + WHERE v.decision_id IS NULL is equivalent to
+ * the NOT IN form findOpenDecisions uses, kept here as its own helper so the
+ * report and dashboard can read open positions without importing the close-out
+ * watcher.
+ */
+export function listOpenPositions(db: Database.Database): OpenPositionRow[] {
+  return db.prepare(`
+    SELECT
+      d.id          AS decision_id,
+      d.signal_id   AS signal_id,
+      d.asset       AS asset,
+      s.side        AS side,
+      s.strategy_id AS strategy_id,
+      COALESCE(d.size_usd, 0) AS cost_basis_usd,
+      d.decided_at  AS decided_at
+    FROM trader_decisions d
+    JOIN trader_signals s ON s.id = d.signal_id
+    LEFT JOIN trader_verdicts v ON v.decision_id = d.id
+    WHERE d.status = 'executed'
+      AND v.decision_id IS NULL
+    ORDER BY d.decided_at ASC
+  `).all() as OpenPositionRow[]
+}
+
+/**
+ * Combine the open-decision set with a live engine positions snapshot to
+ * produce the count + cost basis + unrealized MTM the weekly report needs.
+ *
+ * Matching is by asset. When multiple open decisions share one asset (e.g. two
+ * scaled-in buys of AAPL), the engine reports a single aggregate position for
+ * that asset, so we attribute that asset's market_value/unrealized_pnl ONCE
+ * (to the asset, not per decision) to avoid double counting. openCount and
+ * totalCostBasisUsd still reflect every decision.
+ *
+ * positions can be [] (engine unreachable). In that case MTM/market-value are
+ * 0, every open decision is unmatched, and the caller renders the count + cost
+ * basis with an "MTM unavailable" note rather than a fake $0 unrealized.
+ */
+export function summarizeOpenPositions(
+  openDecisions: OpenPositionRow[],
+  positions: EnginePosition[],
+): OpenPositionsSummary {
+  const byAsset = new Map<string, EnginePosition>()
+  for (const p of positions) {
+    if (Math.abs(p.qty) > 1e-9) byAsset.set(p.asset, p)
+  }
+
+  let totalCostBasisUsd = 0
+  const matchedAssets = new Set<string>()
+  const unmatchedAssets = new Set<string>()
+  for (const d of openDecisions) {
+    totalCostBasisUsd += d.cost_basis_usd
+    if (byAsset.has(d.asset)) matchedAssets.add(d.asset)
+    else unmatchedAssets.add(d.asset)
+  }
+
+  let totalUnrealizedPnlUsd = 0
+  let totalMarketValueUsd = 0
+  for (const asset of matchedAssets) {
+    const pos = byAsset.get(asset)!
+    totalUnrealizedPnlUsd += pos.unrealized_pnl
+    totalMarketValueUsd += pos.market_value
+  }
+
+  return {
+    openCount: openDecisions.length,
+    totalCostBasisUsd,
+    totalUnrealizedPnlUsd,
+    totalMarketValueUsd,
+    unmatchedCount: unmatchedAssets.size,
+    positions: openDecisions,
+  }
+}

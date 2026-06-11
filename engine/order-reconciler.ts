@@ -12,6 +12,16 @@ import { recordFill } from './audit-log.js'
  */
 export const RECONCILE_ORPHAN_HORIZON_MS = 6 * 60 * 60 * 1000
 
+/**
+ * Exit rows get a much shorter orphan horizon: an exit_submitted row with no
+ * broker record means an OPEN POSITION IS UNMANAGED while the duplicate guard
+ * blocks any retry. Live incident 2026-06-11: two pre-market exits were
+ * accepted by the engine, the engine restarted, the queued orders were lost,
+ * and the rows blocked re-exit forever. 15 minutes covers propagation lag
+ * without leaving risk unmanaged for hours.
+ */
+export const EXIT_ORPHAN_HORIZON_MS = 15 * 60 * 1000
+
 export interface ReconcileSummary {
   checked: number
   promotedToFilled: number
@@ -28,6 +38,7 @@ interface OpenRow {
   engine_order_id: string | null
   status: string
   decided_at: number
+  parent_decision_id: string | null
 }
 
 /**
@@ -51,13 +62,16 @@ export async function reconcileOpenOrders(
   client: EngineClient,
   send?: (text: string) => Promise<void>,
 ): Promise<ReconcileSummary> {
+  // Exit rows (status exit_submitted) are tracked alongside entries: a lost
+  // exit means an open position is unmanaged while the duplicate guard blocks
+  // any retry, so they MUST be reconciled against the broker every tick.
   const open = db
     .prepare(
-      `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at
+      `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at, parent_decision_id
        FROM trader_decisions
-       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')})`,
+       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?)`,
     )
-    .all(...OPEN_AT_BROKER) as OpenRow[]
+    .all(...OPEN_AT_BROKER, DECISION_STATUS.EXIT_SUBMITTED) as OpenRow[]
 
   const summary: ReconcileSummary = {
     checked: open.length,
@@ -79,6 +93,7 @@ export async function reconcileOpenOrders(
   }
 
   for (const row of open) {
+    const isExit = row.status === DECISION_STATUS.EXIT_SUBMITTED
     const match = orders.find(
       (o) =>
         (row.engine_order_id != null && o.broker_order_id === row.engine_order_id) ||
@@ -86,11 +101,23 @@ export async function reconcileOpenOrders(
     )
     if (!match) {
       // No broker record. Recent orders may still be propagating -- skip them.
-      // Old orders with no broker record after RECONCILE_ORPHAN_HORIZON_MS are
-      // true orphans: the submit may have silently failed or been lost. Mark
-      // failed and alert so the signal is not silently stuck forever.
+      // Old orders with no broker record after the horizon are true orphans:
+      // the submit may have silently failed or been lost (e.g. queued in the
+      // engine across a restart). Entries are marked failed; exit rows are
+      // DELETED so the duplicate guard frees and the next sweep re-submits
+      // the close.
       const age = Date.now() - row.decided_at
-      if (age < RECONCILE_ORPHAN_HORIZON_MS) continue
+      const horizon = isExit ? EXIT_ORPHAN_HORIZON_MS : RECONCILE_ORPHAN_HORIZON_MS
+      if (age < horizon) continue
+      if (isExit) {
+        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(row.id)
+        summary.expiredOrphans++
+        logger.warn(
+          { decisionId: row.id, parentDecisionId: row.parent_decision_id, asset: row.asset, ageMs: age },
+          'Order reconcile: exit order lost (no broker record after horizon), row removed so the exit sweep retries',
+        )
+        continue
+      }
       db.prepare(`UPDATE trader_decisions SET status = ? WHERE id = ?`).run(
         DECISION_STATUS.FAILED,
         row.id,
@@ -105,6 +132,35 @@ export async function reconcileOpenOrders(
 
     const status = match.status.toLowerCase()
     const filled = typeof match.filled_qty === 'number' ? match.filled_qty : 0
+
+    if (isExit) {
+      // Exit lifecycle: filled -> closed (terminal); canceled/rejected ->
+      // delete the row so the sweep retries; live unfilled -> leave at
+      // exit_submitted (it IS the guard state).
+      if (filled > 0 && (status === 'filled' || status === 'partially_filled')) {
+        db.prepare(
+          `UPDATE trader_decisions SET status = ?, filled_qty = ?, filled_avg_price = ? WHERE id = ?`,
+        ).run(DECISION_STATUS.CLOSED, filled, match.filled_avg_price ?? null, row.id)
+        recordFill(db, {
+          decisionId:    row.id,
+          clientOrderId: row.id,
+          brokerOrderId: match.broker_order_id ?? null,
+          asset:         row.asset,
+          side:          (row.action === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
+          fillQty:       filled,
+          fillPrice:     match.filled_avg_price ?? 0,
+          fillTsMs:      match.updated_at,
+          feeUsd:        0,
+        }, Date.now(), `${match.broker_order_id ?? row.id}:${filled}`)
+        summary.promotedToFilled++
+        logger.info({ decisionId: row.id, asset: row.asset, filled }, 'Order reconcile: exit filled, decision closed')
+      } else if (status === 'canceled' || status === 'rejected' || status === 'expired') {
+        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(row.id)
+        summary.canceledOrRejected++
+        logger.warn({ decisionId: row.id, asset: row.asset, status }, 'Order reconcile: exit order canceled/rejected, row removed so the exit sweep retries')
+      }
+      continue
+    }
 
     if (filled > 0 && (status === 'filled' || status === 'partially_filled')) {
       // Confirmed fill. Promote to executed and cache the fill numbers.

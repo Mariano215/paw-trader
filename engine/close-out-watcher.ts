@@ -50,6 +50,11 @@ export interface OpenDecisionRow {
   thesis: string
   decided_at: number
   committee_transcript_id: string | null
+  /** This decision's own confirmed fill (cached by the order reconciler).
+   *  Required for a verdict: grading against pooled asset orders multi-counts
+   *  an aggregate close across every open decision for the asset. */
+  filled_qty: number | null
+  filled_avg_price: number | null
 }
 
 interface SignalRow {
@@ -67,7 +72,7 @@ export interface ClosureResult {
   fullyClosed: boolean
   outcome: VerdictOutcome | null
   attribution: AgentAttribution[]
-  reason: 'closed' | 'still-open' | 'no-fills' | 'partial'
+  reason: 'closed' | 'still-open' | 'no-fills' | 'partial' | 'closed-no-fill-data'
 }
 
 /**
@@ -93,7 +98,8 @@ export function findOpenDecisions(db: Database.Database): OpenDecisionRow[] {
   // status='executed' now means CONFIRMED FILLED (set only by the order
   // reconciler on filled_qty>0). The submit-ACK no longer lands here.
   return db.prepare(`
-    SELECT id, signal_id, asset, action, size_usd, thesis, decided_at, committee_transcript_id
+    SELECT id, signal_id, asset, action, size_usd, thesis, decided_at, committee_transcript_id,
+           filled_qty, filled_avg_price
     FROM trader_decisions
     WHERE status = 'executed'
       AND id NOT IN (SELECT decision_id FROM trader_verdicts)
@@ -153,8 +159,8 @@ export function processClosure(
   }
 
   const relevant = relevantOrders(decision.asset, decision.decided_at, orders)
-  const buys = rollUpFills(relevant, 'buy')
-  const sells = rollUpFills(relevant, 'sell')
+  let buys = rollUpFills(relevant, 'buy')
+  let sells = rollUpFills(relevant, 'sell')
 
   if (buys.qty <= 0 && sells.qty <= 0) {
     logger.warn(
@@ -171,6 +177,36 @@ export function processClosure(
   }
 
   const side: 'buy' | 'sell' = decision.action === 'sell' ? 'sell' : 'buy'
+
+  // Per-decision lot attribution (2026-06-11): grading a decision against the
+  // asset's POOLED orders stamps the full aggregate-close PnL on EVERY open
+  // decision for that asset -- 68 verdicts each claiming the whole position's
+  // loss in one sweep. A verdict is only honest when this decision's own
+  // confirmed fill is known: grade that lot against the pooled close price.
+  // Decisions without cached fill data (legacy, pre-fill-tracking) get NO
+  // verdict; the caller closes them out via 'closed-no-fill-data'.
+  if (decision.filled_qty == null || decision.filled_qty <= 0 || decision.filled_avg_price == null) {
+    return {
+      decisionId: decision.id,
+      fullyClosed: true,
+      outcome: null,
+      attribution: [],
+      reason: 'closed-no-fill-data',
+    }
+  }
+  const lot = {
+    qty: decision.filled_qty,
+    weightedPrice: decision.filled_avg_price,
+    fees: 0,
+    firstFillMs: decision.decided_at,
+    lastFillMs: decision.decided_at,
+  }
+  if (side === 'buy') {
+    buys = lot
+  } else {
+    sells = lot
+  }
+
   const outcome = computeVerdict({
     decisionId: decision.id,
     side,
@@ -459,6 +495,18 @@ export async function runCloseOutSweep(
 
         const result = processClosure(db, decision, positions, orders, priceFetchResult)
         if (result.reason === 'closed') processed += 1
+        else if (result.reason === 'closed-no-fill-data') {
+          // Position closed but this decision has no cached fill of its own
+          // (legacy pre-fill-tracking row). No honest verdict is possible --
+          // flip to 'closed' so it leaves the candidate set instead of being
+          // re-graded with pooled aggregate PnL every sweep.
+          db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
+          logger.info(
+            { decisionId: decision.id, asset: decision.asset },
+            'Close-out sweep: closed without verdict (no per-decision fill data)',
+          )
+          processed += 1
+        }
         else if (result.reason === 'still-open') stillOpen += 1
         else errors += 1
       } catch (err) {

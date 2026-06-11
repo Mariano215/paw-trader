@@ -76,8 +76,8 @@ function insertExecutedDecision(
   db.prepare(`
     INSERT INTO trader_decisions
       (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
-       committee_transcript_id, decided_at, status)
-    VALUES (?, ?, 'buy', 'AAPL', 1000, 'limit', 't', 0.7, NULL, 1000, 'executed')
+       committee_transcript_id, decided_at, status, filled_qty, filled_avg_price)
+    VALUES (?, ?, 'buy', 'AAPL', 1000, 'limit', 't', 0.7, NULL, 1000, 'executed', 10, 100)
   `).run(decisionId, signalId)
 }
 

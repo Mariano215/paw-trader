@@ -51,13 +51,18 @@ function insertExecutedDecision(
   db: Database.Database,
   decisionId: string,
   signalId: string,
-  overrides: Partial<{ asset: string; action: string; transcriptId: string | null; decidedAt: number; thesis: string }> = {},
+  overrides: Partial<{ asset: string; action: string; transcriptId: string | null; decidedAt: number; thesis: string; filledQty: number | null; filledAvgPrice: number | null }> = {},
 ) {
+  // filled_qty / filled_avg_price default to the pooled fill most tests mock
+  // (10 @ 100): per-decision lot attribution requires a cached fill, and a
+  // single-decision lot equal to the pooled rollup keeps legacy expectations.
+  const filledQty = overrides.filledQty === undefined ? 10 : overrides.filledQty
+  const filledAvgPrice = overrides.filledAvgPrice === undefined ? 100 : overrides.filledAvgPrice
   db.prepare(`
     INSERT INTO trader_decisions
       (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
-       committee_transcript_id, decided_at, status)
-    VALUES (?, ?, ?, ?, 100, 'limit', ?, 0.7, ?, ?, 'executed')
+       committee_transcript_id, decided_at, status, filled_qty, filled_avg_price)
+    VALUES (?, ?, ?, ?, 100, 'limit', ?, 0.7, ?, ?, 'executed', ${filledQty === null ? 'NULL' : filledQty}, ${filledAvgPrice === null ? 'NULL' : filledAvgPrice})
   `).run(
     decisionId,
     signalId,
@@ -218,7 +223,7 @@ describe('processClosure', () => {
   it('records a loss outcome when pnl is negative', () => {
     insertSignal(db, 'sig-1')
     insertTranscript(db, 'tr-1', 'sig-1')
-    insertExecutedDecision(db, 'dec-1', 'sig-1', { transcriptId: 'tr-1' })
+    insertExecutedDecision(db, 'dec-1', 'sig-1', { transcriptId: 'tr-1', filledQty: 5, filledAvgPrice: 100 })
 
     const orders: EngineOrder[] = [
       fillOrder({ side: 'buy',  filled_qty: 5, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
@@ -234,7 +239,7 @@ describe('processClosure', () => {
 
   it('writes verdict with empty attribution when transcript is missing', () => {
     insertSignal(db, 'sig-1')
-    insertExecutedDecision(db, 'dec-1', 'sig-1', { transcriptId: null })
+    insertExecutedDecision(db, 'dec-1', 'sig-1', { transcriptId: null, filledQty: 1, filledAvgPrice: 100 })
 
     const orders: EngineOrder[] = [
       fillOrder({ side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
@@ -295,7 +300,7 @@ describe('processClosure', () => {
     // Decision exists but signal row was deleted somehow.
     insertSignal(db, 'sig-x')
     insertTranscript(db, 'tr-1', 'sig-x')
-    insertExecutedDecision(db, 'dec-orphan', 'sig-x', { transcriptId: 'tr-1' })
+    insertExecutedDecision(db, 'dec-orphan', 'sig-x', { transcriptId: 'tr-1', filledQty: 1, filledAvgPrice: 100 })
     db.prepare("DELETE FROM trader_signals WHERE id='sig-x'").run()
 
     const orders: EngineOrder[] = [
@@ -359,7 +364,7 @@ describe('runCloseOutSweep', () => {
     insertSignal(db, 'sig-nvda', { asset: 'NVDA' })
     insertTranscript(db, 'tr-nvda', 'sig-nvda')
     insertExecutedDecision(db, 'dec-aapl', 'sig-aapl', { asset: 'AAPL', decidedAt: 1000 })
-    insertExecutedDecision(db, 'dec-nvda', 'sig-nvda', { asset: 'NVDA', decidedAt: 1000, transcriptId: 'tr-nvda' })
+    insertExecutedDecision(db, 'dec-nvda', 'sig-nvda', { asset: 'NVDA', decidedAt: 1000, transcriptId: 'tr-nvda', filledQty: 5, filledAvgPrice: 200 })
 
     getPositions.mockResolvedValue([
       { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 100, unrealized_pnl: 0, source: 'paper', updated_at: Date.now() },
@@ -381,7 +386,7 @@ describe('runCloseOutSweep', () => {
   it('isolates a failure in one closure from the rest of the sweep', async () => {
     insertSignal(db, 'sig-good', { asset: 'AAPL' })
     insertSignal(db, 'sig-bad', { asset: 'BAD' })
-    insertExecutedDecision(db, 'dec-good', 'sig-good', { asset: 'AAPL', decidedAt: 1000 })
+    insertExecutedDecision(db, 'dec-good', 'sig-good', { asset: 'AAPL', decidedAt: 1000, filledQty: 1, filledAvgPrice: 100 })
     insertExecutedDecision(db, 'dec-bad',  'sig-bad',  { asset: 'BAD',  decidedAt: 1000 })
 
     getPositions.mockResolvedValue([])
@@ -509,6 +514,50 @@ function pricePoint(ms: number, close: number): PricePoint {
   return { date: new Date(ms).toISOString().slice(0, 10), close, ts_ms: ms }
 }
 
+describe('per-decision lot attribution (Jun 11 2026 multi-count regression)', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it('three decisions on one aggregate close sum to the aggregate PnL, not 3x', () => {
+    // Live failure: 30 QQQ decisions each got a verdict claiming the FULL
+    // -19.07 aggregate-close PnL (one sweep wrote ~$-800 of phantom losses).
+    for (const [i, qty] of [['1', 2], ['2', 3], ['3', 5]] as const) {
+      insertSignal(db, `sig-${i}`, { asset: 'QQQ' })
+      insertExecutedDecision(db, `dec-${i}`, `sig-${i}`, {
+        asset: 'QQQ', decidedAt: 1000, filledQty: qty as number, filledAvgPrice: 100,
+      })
+    }
+    const orders: EngineOrder[] = [
+      fillOrder({ asset: 'QQQ', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'QQQ', side: 'sell', filled_qty: 10, filled_avg_price: 90,  created_at: 5000, updated_at: 5000 }),
+    ]
+    for (const id of ['dec-1', 'dec-2', 'dec-3']) {
+      const row = findOpenDecisions(db).find(d => d.id === id)!
+      const r = processClosure(db, row, [], orders)
+      expect(r.reason).toBe('closed')
+    }
+    const total = db.prepare('SELECT ROUND(SUM(pnl_gross),2) AS t FROM trader_verdicts').get() as { t: number }
+    // Aggregate close lost (90-100)*10 = -100; per-lot: -20, -30, -50.
+    expect(total.t).toBe(-100)
+  })
+
+  it('a decision without cached fill data closes WITHOUT a verdict', () => {
+    insertSignal(db, 'sig-legacy', { asset: 'QQQ' })
+    insertExecutedDecision(db, 'dec-legacy', 'sig-legacy', {
+      asset: 'QQQ', decidedAt: 1000, filledQty: null, filledAvgPrice: null,
+    })
+    const orders: EngineOrder[] = [
+      fillOrder({ asset: 'QQQ', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'QQQ', side: 'sell', filled_qty: 10, filled_avg_price: 90,  created_at: 5000, updated_at: 5000 }),
+    ]
+    const row = findOpenDecisions(db).find(d => d.id === 'dec-legacy')!
+    const r = processClosure(db, row, [], orders)
+    expect(r.reason).toBe('closed-no-fill-data')
+    const v = db.prepare('SELECT COUNT(*) AS n FROM trader_verdicts').get() as { n: number }
+    expect(v.n).toBe(0)
+  })
+})
+
 describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
   let db: ReturnType<typeof makeDb>
   beforeEach(() => { db = makeDb() })
@@ -591,7 +640,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
 
   it('keeps placeholders + returns_backfilled=0 when price fetch failed', () => {
     insertSignal(db, 'sig-2', { asset: 'AAPL', strategy: 'momentum-stocks' })
-    insertExecutedDecision(db, 'dec-2', 'sig-2', { asset: 'AAPL', decidedAt: 1000 })
+    insertExecutedDecision(db, 'dec-2', 'sig-2', { asset: 'AAPL', decidedAt: 1000, filledQty: 5, filledAvgPrice: 100 })
 
     const orders: EngineOrder[] = [
       fillOrder({ side: 'buy',  filled_qty: 5, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
@@ -613,7 +662,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
 
   it('defaults to returns_backfilled=0 when no price fetch result is supplied (legacy caller)', () => {
     insertSignal(db, 'sig-3', { asset: 'AAPL' })
-    insertExecutedDecision(db, 'dec-3', 'sig-3', { asset: 'AAPL', decidedAt: 1000 })
+    insertExecutedDecision(db, 'dec-3', 'sig-3', { asset: 'AAPL', decidedAt: 1000, filledQty: 1, filledAvgPrice: 100 })
 
     const orders: EngineOrder[] = [
       fillOrder({ side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
@@ -749,7 +798,7 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
 
   it('gracefully writes placeholders + returns_backfilled=0 when getPrices fails', async () => {
     insertSignal(db, 'sig-fail', { asset: 'AAPL', strategy: 'momentum-stocks' })
-    insertExecutedDecision(db, 'dec-fail', 'sig-fail', { asset: 'AAPL', decidedAt: 1000 })
+    insertExecutedDecision(db, 'dec-fail', 'sig-fail', { asset: 'AAPL', decidedAt: 1000, filledQty: 1, filledAvgPrice: 100 })
 
     const engine = {
       getPositions: vi.fn().mockResolvedValue([]),

@@ -558,7 +558,27 @@ async function writeDailySnapshot(
       // realized pnl_day.
       accountNav = navClose || navOpen
     } catch {
-      // engine unreachable -- leave nav at 0, snapshot still useful
+      // engine unreachable -- fall through to the carry-forward below
+    }
+    if (accountNav === 0) {
+      // Engine unreachable (or returned nothing). NEVER write a zero-NAV row:
+      // the Jun 9 2026 outage day recorded nav 0 and collapsed the equity
+      // curve + cumulative PnL chain. Carry the last known equity forward;
+      // a flat day is honest, a $0 account is not.
+      const lastKnown = db.prepare(`
+        SELECT nav_open, nav_close, account_nav FROM trader_pnl_snapshots
+        WHERE account_nav > 0 AND date < ?
+        ORDER BY date DESC LIMIT 1
+      `).get(todayNY) as { nav_open: number; nav_close: number; account_nav: number } | undefined
+      if (lastKnown) {
+        accountNav = lastKnown.account_nav
+        if (navOpen === 0) navOpen = lastKnown.account_nav
+        if (navClose === 0) navClose = lastKnown.account_nav
+        logger.warn(
+          { date: todayNY, carriedNav: accountNav },
+          'Close-out sweep: engine NAV unavailable, carried last known equity forward',
+        )
+      }
     }
     try {
       const openDecisions = listOpenPositions(db)

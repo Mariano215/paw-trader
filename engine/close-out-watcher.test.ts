@@ -431,6 +431,27 @@ describe('runCloseOutSweep', () => {
     expect(snap.open_unrealized_pnl).toBe(12)
     expect(snap.account_nav).toBe(1010)
   })
+
+  it('carries forward the last known NAV when the engine is unreachable (never writes a zero-NAV row)', async () => {
+    // Regression (Jun 9 2026): the engine outage day wrote nav 0 / account_nav
+    // 0, collapsing the equity curve to zero and breaking cumulative PnL.
+    getPositions.mockRejectedValue(new Error('engine down'))
+    getOrders.mockRejectedValue(new Error('engine down'))
+    ;(engine as any).getNavLatest = vi.fn().mockRejectedValue(new Error('engine down'))
+
+    // Yesterday's snapshot holds the last known equity.
+    db.prepare(`INSERT INTO trader_pnl_snapshots
+      (date, nav_open, nav_close, pnl_day, trades_count, bench_return, cumulative_pnl, open_unrealized_pnl, account_nav)
+      VALUES ('2020-01-01', 99970, 99950, 0, 0, 0, -50, 0, 99950)`).run()
+
+    await runCloseOutSweep(db, engine)
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const snap = db.prepare('SELECT * FROM trader_pnl_snapshots WHERE date = ?').get(today) as any
+    expect(snap).toBeTruthy()
+    expect(snap.account_nav).toBe(99950)   // carried forward, not 0
+    expect(snap.nav_close).toBe(99950)     // carried forward, not 0
+  })
 })
 
 // writeDailySnapshot TZ correctness -------------------------------------------

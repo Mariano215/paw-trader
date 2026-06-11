@@ -65,7 +65,7 @@ const TABLE_MAP: Record<keyof TraderSyncPayload, { table: string; cols: string[]
   },
   decisions: {
     table: 'trader_decisions',
-    cols: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status'],
+    cols: ['id', 'signal_id', 'parent_decision_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status'],
   },
   transcripts: {
     table: 'trader_committee_transcripts',

@@ -402,6 +402,20 @@ export function buildSignalContext(signal: CommitteeSignalInput): string {
 // Per-specialist call helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Thrown when runAgent REFUSED to run (kill switch / cost cap), as opposed to
+ * running and returning bad output. Callers must NOT treat this as a parse
+ * failure: during the Jun 8-11 2026 dashboard outage every refusal was
+ * recorded as "parse failed" -> quorum fail -> committee_abstain, which
+ * suppressed real signals for 24h and buried the actual outage.
+ */
+export class CommitteeGatedError extends Error {
+  constructor(reason: string) {
+    super(`Committee gated: ${reason}`)
+    this.name = 'CommitteeGatedError'
+  }
+}
+
 async function callAgent(
   deps: CommitteeDeps,
   systemPrompt: string,
@@ -419,8 +433,12 @@ async function callAgent(
       { projectId: 'trader', source },
       { projectId: 'trader' },
     )
+    if (result.resultSubtype === 'refused') {
+      throw new CommitteeGatedError(result.emptyReason ?? result.text ?? 'agent refused')
+    }
     return result.text
   } catch (err) {
+    if (err instanceof CommitteeGatedError) throw err
     logger.warn({ err, source }, 'Committee agent call threw')
     return null
   }

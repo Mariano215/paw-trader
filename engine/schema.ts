@@ -294,6 +294,16 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
       `)
     },
   },
+  {
+    version: 5,
+    description:
+      'Exit rows: parent_decision_id linkage. signal_id must stay a real trader_signals.id (FK is enforced in prod); the old convention of stuffing the entry decision id into signal_id made every exit INSERT throw SQLITE_CONSTRAINT_FOREIGNKEY, so no position ever closed (May-Jun 2026).',
+    up: (db) => {
+      addColumn(db, 'trader_decisions', 'parent_decision_id', 'TEXT REFERENCES trader_decisions(id)')
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_trader_decisions_parent
+        ON trader_decisions(parent_decision_id, status)`)
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {
@@ -310,7 +320,7 @@ export const TRADER_SCHEMA_VERSION = Math.max(...TRADER_MIGRATIONS.map((m) => m.
 export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_strategies: ['id', 'name', 'asset_class', 'tier', 'status', 'params_json', 'created_at', 'updated_at', 'max_size_usd'],
   trader_signals: ['id', 'strategy_id', 'asset', 'side', 'raw_score', 'horizon_days', 'enrichment_json', 'generated_at', 'status'],
-  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price'],
+  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id'],
   trader_committee_transcripts: ['id', 'signal_id', 'transcript_json', 'rounds', 'total_tokens', 'total_cost_usd', 'created_at'],
   trader_approvals: ['id', 'decision_id', 'sent_at', 'responded_at', 'response', 'override_size'],
   trader_verdicts: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled'],

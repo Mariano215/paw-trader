@@ -5,6 +5,7 @@ import type { EnginePosition } from './types.js'
 import {
   runCommittee,
   storeTranscript,
+  CommitteeGatedError,
   type CommitteeDeps,
   type CommitteeResult,
   type CommitteeSignalInput,
@@ -41,8 +42,10 @@ export interface AutoDispatchResult {
 }
 
 // Phase 2 hard cap: committee can size up to this via the size_multiplier.
-// Raised from $100 default in Task 9 once paper trades pass QA.
-const COMMITTEE_MAX_SIZE_USD = 200
+// Raised from $100 default in Task 9 once paper trades pass QA; lifted to
+// $2500 on 2026-06-11 alongside HARD_CEILING_USD + the engine per-trade cap
+// (operator decision: risk model owns sizing for the paper evaluation).
+const COMMITTEE_MAX_SIZE_USD = 2500
 
 // Phase 5 Task 1 -- per-strategy live cap constants.
 // Absolute ceiling applied on top of every cap source so no single
@@ -609,9 +612,19 @@ export async function autoDispatchPendingSignals(
             db,
           })
         } catch (err) {
-          logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
           db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
             .run(signal.id)
+          if (err instanceof CommitteeGatedError) {
+            // runAgent REFUSED (kill switch / cost cap). The gate is global:
+            // every remaining signal would refuse identically, so stop the
+            // loop instead of churning through the queue recording bogus
+            // abstains (Jun 8-11 2026: 100% of committee output was gate
+            // refusals mislabeled as parse failures). Signals stay pending
+            // and re-enter on the next tick once the gate clears.
+            logger.warn({ signalId: signal.id, reason: err.message }, 'Committee gated -- halting dispatch loop for this tick')
+            break
+          }
+          logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
           continue
         }
         storeTranscript(db, committeeResult)

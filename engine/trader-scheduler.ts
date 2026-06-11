@@ -5,6 +5,7 @@ import { enrichPendingSignals } from './enrichment-fetcher.js'
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { reconcileOpenOrders } from './order-reconciler.js'
 import { runRetrySweep } from './order-retry.js'
+import { syncSignalStatuses } from './signal-state-sync.js'
 import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { runExitSweep } from './exit-evaluator.js'
@@ -422,6 +423,19 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     } catch (err) {
       logger.warn({ err }, 'Trader tick: retry sweep failed')
     }
+  }
+
+  // 1e. Converge signal status onto decision status (pure SQL, no engine).
+  //     The retry sweep + reconciler advance DECISIONS but never touched
+  //     SIGNALS, so a transient submit failure left signals at 'dispatching'
+  //     forever and the partial unique index froze that asset+side until the
+  //     next reboot (Jun 9 2026: VTI/SPY/QQQ/IWM frozen for two days). Runs
+  //     after reconcile/retry so it sees this tick's decision transitions,
+  //     and before auto-dispatch so freed slots are usable immediately.
+  try {
+    syncSignalStatuses(deps.db, Date.now())
+  } catch (err) {
+    logger.warn({ err }, 'Trader tick: signal state sync failed')
   }
 
   // 2. Auto-dispatch pending signals through the committee.

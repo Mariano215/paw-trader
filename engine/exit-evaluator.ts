@@ -69,11 +69,18 @@ export interface ExitDecision {
  * joined to their signal's enrichment for momentum.
  * 'executed' = entry filled-or-submitted (the dispatcher's success state).
  *
- * Guard is keyed on the entry DECISION id (d.id): the exit row stores the
- * entry decision's id in its signal_id column (convention: exit.signal_id =
- * entry_decision.id). This means two executed decisions for the same signal
- * (e.g. a partial-fill pair) each get their own independent exit guard
- * rather than the first decision's in-flight exit suppressing the second.
+ * Guard is keyed on the entry DECISION id via the exit row's
+ * parent_decision_id column (exit.parent_decision_id = entry_decision.id).
+ * Two executed decisions for the same signal (e.g. a partial-fill pair) each
+ * get their own independent exit guard rather than the first decision's
+ * in-flight exit suppressing the second.
+ *
+ * HISTORY: the original convention stored the entry decision id in the exit
+ * row's signal_id column. trader_decisions.signal_id has an FK to
+ * trader_signals(id) and production runs PRAGMA foreign_keys = ON, so every
+ * exit INSERT threw SQLITE_CONSTRAINT_FOREIGNKEY and no sweep-exit ever
+ * succeeded (May-Jun 2026). Schema v5 added parent_decision_id for the
+ * linkage; signal_id now always carries a real signal id.
  */
 export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
   return db.prepare(`
@@ -86,7 +93,7 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
       AND d.action IN ('buy', 'sell')
       AND NOT EXISTS (
         SELECT 1 FROM trader_decisions e
-        WHERE e.signal_id = d.id
+        WHERE e.parent_decision_id = d.id
           AND e.status = ?
       )
   `).all(DECISION_STATUS.EXIT_SUBMITTED) as OpenExitRow[]
@@ -196,16 +203,18 @@ export async function runExitSweep(
       const exitDecisionId = randomUUID()
       // Record intent BEFORE the broker sees the order so a crash between
       // submit and record cannot lose the exit.
-      // I3: signal_id on the exit row is set to the ENTRY DECISION's id (row.id),
-      // not the signal id. The duplicate guard in findOpenExitCandidates matches
-      // on e.signal_id = d.id, so each entry decision has its own guard slot and
-      // two executed decisions for the same signal are guarded independently.
+      // I3: the entry-decision linkage is parent_decision_id = row.id; the
+      // duplicate guard in findOpenExitCandidates matches on
+      // e.parent_decision_id = d.id, so each entry decision has its own guard
+      // slot and two executed decisions for the same signal are guarded
+      // independently. signal_id carries the entry's REAL signal id -- it has
+      // an enforced FK to trader_signals(id) in production.
       db.prepare(`
         INSERT INTO trader_decisions
-          (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, signal_id, parent_decision_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        exitDecisionId, row.id, verdict.side, row.asset,
+        exitDecisionId, row.signal_id, row.id, verdict.side, row.asset,
         0, 'market',
         `Auto-exit (${verdict.reason}): last=${last} entry=${row.entry_price} stop=${row.stop_loss} target=${row.take_profit}`,
         1.0, nowMs, DECISION_STATUS.EXIT_SUBMITTED,
@@ -241,6 +250,18 @@ export async function runExitSweep(
           )
           continue
         }
+        // Any other submit failure (503 broker_unavailable pre-market, network,
+        // timeout): the broker never confirmed the order, so the freshly
+        // inserted exit_submitted row would permanently block this decision's
+        // exit via the duplicate guard while no closing order exists. Delete
+        // the intent row so the NEXT sweep retries cleanly. Double-submit risk
+        // on an ambiguous timeout is bounded by the engine's clip_close_qty
+        // (a close can never sell more than the held position).
+        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(exitDecisionId)
+        logger.warn(
+          { asset: row.asset, decisionId: row.id, err: msg },
+          'Exit sweep: exit submit failed, intent row removed so next sweep retries',
+        )
         throw submitErr
       }
 

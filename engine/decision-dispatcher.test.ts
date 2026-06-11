@@ -16,6 +16,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import { dispatchApproval, autoDispatchPendingSignals } from './decision-dispatcher.js'
+import { HARD_CEILING_USD } from './trader-constants.js'
 import type { EngineClient } from './engine-client.js'
 import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
 import type { LadderResult } from './autonomy-ladder.js'
@@ -409,21 +410,21 @@ describe('decision-dispatcher', () => {
     expect(mockClient.getNav).toHaveBeenCalled()
   })
 
-  it('honors the $1000 hard ceiling even when NAV * 2% would allow more', async () => {
+  it('honors the HARD_CEILING_USD hard ceiling even when NAV * 2% would allow more', async () => {
     const signalId = insertSignal(db)
-    // NAV 1M * 2% = 20_000, but hard ceiling clamps to 1000.
+    // NAV 1M * 2% = 20_000, but the hard ceiling clamps to HARD_CEILING_USD.
     mockClient.getNav = vi.fn().mockResolvedValue(1_000_000)
     vi.mocked(mockClient.submitDecision!).mockResolvedValue({
-      client_order_id: 'coid-ceil', broker_order_id: 'boid-ceil', status: 'placed', approved_size_usd: 1000,
+      client_order_id: 'coid-ceil', broker_order_id: 'boid-ceil', status: 'placed', approved_size_usd: HARD_CEILING_USD,
     })
     await dispatchApproval(
       db,
       { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
       mockClient as EngineClient,
-      { runCommittee: makeApproveCommittee(5000), classifyTier: tierStub },
+      { runCommittee: makeApproveCommittee(HARD_CEILING_USD * 5), classifyTier: tierStub },
     )
     const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
-    expect(submitCall.size_usd).toBe(1000)
+    expect(submitCall.size_usd).toBe(HARD_CEILING_USD)
   })
 
   it('treats max_size_usd = 0 as "cap disabled" and falls through to the NAV path', async () => {

@@ -78,7 +78,10 @@ describe('evaluateExit', () => {
 describe('runExitSweep', () => {
   function makeDb() {
     const db = new Database(':memory:')
-    db.pragma('foreign_keys = OFF')
+    // Production runs with foreign_keys = ON (src/db.ts). Tests must match:
+    // the May-Jun 2026 exit outage shipped because every trader test ran with
+    // FKs OFF while prod rejected the exit-row INSERT on the signal_id FK.
+    db.pragma('foreign_keys = ON')
     initTraderTables(db)
     db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
       VALUES ('momentum-stocks','M','equity',1,'active','{}',?,?)`).run(Date.now(), Date.now())
@@ -111,6 +114,14 @@ describe('runExitSweep', () => {
     const closing = db.prepare("SELECT * FROM trader_decisions WHERE action='sell' AND asset='AAPL'").get() as any
     expect(closing).toBeTruthy()
     expect(closing.status).toBe('exit_submitted')
+    // Regression (Jun 2026 outage): the exit row must satisfy the
+    // trader_decisions.signal_id -> trader_signals(id) FK. signal_id carries
+    // the ENTRY's signal; the entry-decision linkage lives in
+    // parent_decision_id. With foreign_keys = ON the old convention
+    // (signal_id = entry decision id) threw SQLITE_CONSTRAINT_FOREIGNKEY on
+    // every exit, forever.
+    expect(closing.signal_id).toBe('s1')
+    expect(closing.parent_decision_id).toBe('d1')
     expect(send).toHaveBeenCalledTimes(1)
   })
 
@@ -126,12 +137,13 @@ describe('runExitSweep', () => {
     expect(client.submitDecision).not.toHaveBeenCalled()
   })
 
-  it('does not double-submit when a prior exit row exists for the same DECISION (I3: guard on decision id)', async () => {
+  it('does not double-submit when a prior exit row exists for the same DECISION (I3: guard on parent_decision_id)', async () => {
     const db = makeDb()
-    // Exit row's signal_id = entry decision's id ('d1'), NOT the signal id ('s1').
+    // Exit row: signal_id stays the real signal ('s1', FK-valid); the entry
+    // decision linkage lives in parent_decision_id ('d1').
     db.prepare(`INSERT INTO trader_decisions
-      (id,signal_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
-      VALUES ('d1-exit','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
+      (id,signal_id,parent_decision_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
+      VALUES ('d1-exit','s1','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
     const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
     const client = {
       getPositions: vi.fn().mockResolvedValue(pos),
@@ -149,10 +161,11 @@ describe('runExitSweep', () => {
     db.prepare(`INSERT INTO trader_decisions
       (id,signal_id,action,asset,size_usd,entry_type,entry_price,stop_loss,take_profit,thesis,confidence,decided_at,status)
       VALUES ('d2','s1','buy','AAPL',100,'market',100,92,116,'t',0.7,?,'executed')`).run(Date.now())
-    // Exit row keyed on entry decision d1's id -- only d1 is guarded, d2 is free.
+    // Exit row keyed on entry decision d1 via parent_decision_id -- only d1
+    // is guarded, d2 is free.
     db.prepare(`INSERT INTO trader_decisions
-      (id,signal_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
-      VALUES ('d1-exit','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
+      (id,signal_id,parent_decision_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
+      VALUES ('d1-exit','s1','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
     const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 2.5, avg_entry_price: 100, market_value: 227.5, unrealized_pnl: -22.5, source: 'broker', updated_at: Date.now() }]
     const submitDecision = vi.fn().mockResolvedValue({ client_order_id: 'x2', broker_order_id: 'y2', status: 'placed', approved_size_usd: 0 })
     const client = {
@@ -195,5 +208,33 @@ describe('runExitSweep', () => {
     const out2 = await runExitSweep(db, client2, vi.fn())
     expect(out2.exited).toBe(1)
     expect(submitDecision2).toHaveBeenCalledTimes(1)
+  })
+
+  it('a transient submit failure (503 broker_unavailable) removes the intent row so the next sweep retries', async () => {
+    // Live regression 2026-06-11 09:02 ET: pre-market exit submit got
+    // "Engine API error 503 :: broker_unavailable"; the orphaned
+    // exit_submitted row then blocked the exit forever via the guard.
+    const db = makeDb()
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
+    const failing = {
+      getPositions: vi.fn().mockResolvedValue(pos),
+      getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
+      submitDecision: vi.fn().mockRejectedValue(new Error('Engine API error 503 on /decisions/submit :: broker_unavailable')),
+    } as unknown as EngineClient
+
+    const out = await runExitSweep(db, failing, vi.fn())
+    expect(out.errors).toBe(1)
+    expect(out.exited).toBe(0)
+    // Intent row removed -- not left to block the guard.
+    expect(db.prepare("SELECT id FROM trader_decisions WHERE status='exit_submitted'").get()).toBeUndefined()
+
+    // Next sweep retries and succeeds.
+    const ok = {
+      getPositions: vi.fn().mockResolvedValue(pos),
+      getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
+      submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'x3', broker_order_id: 'y3', status: 'placed', approved_size_usd: 0 }),
+    } as unknown as EngineClient
+    const out2 = await runExitSweep(db, ok, vi.fn())
+    expect(out2.exited).toBe(1)
   })
 })

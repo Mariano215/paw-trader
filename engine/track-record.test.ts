@@ -131,6 +131,19 @@ describe('computeTrackRecord (pure function)', () => {
     expect(r.max_dd_pct).toBe(0)
   })
 
+  it('max_dd_pct is 0 when underwater from the first trade (no positive peak)', () => {
+    // Regression: previously divided the dollar drawdown by Math.max(peak, 1),
+    // leaking a -$30 curve out as -3000%. With no high-water mark above the 0
+    // baseline there is nothing to take a percentage of, so it must be 0 and
+    // the loss is carried by net_pnl_usd.
+    const r = computeTrackRecord('s', [
+      { pnl_gross: -10, pnl_net: -10, closed_at: 1, cost_basis_usd: 100 },
+      { pnl_gross: -20, pnl_net: -20, closed_at: 2, cost_basis_usd: 100 },
+    ])
+    expect(r.max_dd_pct).toBe(0)
+    expect(r.net_pnl_usd).toBe(-30)
+  })
+
   it('handles cost_basis_usd of 0 without dividing by zero', () => {
     const r = computeTrackRecord('s', [
       { pnl_gross: 10, pnl_net: 10, closed_at: 1, cost_basis_usd: 0 },

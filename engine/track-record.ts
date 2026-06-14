@@ -134,12 +134,14 @@ export function computeTrackRecord(
     cum += v.pnl_net
     if (cum > peak) peak = cum
     const ddAbs = peak - cum
-    // Express as a fraction of the running peak. When the peak is 0
-    // (still underwater from start), use the decline relative to the
-    // initial 0 baseline as an absolute USD figure normalised by the
-    // largest cum so far. We clamp peak to 1 in that case so the
-    // fraction stays meaningful and bounded.
-    const ddPct = ddAbs / Math.max(peak, 1)
+    // Express the dollar drawdown as a fraction of the running peak of the
+    // cumulative-PnL curve. When the curve never rises above its 0 starting
+    // baseline (peak stays 0, strategy underwater from the first trade)
+    // there is no high-water mark to take a percentage of, so report 0 and
+    // let net_pnl_usd carry the loss. The previous Math.max(peak, 1) divisor
+    // leaked the raw dollar drawdown through as a >100x "percent" (a
+    // -$945.96 curve rendered as -94595.88%).
+    const ddPct = peak > 0 ? ddAbs / peak : 0
     if (ddPct > maxDd) maxDd = ddPct
   }
   // Express as a non-positive number (a decline). Use 0 explicitly

@@ -267,6 +267,61 @@ describe('trader-scheduler', () => {
       expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(1)
     })
 
+    it('auto-heals a safe broker-only halt on the first tick', async () => {
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'NVDA' }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'NVDA: broker shows qty=10 but local has no record',
+      })
+
+      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(result.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('NVDA')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('auto-healed'))).toBe(true)
+    })
+
+    it('holds a phantom for one tick, then auto-heals once confirmed under the $ cap', async () => {
+      const phantom = { ...healthOk, reconciler_halted: true, halt_reason: 'AAPL: local qty=2.04813 but broker shows no position' }
+      vi.mocked(engineClient.getHealth!).mockResolvedValue(phantom)
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        { asset: 'AAPL', qty: 2.04813, avg_entry_price: 308.88, market_value: 612.43, unrealized_pnl: -20, source: 'adopted', updated_at: 1 } as any,
+      ])
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'AAPL', qty: 0 }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+
+      // Tick 1: not yet confirmed -> alert, no heal.
+      const r1 = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(r1.reconcilerHalted).toBe(true)
+      expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('held for review'))).toBe(true)
+
+      // Tick 2: second consecutive halt confirms -> adopt + clear.
+      const r2 = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(r2.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('AAPL')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+    })
+
+    it('never auto-heals a phantom whose local value exceeds the cap', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk, reconciler_halted: true, halt_reason: 'TSLA: local qty=50 but broker shows no position',
+      })
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        { asset: 'TSLA', qty: 50, avg_entry_price: 300, market_value: 15000, unrealized_pnl: 0, source: 'adopted', updated_at: 1 } as any,
+      ])
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({})
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+
+      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
+      expect(engineClient.clearReconcilerHalt).not.toHaveBeenCalled()
+    })
+
     it('continues when health check fails', async () => {
       vi.mocked(engineClient.getHealth!).mockRejectedValue(new Error('health endpoint down'))
       insertSignal(db, 'sig-1')

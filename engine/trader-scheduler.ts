@@ -100,6 +100,20 @@ const ENGINE_RESTART_THRESHOLD = 1      // 1 × 5-min tick = restart after first
 let _consecutiveZeroPollCount = 0
 
 /**
+ * Per-asset consecutive-halt confirmation counter for phantom positions
+ * ("local qty=X but broker shows no position"). A phantom can be a real
+ * holding the broker is just under-reporting on a transient blip, so we
+ * never zero it on the first sighting. It heals only after the same asset
+ * appears in PHANTOM_CONFIRM_TICKS consecutive halted ticks AND its local
+ * market value is under PHANTOM_HEAL_MAX_USD. Reset to {} when the
+ * reconciler recovers. adopt-from-broker reconciles local to broker truth
+ * in either direction (it zeroes a phantom).
+ */
+let _phantomConfirm: Record<string, number> = {}
+const PHANTOM_CONFIRM_TICKS = 2     // 2 × 5-min ticks ≈ 10 min broker-flat confirmation
+const PHANTOM_HEAL_MAX_USD = 2000   // only auto-zero phantoms under this local market value
+
+/**
  * Start the trader tick. Each tick:
  *  1. Checks engine health and alerts if reconciler is halted (once per halt event).
  *  2. Polls the engine for new signals and stores them in trader_signals.
@@ -196,6 +210,7 @@ export function stopTraderScheduler(): void {
 /** Reset halt-alert state. Exposed for tests only -- do not call in production code. */
 export function _resetHaltAlertForTest(): void {
   _haltAlertSent = false
+  _phantomConfirm = {}
 }
 
 /** Reset tick lock state. Exposed for tests only -- do not call in production code. */
@@ -275,51 +290,89 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
     if (health && health.reconciler_halted === true) {
       reconcilerHalted = true
-      if (!_haltAlertSent) {
-        _haltAlertSent = true
-        const reason = health.halt_reason ?? 'no reason provided'
-        logger.error({ halt_reason: reason }, 'Trader engine reconciler halted')
+      const reason = health.halt_reason ?? 'no reason provided'
 
-        // Auto-heal safe patterns (broker is source of truth):
-        //   1. "broker shows qty=X but local has no record" — new position engine missed
-        //   2. "qty mismatch local=X broker=Y" where broker > local — fill landed, engine didn't update
-        // NOT auto-healed: "local qty=X but broker shows no record" — phantom position, needs review.
-        const brokerOnlyAssets = [
-          ...[...reason.matchAll(/(\w[\w/]*):\s*broker shows qty=[\d.]+ but local has no record/g)].map(m => m[1]),
-          ...[...reason.matchAll(/(\w[\w/]*):\s*qty mismatch local=([\d.]+) broker=([\d.]+)/g)]
-            .filter(m => parseFloat(m[3]) > parseFloat(m[2]))  // only when broker > local
-            .map(m => m[1]),
-        ]
-        const hasUnsafePattern = /local (?:has qty|qty=)[\d.]+ but broker shows no/i.test(reason)
+      // Auto-heal patterns (broker is source of truth). adopt-from-broker
+      // reconciles the local engine row to broker truth in either direction.
+      //   Safe (heal on first sighting):
+      //     1. "broker shows qty=X but local has no record" — engine missed a fill
+      //     2. "qty mismatch local=X broker=Y" where broker > local — fill landed, engine stale
+      //   Phantom ("local qty=X but broker shows no position") — local-only. Could be a
+      //     real holding the broker is briefly under-reporting, so it heals only after
+      //     PHANTOM_CONFIRM_TICKS consecutive halts name it AND its local market value is
+      //     under PHANTOM_HEAL_MAX_USD. Otherwise it falls through to a manual alert.
+      const brokerOnlyAssets = [
+        ...[...reason.matchAll(/(\w[\w/]*):\s*broker shows qty=[\d.]+ but local has no record/g)].map(m => m[1]),
+        ...[...reason.matchAll(/(\w[\w/]*):\s*qty mismatch local=([\d.]+) broker=([\d.]+)/g)]
+          .filter(m => parseFloat(m[3]) > parseFloat(m[2]))  // only when broker > local
+          .map(m => m[1]),
+      ]
+      const phantomAssets = [
+        ...reason.matchAll(/(\w[\w/]*):\s*local (?:has\s*qty|qty=)?\s*[\d.]+ but broker shows no/gi),
+      ].map(m => m[1])
 
-        if (brokerOnlyAssets.length > 0 && !hasUnsafePattern) {
-          logger.info({ assets: brokerOnlyAssets }, 'Trader: auto-adopting broker positions to clear halt')
-          try {
-            const client = deps.getEngineClient()
-            for (const asset of brokerOnlyAssets) {
-              const result = await client.adoptBrokerPosition(asset)
-              logger.info({ asset, result }, 'Trader: auto-adopted broker position')
-            }
-            await client.clearReconcilerHalt()
-            reconcilerHalted = false
-            _haltAlertSent = false
-            logger.info('Trader: reconciler halt auto-cleared')
-            await deps.send(`TRADER: Reconciler auto-healed. Adopted broker positions: ${brokerOnlyAssets.join(', ')}. Trading resumed.`)
-          } catch (err) {
-            logger.error({ err }, 'Trader: auto-adopt failed, falling back to manual alert')
-            await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. Auto-heal failed — run: npx tsx scripts/trader-diagnose.ts --fix`)
-          }
-        } else {
-          // Unsafe pattern or unparseable — require manual intervention
-          await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. No new orders will reconcile until cleared.`)
+      // Advance the per-asset confirm counter every halted tick. Assets no longer
+      // named drop out, so a cleared-then-recurring phantom restarts the count.
+      const nextConfirm: Record<string, number> = {}
+      for (const a of phantomAssets) nextConfirm[a] = (_phantomConfirm[a] ?? 0) + 1
+      _phantomConfirm = nextConfirm
+
+      // Look up local market value for phantoms (unknown -> treat as over cap).
+      let positionValue: Record<string, number> = {}
+      if (phantomAssets.length > 0) {
+        try {
+          const positions = await deps.getEngineClient().getPositions()
+          positionValue = Object.fromEntries(positions.map(p => [p.asset, Math.abs(p.market_value ?? 0)]))
+        } catch (err) {
+          logger.warn({ err }, 'Trader: getPositions failed during phantom heal check')
         }
       }
+      const blockedPhantoms = phantomAssets.filter(a =>
+        (_phantomConfirm[a] ?? 0) < PHANTOM_CONFIRM_TICKS ||
+        (positionValue[a] ?? Infinity) > PHANTOM_HEAL_MAX_USD
+      )
+      const healableAssets = [
+        ...brokerOnlyAssets,
+        ...phantomAssets.filter(a => !blockedPhantoms.includes(a)),
+      ]
+
+      if (blockedPhantoms.length === 0 && healableAssets.length > 0) {
+        logger.info({ assets: healableAssets }, 'Trader: auto-adopting positions to clear halt')
+        try {
+          const client = deps.getEngineClient()
+          for (const asset of healableAssets) {
+            const result = await client.adoptBrokerPosition(asset)
+            logger.info({ asset, result }, 'Trader: auto-adopted position')
+          }
+          await client.clearReconcilerHalt()
+          reconcilerHalted = false
+          _haltAlertSent = false
+          _phantomConfirm = {}
+          logger.info('Trader: reconciler halt auto-cleared')
+          await deps.send(`TRADER: Reconciler auto-healed. Reconciled positions: ${healableAssets.join(', ')}. Trading resumed.`)
+        } catch (err) {
+          logger.error({ err }, 'Trader: auto-adopt failed, falling back to manual alert')
+          if (!_haltAlertSent) {
+            _haltAlertSent = true
+            await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. Auto-heal failed — run: npx tsx scripts/trader-diagnose.ts --fix`)
+          }
+        }
+      } else if (!_haltAlertSent) {
+        // Nothing healable yet: phantom awaiting confirmation / over the $ cap, or unparseable.
+        _haltAlertSent = true
+        logger.error({ halt_reason: reason, blockedPhantoms }, 'Trader engine reconciler halted')
+        const detail = blockedPhantoms.length > 0
+          ? ` Phantom (${blockedPhantoms.join(', ')}) held for review — auto-heal needs ${PHANTOM_CONFIRM_TICKS} confirms and value under $${PHANTOM_HEAL_MAX_USD}.`
+          : ''
+        await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}.${detail} No new orders will reconcile until cleared.`)
+      }
     } else if (health) {
-      // Reconciler recovered -- reset flag so we alert again on the next halt
+      // Reconciler recovered -- reset flags so we alert / re-confirm on the next halt.
       if (_haltAlertSent) {
         logger.info('Trader engine reconciler recovered')
         _haltAlertSent = false
       }
+      _phantomConfirm = {}
     }
   } catch (err) {
     _healthCheckConsecutiveFailures++

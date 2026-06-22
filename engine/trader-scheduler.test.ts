@@ -283,6 +283,21 @@ describe('trader-scheduler', () => {
       expect(sendMock.mock.calls.some(c => String(c[0]).includes('auto-healed'))).toBe(true)
     })
 
+    it('auto-heals a notional mismatch (qty agrees, $ mark drifted) on the first tick', async () => {
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'EEM' }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'EEM: notional mismatch local=$6363.41 broker=$6402.35 diff=$38.94 threshold=$31.82',
+      })
+
+      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      expect(result.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('EEM')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+    })
+
     it('holds a phantom for one tick, then auto-heals once confirmed under the $ cap', async () => {
       const phantom = { ...healthOk, reconciler_halted: true, halt_reason: 'AAPL: local qty=2.04813 but broker shows no position' }
       vi.mocked(engineClient.getHealth!).mockResolvedValue(phantom)

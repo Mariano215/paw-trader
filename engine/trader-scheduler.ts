@@ -297,6 +297,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       //   Safe (heal on first sighting):
       //     1. "broker shows qty=X but local has no record" — engine missed a fill
       //     2. "qty mismatch local=X broker=Y" where broker > local — fill landed, engine stale
+      //     3. "notional mismatch local=$X broker=$Y" — qty agrees, only the $ mark drifted
+      //        (intraday price staleness). Adopting refreshes local to broker truth.
       //   Phantom ("local qty=X but broker shows no position") — local-only. Could be a
       //     real holding the broker is briefly under-reporting, so it heals only after
       //     PHANTOM_CONFIRM_TICKS consecutive halts name it AND its local market value is
@@ -306,6 +308,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         ...[...reason.matchAll(/(\w[\w/]*):\s*qty mismatch local=([\d.]+) broker=([\d.]+)/g)]
           .filter(m => parseFloat(m[3]) > parseFloat(m[2]))  // only when broker > local
           .map(m => m[1]),
+        ...[...reason.matchAll(/(\w[\w/]*):\s*notional mismatch /g)].map(m => m[1]),
       ]
       const phantomAssets = [
         ...reason.matchAll(/(\w[\w/]*):\s*local (?:has\s*qty|qty=)?\s*[\d.]+ but broker shows no/gi),

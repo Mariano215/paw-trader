@@ -764,10 +764,10 @@ describe('autoDispatchPendingSignals', () => {
       VALUES ('sig-cluster','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
 
     const sendSpy = vi.fn(async () => {})
-    // NAV=5000, cluster cap 20%=$1000. Existing SPY+QQQ exposure=$1200, already over cap -> headroom=0.
+    // NAV=2000, cluster cap 50%=$1000. Existing SPY+QQQ exposure=$1200, already over cap -> headroom=0.
     const fakeEngine = {
       submitDecision: vi.fn(),
-      getNav: vi.fn().mockResolvedValue(5000),
+      getNav: vi.fn().mockResolvedValue(2000),
       getPositions: vi.fn().mockResolvedValue([
         { asset: 'SPY', qty: 1, avg_entry_price: 600, market_value: 700, unrealized_pnl: 100, source: 'test', updated_at: Date.now() },
         { asset: 'QQQ', qty: 1, avg_entry_price: 450, market_value: 500, unrealized_pnl: 50, source: 'test', updated_at: Date.now() },
@@ -794,14 +794,14 @@ describe('autoDispatchPendingSignals', () => {
     testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
       VALUES ('sig-trim','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
 
-    // NAV=5000, cluster cap 20%=$1000. Existing SPY market_value=$900 ->
+    // NAV=2000, cluster cap 50%=$1000. Existing SPY market_value=$900 ->
     // cluster exposure=$900, headroom=$100. Risk sizing: explicit cap=$150 ->
     // sizeUsd=$150 (no heat issue). Cluster gate: 150 > 100 headroom -> TRIM to 100.
     const fakeEngine = {
       submitDecision: vi.fn().mockResolvedValue({
         client_order_id: 'coid-trim', broker_order_id: 'boid-trim', status: 'placed', approved_size_usd: 100,
       }),
-      getNav: vi.fn().mockResolvedValue(5000),
+      getNav: vi.fn().mockResolvedValue(2000),
       getPositions: vi.fn().mockResolvedValue([
         { asset: 'SPY', qty: 1, avg_entry_price: 900, market_value: 900, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
       ]),

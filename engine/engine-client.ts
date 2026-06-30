@@ -37,33 +37,50 @@ export class EngineClient {
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
     const url = this.baseUrl + path;
-    const resp = await fetch(url, {
-      ...init,
-      headers: {
-        "X-Engine-Token": this.token,
-        "Content-Type": "application/json",
-        ...(init?.headers ?? {}),
-      },
-      // Caller-supplied signal takes precedence (e.g. submitDecision uses 30s
-      // because the engine makes an outbound Alpaca price-fetch on entry_price=0).
-      signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
-    });
-    if (!resp.ok) {
-      // Capture response body so 4xx validation errors and 5xx engine errors
-      // surface their actual cause in logs. Without this every failure shows
-      // up as a bare status code; tracking down a 422 takes a manual curl.
-      let body = "";
+    const isGet = !init?.method || init.method.toUpperCase() === "GET";
+    // ponytail: retry only GET requests on network errors (2 retries, 1s/2s backoff).
+    // POST/PUT are not retried -- double-submitting a decision would place duplicate orders.
+    // HTTP errors (4xx/5xx) are never retried -- they're deterministic failures.
+    const maxAttempts = isGet ? 3 : 1;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, attempt * 1000));
+      let resp: Response;
       try {
-        body = await resp.text();
-      } catch {
-        body = "<unable to read response body>";
+        resp = await fetch(url, {
+          ...init,
+          headers: {
+            "X-Engine-Token": this.token,
+            "Content-Type": "application/json",
+            ...(init?.headers ?? {}),
+          },
+          signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxAttempts - 1) {
+          logger.warn({ path, attempt, err }, "engine-client: network error, retrying");
+        }
+        continue;
       }
-      const trimmed = body.length > 800 ? body.slice(0, 800) + "...(truncated)" : body;
-      throw new Error(
-        "Engine API error " + resp.status + " on " + path + " :: " + trimmed,
-      );
+      if (!resp.ok) {
+        // Capture response body so 4xx validation errors and 5xx engine errors
+        // surface their actual cause in logs. Without this every failure shows
+        // up as a bare status code; tracking down a 422 takes a manual curl.
+        let body = "";
+        try {
+          body = await resp.text();
+        } catch {
+          body = "<unable to read response body>";
+        }
+        const trimmed = body.length > 800 ? body.slice(0, 800) + "...(truncated)" : body;
+        throw new Error(
+          "Engine API error " + resp.status + " on " + path + " :: " + trimmed,
+        );
+      }
+      return resp.json() as Promise<T>;
     }
-    return resp.json() as Promise<T>;
+    throw lastErr instanceof Error ? lastErr : new Error("Engine fetch failed: " + path);
   }
 
   /**

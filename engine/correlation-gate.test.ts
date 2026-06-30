@@ -96,26 +96,26 @@ describe('correlation cluster gate', () => {
     expect(r.allowedSizeUsd).toBe(0)
   })
 
-  it('uses DEFAULT_CLUSTER_CAP_PCT (0.20) when capPct is omitted', () => {
-    expect(DEFAULT_CLUSTER_CAP_PCT).toBe(0.20)
-    // nav=10000, default cap = 10000 * 0.20 = 2000. Current=1500, headroom=500.
+  it('uses DEFAULT_CLUSTER_CAP_PCT (0.50) when capPct is omitted', () => {
+    expect(DEFAULT_CLUSTER_CAP_PCT).toBe(0.50)
+    // nav=10000, default cap = 10000 * 0.50 = 5000. Current=4500, headroom=500.
     // proposed=300 fits -> allowed. allowedSizeUsd = 300.
     const fits = evaluateClusterGate({
       asset: 'SPY',
       proposedSizeUsd: 300,
-      positions: [pos('QQQ', 1500)],
+      positions: [pos('QQQ', 4500)],
       nav: 10000,
       // capPct intentionally omitted
     })
     expect(fits.allowed).toBe(true)
-    expect(fits.capUsd).toBe(2000)
+    expect(fits.capUsd).toBe(5000)
     expect(fits.allowedSizeUsd).toBe(300)
 
     // proposed=600 exceeds headroom of 500 -> not allowed, allowedSizeUsd=500.
     const exceeds = evaluateClusterGate({
       asset: 'SPY',
       proposedSizeUsd: 600,
-      positions: [pos('QQQ', 1500)],
+      positions: [pos('QQQ', 4500)],
       nav: 10000,
     })
     expect(exceeds.allowed).toBe(false)

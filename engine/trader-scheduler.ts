@@ -10,11 +10,13 @@ import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboa
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { runExitSweep } from './exit-evaluator.js'
 import { maybeFireWeeklyReport } from './weekly-report.js'
+import { maybeFireTraderDigest } from './notify-digest.js'
 import {
   checkAbstainDigest,
   checkAbstainRate,
   evaluateAndRecordSharpeFlip,
   evaluateAndRecordCoinbaseHealth,
+  evaluateAndRecordEngineUnreachable,
   evaluateAndRecordNavDrop,
   recordAlertFired,
   checkSignalDrought,
@@ -43,8 +45,18 @@ export interface TraderSchedulerDeps {
   db: Database.Database
   /** Engine client factory -- deferred so credentials can be resolved at tick time. */
   getEngineClient: () => EngineClient
-  /** Sends a plain-text alert to the operator's Telegram chat (e.g. engine halt). */
+  /**
+   * Sends a plain-text message to the operator's Telegram chat. In production
+   * this is the DIGESTING send: issues go out instantly, routine messages are
+   * buffered for the 2x/day digest (see notify-digest.ts).
+   */
   send: (text: string) => Promise<void>
+  /**
+   * Unwrapped send that always delivers immediately. Used only to push the
+   * digest summary itself (so it is not re-buffered) and reports. Defaults to
+   * `send` when omitted (tests that don't wrap).
+   */
+  rawSend?: (text: string) => Promise<void>
   /** Sends an approval card with inline keyboard buttons. */
   sendWithKeyboard: (text: string, keyboard: TraderApprovalKeyboard) => Promise<void>
   /** Tick interval override. Defaults to DEFAULT_TICK_MS (5 min). */
@@ -80,15 +92,14 @@ let _haltAlertSent = false
 let _tickInProgress = false
 
 /**
- * Consecutive health-check failure counter. Reset to zero on any successful
- * health response. When it reaches ENGINE_UNREACHABLE_THRESHOLD the operator
- * gets a single Telegram alert; _engineUnreachableAlertSent gates further
- * sends so only one alert fires per outage event.
+ * Consecutive health-check failure counter, in-memory and per-process.
+ * Reset to zero on any successful health response. Drives the SSH
+ * auto-restart below (which is correctly per-process). The sustained-
+ * outage operator page lives in evaluateAndRecordEngineUnreachable, whose
+ * state is persisted in trader_alert_state so it survives bot restarts.
  */
 let _healthCheckConsecutiveFailures = 0
-let _engineUnreachableAlertSent = false
 let _engineRestartAttempted = false
-const ENGINE_UNREACHABLE_THRESHOLD = 3  // 3 × 5-min ticks = 15 min before alerting
 const ENGINE_RESTART_THRESHOLD = 1      // 1 × 5-min tick = restart after first failure (market hours only)
 
 /**
@@ -284,10 +295,10 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
     _healthCheckConsecutiveFailures = 0
     _engineRestartAttempted = false
-    if (_engineUnreachableAlertSent) {
-      _engineUnreachableAlertSent = false
-      await deps.send('TRADER: Engine back online. Signal polling resumed.')
-    }
+    // Engine-unreachable alerting + recovery notice now live in the
+    // persistent monitor check (evaluateAndRecordEngineUnreachable), which
+    // survives bot restarts. This phase keeps only the in-memory counter
+    // that drives the per-process SSH auto-restart below.
     if (health && health.reconciler_halted === true) {
       reconcilerHalted = true
       const reason = health.halt_reason ?? 'no reason provided'
@@ -399,11 +410,10 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       deps.restartEngineAsync()
       await deps.send(`TRADER: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} min. SSH restart issued — will confirm next tick.`)
     }
-    if (_healthCheckConsecutiveFailures >= ENGINE_UNREACHABLE_THRESHOLD && !_engineUnreachableAlertSent) {
-      _engineUnreachableAlertSent = true
-      logger.error({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: sending alert')
-      await deps.send(`TRADER ALERT: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} minutes. Win11 may be offline or Tailscale disconnected. Signal generation is stopped.`)
-    }
+    // The sustained-outage page is emitted by the persistent monitor check
+    // (evaluateAndRecordEngineUnreachable in runMonitorPhase), not here --
+    // its outage clock lives in trader_alert_state and re-nags hourly,
+    // where this in-memory counter would reset to 0 on every bot restart.
   }
 
   // 1. Poll engine for fresh signals.
@@ -619,6 +629,18 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     logger.warn({ err }, 'Trader tick: weekly report gate failed')
   }
 
+  // 5b. Twice-daily plain-English digest of routine activity. Routine messages
+  //     are buffered by the digesting send (notify-digest.ts); this drains them
+  //     into one summary at the 08:00 / 20:00 slots. Uses rawSend so the digest
+  //     itself is never re-buffered. Own try/catch so a failure never stalls the
+  //     monitor phase below.
+  try {
+    const dg = await maybeFireTraderDigest({ db: deps.db, send: deps.rawSend ?? deps.send })
+    if (dg.fired) logger.info({ count: dg.count }, 'Trader tick: daily digest fired')
+  } catch (err) {
+    logger.warn({ err }, 'Trader tick: digest gate failed')
+  }
+
   // 6. Monitoring alerts (Phase 5 Task 2 Dispatch C).  Each of the four
   //    alert checks is wrapped in its own try/catch so a single throwing
   //    check cannot stall the others.  Telegram emission is via deps.send
@@ -791,6 +813,24 @@ async function runMonitorPhase(deps: TraderSchedulerDeps): Promise<void> {
     }
   } catch (err) {
     logger.error({ err }, 'Trader tick: coinbase health check failed')
+  }
+
+  // 3b. Engine-unreachable alert -- persistent outage clock + hourly re-nag.
+  //     State lives in trader_alert_state so an outage spanning bot
+  //     restarts still pages (the old in-memory counter reset on every
+  //     launchd respawn and went silent for the 06-15..06-25 freeze).
+  try {
+    const r = await evaluateAndRecordEngineUnreachable(deps.db, nowMs, () => client!.getHealth())
+    if (r.fire && r.message) {
+      recordAlertFired(deps.db, 'engine_unreachable_alert', nowMs)
+      await deps.send(r.message)
+      logger.error('Trader tick: engine-unreachable alert sent')
+    } else if (r.recovered) {
+      await deps.send('TRADER: Engine reachable again. Trading resumed.')
+      logger.info('Trader tick: engine reachable again, recovery notice sent')
+    }
+  } catch (err) {
+    logger.error({ err }, 'Trader tick: engine-unreachable check failed')
   }
 
   // 4. NAV drop halt -- on fire, we write the dedup row FIRST, then

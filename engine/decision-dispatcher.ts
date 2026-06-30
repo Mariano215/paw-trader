@@ -194,6 +194,7 @@ export async function dispatchApproval(
     raw_score: signal.raw_score,
     horizon_days: signal.horizon_days,
     enrichment_json: signal.enrichment_json ?? null,
+    strategy_id: signal.strategy_id,
   }
 
   // Phase 2 Task 5 -- ReasoningBank retrieval. Returns null until the
@@ -514,18 +515,23 @@ export async function autoDispatchPendingSignals(
       }
 
       // Gate 0: Markov regime pre-filter (deterministic, no LLM cost).
-      // If the Markov regime strongly contradicts the signal direction
-      // (markov_signal <= -0.30 for a buy, >= 0.30 for a sell) the committee
-      // would veto it anyway -- skip the 6 LLM calls and suppress now.
-      // Signals without enrichment data bypass this gate (no regime info).
-      if (signal.enrichment_json) {
+      // Skipped for mean-reversion strategies: a bear/oversold regime is the
+      // entry condition for mean reversion, not a contraindication. The SMA
+      // regime gate and committee still protect those signals downstream.
+      // For all other strategies: suppress if Markov strongly contradicts
+      // the signal direction -- committee would veto anyway, skip LLM cost.
+      const isMeanReversion = strategy.id.startsWith('mean-reversion')
+      if (!isMeanReversion && signal.enrichment_json) {
         try {
           const enrichment = JSON.parse(signal.enrichment_json) as Record<string, unknown>
           const regime = enrichment?.markov_regime as { markov_signal?: number } | undefined
           const markovSignal = typeof regime?.markov_signal === 'number' ? regime.markov_signal : null
           if (markovSignal !== null) {
             const isBuy = signal.side === 'buy'
-            const regimeConflict = (isBuy && markovSignal <= -0.30) || (!isBuy && markovSignal >= 0.30)
+            // Threshold loosened -0.30 -> -0.15 (2026-06-28) to unfreeze the
+            // ~45% of signals this pre-gate suppressed. MUST stay in sync with
+            // the risk-officer mirror in committee.ts.
+            const regimeConflict = (isBuy && markovSignal <= -0.15) || (!isBuy && markovSignal >= 0.15)
             if (regimeConflict) {
               logger.info(
                 { signalId: signal.id, asset: signal.asset, side: signal.side, markovSignal },
@@ -549,6 +555,7 @@ export async function autoDispatchPendingSignals(
         raw_score:       signal.raw_score,
         horizon_days:    signal.horizon_days,
         enrichment_json: signal.enrichment_json ?? null,
+        strategy_id:     signal.strategy_id,
       }
 
       // Gate 1: daily cap (applies regardless of bypass mode)

@@ -149,6 +149,8 @@ export interface CommitteeSignalInput {
   raw_score: number
   horizon_days: number
   enrichment_json: string | null
+  /** Strategy that produced this signal. Used to apply strategy-aware gate logic. */
+  strategy_id?: string
 }
 
 export interface CommitteeDeps {
@@ -323,6 +325,7 @@ function applyDeterministicRiskGate(
   avgConfidence: number,
   markov: MarkovRegimePayload | null,
   llmVetoedOnDisagreement: boolean,
+  strategyId?: string,
 ): RiskVerdict | null {
   // Hard veto: avg confidence below absolute floor (0.30) -- beats everything.
   if (avgConfidence < 0.30) {
@@ -334,13 +337,22 @@ function applyDeterministicRiskGate(
     }
   }
 
+  // Mean-reversion strategies skip the Markov conflict veto: a bear/oversold
+  // regime is the entry condition, not a contraindication. Mirrors the pre-gate
+  // bypass in decision-dispatcher.ts.
+  const isMeanReversion = (strategyId ?? '').startsWith('mean-reversion')
+
   if (markov !== null) {
     const markovSignal = markov.markov_signal
 
     // Markov conflicts with proposed action → veto regardless of LLM.
+    // Threshold loosened -0.30 -> -0.15 (2026-06-28). MUST mirror the Markov
+    // pre-gate in decision-dispatcher.ts.
+    // Skipped for mean-reversion: oversold/bear regime is the buy entry.
     const conflicts =
-      (action === 'buy'  && markovSignal <= -0.30) ||
-      (action === 'sell' && markovSignal >=  0.30)
+      !isMeanReversion &&
+      ((action === 'buy'  && markovSignal <= -0.15) ||
+       (action === 'sell' && markovSignal >=  0.15))
 
     if (conflicts) {
       return {
@@ -673,7 +685,7 @@ export async function runCommittee(
     // prompts or parse-degraded outputs).
     const llmVetoedOnDisagreement =
       riskVerdict.veto && classifyVetoCategory(riskVerdict) === 'disagreement'
-    const gateVerdict = applyDeterministicRiskGate(proposedAction, avgConf, markov, llmVetoedOnDisagreement)
+    const gateVerdict = applyDeterministicRiskGate(proposedAction, avgConf, markov, llmVetoedOnDisagreement, signal.strategy_id)
     if (gateVerdict !== null) {
       logger.debug(
         { gateVeto: gateVerdict.veto, reason: gateVerdict.reason, markovSignal: markov?.markov_signal },

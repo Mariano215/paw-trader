@@ -37,6 +37,24 @@ describe('trainRegimePawConfig', () => {
     expect(analyze).toContain('validation_accuracy')
   })
 
+  it('observe phase captures the script exit status (non-zero = predictive gate fail)', () => {
+    expect(trainRegimePawConfig.phases.observe).toContain('EXIT_STATUS')
+  })
+
+  it('analyze phase gates on the predictive gate as primary, accuracy as backstop', () => {
+    const analyze = trainRegimePawConfig.phases.analyze
+    expect(analyze).toContain('PREDICTIVE_GATE')
+    expect(analyze).toContain('EXIT_STATUS')
+    expect(analyze.toLowerCase()).toContain('separation')
+    // backstop language present so accuracy is clearly demoted, not trusted
+    expect(analyze.toLowerCase()).toContain('tautolog')
+  })
+
+  it('report phase leads with the predictive gate, not the tautological accuracy', () => {
+    const report = trainRegimePawConfig.phases.report
+    expect(report.toLowerCase()).toContain('predictive gate')
+  })
+
   it('act phase rotates old joblib to dated backup before installing the new one', () => {
     const act = trainRegimePawConfig.phases.act
     // rotation preamble must mention bak

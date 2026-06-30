@@ -94,8 +94,13 @@ export async function reconcileOpenOrders(
 
   for (const row of open) {
     const isExit = row.status === DECISION_STATUS.EXIT_SUBMITTED
+    // Primary key: engine echoes the brain decision id in decision_id. The
+    // engine mints its own random client_order_id, so client_order_id ==
+    // row.id NEVER matches -- it is kept only as a legacy fallback for older
+    // engine builds that did not serialize decision_id.
     const match = orders.find(
       (o) =>
+        (o.decision_id != null && o.decision_id === row.id) ||
         (row.engine_order_id != null && o.broker_order_id === row.engine_order_id) ||
         o.client_order_id === row.id,
     )

@@ -107,6 +107,26 @@ const COINBASE_FIRST_DOWN_ID = 'coinbase_first_down'
 const COINBASE_ALERT_ID = 'coinbase_alert'
 
 /**
+ * Engine-unreachable monitor. Same outage-clock + dedup machinery as the
+ * Coinbase check, but the down signal is the engine itself being
+ * unreachable (getHealth throws or returns null) rather than a field in
+ * the health body. 15-min grace before the first page; re-nags hourly
+ * while the outage persists.
+ */
+export const ENGINE_UNREACHABLE_OUTAGE_THRESHOLD_MS = 15 * 60 * 1000
+export const ENGINE_UNREACHABLE_DEDUP_MS = 60 * 60 * 1000
+
+/** alert_ids for the engine-unreachable monitor. engine_first_down holds
+ * the outage-start ms timestamp; engine_unreachable_alert holds the last
+ * fire ms timestamp for the hourly re-nag dedup. Both live in
+ * trader_alert_state so the outage clock survives bot restarts -- the old
+ * in-memory counter reset to 0 on every launchd respawn, so a multi-day
+ * outage spanning restarts never reached the threshold and stayed
+ * silent. */
+const ENGINE_FIRST_DOWN_ID = 'engine_first_down'
+const ENGINE_UNREACHABLE_ALERT_ID = 'engine_unreachable_alert'
+
+/**
  * Lookback for the NAV-drop comparison.  7 days: long enough that a
  * single bad day does not trigger, short enough that a real drawdown
  * shows up before NAV bleeds out.
@@ -459,6 +479,86 @@ export async function evaluateAndRecordCoinbaseHealth(
     message:
       'Coinbase connection down for >15m during scheduler ticks. ' +
       'Check engine credentials and /health.',
+  }
+}
+
+/**
+ * 2e. Engine-unreachable alert. Inverse of the Coinbase check: here a
+ * throw or null/empty /health body IS the down signal (the engine box is
+ * offline or Tailscale is down). A truthy health body means reachable.
+ *
+ * State lives entirely in trader_alert_state so the outage clock and the
+ * hourly re-nag survive bot restarts. The previous implementation kept an
+ * in-memory consecutive-failure counter that reset to 0 on every launchd
+ * respawn, so a multi-day outage spanning restarts never accumulated to
+ * the alert threshold and stayed silent (the 2026-06-15 to 06-25 freeze).
+ *
+ * Semantics mirror evaluateAndRecordCoinbaseHealth:
+ *   - reachable: clear the outage clock + dedup; report `recovered` if a
+ *     real alert had fired, so the caller can post a one-shot recovery.
+ *   - first down tick: set the start-of-outage marker, no fire.
+ *   - within the 15-min grace: no fire.
+ *   - past grace, within the 60-min dedup: no fire.
+ *   - past grace, outside dedup: fire. Re-nags hourly until recovery,
+ *     unlike the old single-shot alert.
+ */
+export async function evaluateAndRecordEngineUnreachable(
+  db: Database.Database,
+  nowMs: number,
+  getHealth: () => Promise<unknown>,
+): Promise<{ fire: boolean; message?: string; recovered: boolean }> {
+  let reachable = false
+  try {
+    const body = await getHealth()
+    reachable = body !== null && body !== undefined
+  } catch {
+    reachable = false
+  }
+
+  const hadAlerted =
+    db
+      .prepare(`SELECT 1 FROM trader_alert_state WHERE alert_id = ?`)
+      .get(ENGINE_UNREACHABLE_ALERT_ID) !== undefined
+
+  if (reachable) {
+    // Clear the outage clock + dedup so the next outage starts fresh.
+    db.prepare(`DELETE FROM trader_alert_state WHERE alert_id IN (?, ?)`).run(
+      ENGINE_FIRST_DOWN_ID,
+      ENGINE_UNREACHABLE_ALERT_ID,
+    )
+    return { fire: false, recovered: hadAlerted }
+  }
+
+  // Engine unreachable. Look up the start-of-outage marker.
+  const firstDownRow = db
+    .prepare(`SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?`)
+    .get(ENGINE_FIRST_DOWN_ID) as { last_alerted_at: number } | undefined
+
+  if (!firstDownRow) {
+    recordAlertFired(db, ENGINE_FIRST_DOWN_ID, nowMs)
+    return { fire: false, recovered: false }
+  }
+
+  const outageMs = nowMs - firstDownRow.last_alerted_at
+  if (outageMs < ENGINE_UNREACHABLE_OUTAGE_THRESHOLD_MS) {
+    return { fire: false, recovered: false }
+  }
+
+  const lastAlertRow = db
+    .prepare(`SELECT last_alerted_at FROM trader_alert_state WHERE alert_id = ?`)
+    .get(ENGINE_UNREACHABLE_ALERT_ID) as { last_alerted_at: number } | undefined
+
+  if (lastAlertRow && nowMs - lastAlertRow.last_alerted_at < ENGINE_UNREACHABLE_DEDUP_MS) {
+    return { fire: false, recovered: false }
+  }
+
+  const mins = Math.round(outageMs / 60000)
+  return {
+    fire: true,
+    recovered: false,
+    message:
+      `TRADER ALERT: Engine unreachable for ${mins}+ min. Win11 may be offline ` +
+      'or Tailscale disconnected. No signals, no exits, no reconciliation until it returns.',
   }
 }
 

@@ -31,6 +31,10 @@ export interface AdoptPositionResult {
 export interface EngineOrder {
   client_order_id: string;
   broker_order_id: string | null;
+  /** Brain decision id stored by the engine at submit. The reconciler matches
+   *  on this -- client_order_id is an engine-minted uuid that never matches a
+   *  brain decision. Optional for back-compat with older engine builds. */
+  decision_id?: string | null;
   asset: string;
   side: "buy" | "sell";
   qty: number;

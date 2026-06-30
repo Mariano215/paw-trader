@@ -105,6 +105,18 @@ export function listFillsForDecision(db: Database.Database, decisionId: string):
   `).all(decisionId) as FillRow[]
 }
 
+/**
+ * Read all fills for an asset across ALL decisions, ascending by fill time.
+ * Entry (buy) fills live under the entry decision id; exit (sell) fills live
+ * under a separate exit decision id. Realized P&L can only be computed by
+ * pooling both legs per asset -- see recomputeRealizedPnlForAsset.
+ */
+export function listFillsForAsset(db: Database.Database, asset: string): FillRow[] {
+  return db.prepare(`
+    SELECT * FROM trader_fills WHERE asset = ? ORDER BY fill_ts_ms ASC, recorded_at ASC
+  `).all(asset) as FillRow[]
+}
+
 export interface RealizedLot {
   qty: number
   entryPrice: number
@@ -114,6 +126,10 @@ export interface RealizedLot {
   feesUsd: number
   pnlGross: number
   pnlNet: number
+  /** Decision id of the buy lot this realized row closed (valid trader_decisions FK). */
+  entryDecisionId: string
+  /** Decision id of the sell that closed it (may be a separate exit decision). */
+  exitDecisionId: string
 }
 
 /**
@@ -125,13 +141,13 @@ export interface RealizedLot {
  * fully matched lots produce realized rows.
  */
 export function matchLotsFifo(fills: FillRow[]): RealizedLot[] {
-  interface OpenLot { qty: number; price: number; tsMs: number; feePerUnit: number }
+  interface OpenLot { qty: number; price: number; tsMs: number; feePerUnit: number; decisionId: string }
   const open: OpenLot[] = []
   const realized: RealizedLot[] = []
   for (const f of fills) {
     const feePerUnit = f.fill_qty > 0 ? f.fee_usd / f.fill_qty : 0
     if (f.side === 'buy') {
-      open.push({ qty: f.fill_qty, price: f.fill_price, tsMs: f.fill_ts_ms, feePerUnit })
+      open.push({ qty: f.fill_qty, price: f.fill_price, tsMs: f.fill_ts_ms, feePerUnit, decisionId: f.decision_id })
       continue
     }
     // Sell: close oldest buy lots first.
@@ -151,6 +167,8 @@ export function matchLotsFifo(fills: FillRow[]): RealizedLot[] {
         feesUsd: entryFee + exitFee,
         pnlGross,
         pnlNet: pnlGross - entryFee - exitFee,
+        entryDecisionId: lot.decisionId,
+        exitDecisionId: f.decision_id,
       })
       lot.qty -= matched
       remaining -= matched
@@ -187,6 +205,48 @@ export function recomputeRealizedPnl(
     for (const lot of lots) {
       ins.run(
         randomUUID(), decisionId, asset, lot.qty, lot.entryPrice, lot.exitPrice,
+        lot.entryTsMs, lot.exitTsMs, lot.feesUsd, lot.pnlGross, lot.pnlNet,
+        LOT_MATCH_RULE, nowMs,
+      )
+    }
+  })
+  tx()
+  return lots
+}
+
+/**
+ * Recompute trader_realized_pnl for one ASSET from the full fill history of
+ * that asset, pooling entry (buy) and exit (sell) fills that live under
+ * DIFFERENT decision ids. This is the canonical realized-P&L path: an exit is
+ * always a separate decision from its entry, so per-decision matching (above)
+ * never sees a buy and its matching sell together and yields zero realized
+ * rows. FIFO across the asset closes oldest buy lots first.
+ *
+ * Each realized row is keyed by the entry (buy) decision id -- the lot that
+ * was closed -- which is a live trader_decisions FK (entries persist; exits
+ * may be deleted/aggregated). Full rebuild per asset, so re-runs are
+ * idempotent. Returns the realized lots written.
+ */
+export function recomputeRealizedPnlForAsset(
+  db: Database.Database,
+  asset: string,
+  nowMs: number = Date.now(),
+): RealizedLot[] {
+  const fills = listFillsForAsset(db, asset)
+  if (fills.length === 0) return []
+  const lots = matchLotsFifo(fills)
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM trader_realized_pnl WHERE asset = ?').run(asset)
+    const ins = db.prepare(`
+      INSERT INTO trader_realized_pnl
+        (id, decision_id, asset, qty, entry_price, exit_price,
+         entry_ts_ms, exit_ts_ms, fees_usd, pnl_gross, pnl_net,
+         lot_match_rule, computed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const lot of lots) {
+      ins.run(
+        randomUUID(), lot.entryDecisionId, asset, lot.qty, lot.entryPrice, lot.exitPrice,
         lot.entryTsMs, lot.exitTsMs, lot.feesUsd, lot.pnlGross, lot.pnlNet,
         LOT_MATCH_RULE, nowMs,
       )

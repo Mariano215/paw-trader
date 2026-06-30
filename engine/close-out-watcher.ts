@@ -20,7 +20,7 @@ import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
 import { recomputeTrackRecord, listOpenPositions, summarizeOpenPositions } from './track-record.js'
-import { recomputeRealizedPnl } from './audit-log.js'
+import { recomputeRealizedPnlForAsset } from './audit-log.js'
 import { insertPnlSnapshot, getLastCumulativePnl } from './db.js'
 import {
   computeVerdict,
@@ -305,14 +305,18 @@ export function processClosure(
   db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
 
   // Populate the derived realized-P&L layer from the immutable fills written
-  // by the order-reconciler. Errors must not roll back the verdict -- the
-  // verdict is the source of truth; the P&L layer can be recomputed later.
+  // by the order-reconciler. Matched PER ASSET, not per decision: an exit is a
+  // SEPARATE decision from its entry, so the sell fill lives under a different
+  // decision id than the buy. Per-decision matching never sees both legs and
+  // yields zero realized rows -- the months-long "P&L always empty" bug. FIFO
+  // across the asset closes oldest buy lots first. Errors must not roll back
+  // the verdict -- the verdict is the source of truth; P&L recomputes later.
   try {
-    recomputeRealizedPnl(db, decision.id)
+    recomputeRealizedPnlForAsset(db, decision.asset)
   } catch (err) {
     logger.warn(
-      { err, decisionId: decision.id },
-      'Close-out sweep: recomputeRealizedPnl failed; verdict already persisted',
+      { err, decisionId: decision.id, asset: decision.asset },
+      'Close-out sweep: recomputeRealizedPnlForAsset failed; verdict already persisted',
     )
   }
 
@@ -501,6 +505,17 @@ export async function runCloseOutSweep(
           // flip to 'closed' so it leaves the candidate set instead of being
           // re-graded with pooled aggregate PnL every sweep.
           db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
+          // Even without a per-decision verdict, the asset's pooled fills may
+          // now form a complete round-trip -- recompute realized P&L per asset
+          // so a legacy close still books money instead of vanishing.
+          try {
+            recomputeRealizedPnlForAsset(db, decision.asset)
+          } catch (err) {
+            logger.warn(
+              { err, decisionId: decision.id, asset: decision.asset },
+              'Close-out sweep: recomputeRealizedPnlForAsset failed on no-fill-data close',
+            )
+          }
           logger.info(
             { decisionId: decision.id, asset: decision.asset },
             'Close-out sweep: closed without verdict (no per-decision fill data)',

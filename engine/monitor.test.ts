@@ -19,6 +19,7 @@ import {
   checkSignalDrought,
   evaluateAndRecordSharpeFlip,
   evaluateAndRecordCoinbaseHealth,
+  evaluateAndRecordEngineUnreachable,
   evaluateAndRecordNavDrop,
   recordAlertFired,
   ABSTAIN_THRESHOLD,
@@ -573,6 +574,84 @@ describe('monitor: evaluateAndRecordCoinbaseHealth', () => {
     const getHealth = async () => ({ coinbase_connected: false })
     await evaluateAndRecordCoinbaseHealth(db, NOW, getHealth)
     expect(lastAlertedRow()).toBeUndefined()
+  })
+})
+
+// Engine-unreachable monitor -- inverse of Coinbase: a getHealth throw or
+// null body is the down signal. State persists in trader_alert_state so the
+// outage clock + hourly re-nag survive bot restarts (the bug that silenced
+// the 2026-06-15..06-25 freeze, where the old in-memory counter reset on
+// every launchd respawn before it could reach the alert threshold).
+describe('monitor: evaluateAndRecordEngineUnreachable', () => {
+  let db: ReturnType<typeof makeDb>
+  const NOW = 1_700_000_000_000
+  const ok = async () => ({ status: 'ok' })
+  const down = async () => { throw new Error('ECONNREFUSED') }
+
+  beforeEach(() => { db = makeDb() })
+
+  function firstDownRow(): { last_alerted_at: number } | undefined {
+    return db
+      .prepare("SELECT last_alerted_at FROM trader_alert_state WHERE alert_id='engine_first_down'")
+      .get() as { last_alerted_at: number } | undefined
+  }
+
+  it('sets the outage marker on the first unreachable tick, no fire', async () => {
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
+    expect(r.fire).toBe(false)
+    expect(firstDownRow()?.last_alerted_at).toBe(NOW)
+  })
+
+  it('holds fire within the 15-minute grace', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 5 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
+    expect(r.fire).toBe(false)
+    // Marker is not refreshed once set.
+    expect(firstDownRow()?.last_alerted_at).toBe(NOW - 5 * 60 * 1000)
+  })
+
+  it('fires once the outage exceeds 15 minutes with no prior alert', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 20 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
+    expect(r.fire).toBe(true)
+    expect(r.message).toContain('Engine unreachable')
+  })
+
+  it('treats a null health body as unreachable', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 20 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, async () => null)
+    expect(r.fire).toBe(true)
+  })
+
+  it('does not re-fire within the 60-minute dedup window', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 90 * 60 * 1000)
+    recordAlertFired(db, 'engine_unreachable_alert', NOW - 30 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
+    expect(r.fire).toBe(false)
+  })
+
+  it('re-nags once the 60-minute dedup window elapses (survives a long outage)', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 3 * 60 * 60 * 1000)
+    recordAlertFired(db, 'engine_unreachable_alert', NOW - 61 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
+    expect(r.fire).toBe(true)
+  })
+
+  it('clears the clock and reports recovery only if an alert had fired', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 3 * 60 * 60 * 1000)
+    recordAlertFired(db, 'engine_unreachable_alert', NOW - 61 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, ok)
+    expect(r.fire).toBe(false)
+    expect(r.recovered).toBe(true)
+    expect(firstDownRow()).toBeUndefined()
+  })
+
+  it('does not report recovery for a sub-grace blip that never alerted', async () => {
+    recordAlertFired(db, 'engine_first_down', NOW - 2 * 60 * 1000)
+    const r = await evaluateAndRecordEngineUnreachable(db, NOW, ok)
+    expect(r.fire).toBe(false)
+    expect(r.recovered).toBe(false)
+    expect(firstDownRow()).toBeUndefined()
   })
 })
 

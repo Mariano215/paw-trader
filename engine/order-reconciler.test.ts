@@ -47,6 +47,24 @@ describe('reconcileOpenOrders', () => {
     expect(row.filled_avg_price).toBe(101.5)
   })
 
+  it('matches on decision_id when the engine minted its own client_order_id (real-world case)', async () => {
+    // Engine assigns a random client_order_id and stores the brain decision id
+    // in decision_id. engine_order_id is null (submit ack lost). The ONLY key
+    // that links this order to decision d1 is decision_id. This is the 0/100
+    // mismatch the fix repairs.
+    insertDecision(db, DECISION_STATUS.SUBMITTED, null)
+    const client = { getOrders: vi.fn().mockResolvedValue([order({
+      client_order_id: 'engine-minted-uuid-9f3a', broker_order_id: 'boid-x',
+      decision_id: 'd1', status: 'filled', filled_qty: 5, filled_avg_price: 200,
+    })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.promotedToFilled).toBe(1)
+    const row = db.prepare("SELECT status, filled_qty FROM trader_decisions WHERE id='d1'").get() as any
+    expect(row.status).toBe('executed')
+    expect(row.filled_qty).toBe(5)
+    expect(listFillsForDecision(db, 'd1')).toHaveLength(1)
+  })
+
   it('advances submitted -> pending_fill when live but unfilled', async () => {
     insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-1')
     const client = { getOrders: vi.fn().mockResolvedValue([order({ status: 'new', filled_qty: 0 })]) }

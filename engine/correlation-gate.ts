@@ -53,8 +53,12 @@ export const CLUSTER_MAP: Record<string, string> = {
   EEM:  'intl-equity',
 }
 
-/** Default gross exposure cap per cluster as a fraction of NAV. */
-export const DEFAULT_CLUSTER_CAP_PCT = 0.20
+/** Default gross exposure cap per cluster as a fraction of NAV.
+ *  Raised 0.20 -> 0.50 (2026-06-28): the 20% cap suppressed ~53% of all
+ *  signals because correlated ETFs (SPY/QQQ/IWM/VTI) share one cluster and a
+ *  couple of positions exhausted the 20% headroom, freezing new entries.
+ *  50% keeps a real concentration guard while letting trades flow. */
+export const DEFAULT_CLUSTER_CAP_PCT = 0.50
 
 export function clusterFor(asset: string): string {
   return CLUSTER_MAP[asset.toUpperCase()] ?? asset.toUpperCase()

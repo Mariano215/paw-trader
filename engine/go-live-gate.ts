@@ -44,8 +44,16 @@ export interface BrokerTruth {
 export async function computeBrokerTruth(client: EngineClient): Promise<BrokerTruth> {
   const [orders, positions] = await Promise.all([client.getOrders(), client.getPositions()])
 
-  const byAsset = new Map<string, FillRow[]>()
+  // Dedup by order id: a partially_filled snapshot plus the final filled row
+  // for the same order must not both count. filled_qty only grows.
+  const latestByOrder = new Map<string, (typeof orders)[number]>()
   for (const o of orders) {
+    const key = o.client_order_id ?? `${o.asset}:${o.side}:${o.updated_at}`
+    const prev = latestByOrder.get(key)
+    if (!prev || (o.filled_qty ?? 0) > (prev.filled_qty ?? 0)) latestByOrder.set(key, o)
+  }
+  const byAsset = new Map<string, FillRow[]>()
+  for (const o of latestByOrder.values()) {
     const status = (o.status ?? '').toLowerCase()
     if (!(o.filled_qty > 0) || (status !== 'filled' && status !== 'partially_filled')) continue
     const rows = byAsset.get(o.asset) ?? []

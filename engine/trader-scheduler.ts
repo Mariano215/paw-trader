@@ -622,11 +622,26 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //     the result (the live-mode guard in phase 0 enforces it) and buffers
   //     a plain-English progress summary into the digest.
   try {
-    const { gateRunDue, runGoLiveGate, renderGateSummary } = await import('./go-live-gate.js')
+    const { gateRunDue, runGoLiveGate, readLastGateResult, renderGateSummary } = await import('./go-live-gate.js')
     if (gateRunDue(deps.db, Date.now())) {
+      const prev = readLastGateResult(deps.db)
       const gate = await runGoLiveGate(deps.db, deps.getEngineClient())
       logger.info({ passed: gate.passed, roundTrips: gate.roundTrips }, 'Trader tick: go-live gate evaluated')
-      await deps.send(renderGateSummary(gate)).catch(() => {})
+      // Transition alerts fire instantly (TRADER ALERT matches the digest
+      // issue pattern); the routine summary buffers into the digest.
+      if (gate.passed && !prev?.passed) {
+        await deps.send(
+          'TRADER ALERT: GO-LIVE GATE PASSED. All validation criteria met on paper. ' +
+          'Ready to discuss switching the engine from paper to real money.\n\n' + renderGateSummary(gate),
+        ).catch(() => {})
+      } else if (!gate.passed && prev?.passed) {
+        await deps.send(
+          'TRADER ALERT: go-live gate REGRESSED from passed to failed. Live flip is blocked again.\n\n' +
+          renderGateSummary(gate),
+        ).catch(() => {})
+      } else {
+        await deps.send(renderGateSummary(gate)).catch(() => {})
+      }
     }
   } catch (err) {
     logger.warn({ err }, 'Trader tick: go-live gate evaluation failed')

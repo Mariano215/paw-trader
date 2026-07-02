@@ -47,6 +47,7 @@ interface TraderSyncPayload {
   circuit_breakers?: Record<string, unknown>[]
   pnl_snapshots?: Record<string, unknown>[]
   alert_state?:   Record<string, unknown>[]
+  kv?:            Record<string, unknown>[]
 }
 
 // Maps payload key → { table name, columns in insert order }
@@ -91,6 +92,10 @@ const TABLE_MAP: Record<keyof TraderSyncPayload, { table: string; cols: string[]
     table: 'trader_alert_state',
     cols: ['alert_id', 'last_alerted_at'],
   },
+  kv: {
+    table: 'kv_settings',
+    cols: ['key', 'value'],
+  },
 }
 
 router.post('/api/v1/internal/trader-sync', requireBotOrAdmin, (req: Request, res: Response) => {
@@ -109,6 +114,10 @@ router.post('/api/v1/internal/trader-sync', requireBotOrAdmin, (req: Request, re
   const results: Record<string, number> = {}
 
   try {
+    // kv_settings is created lazily bot-side; mirror that here so the kv
+    // slice of the payload never 500s on a fresh server DB.
+    bdb.prepare('CREATE TABLE IF NOT EXISTS kv_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run()
+
     const syncAll = bdb.transaction(() => {
       for (const [key, spec] of Object.entries(TABLE_MAP) as [keyof TraderSyncPayload, { table: string; cols: string[] }][]) {
         const rows = payload[key]

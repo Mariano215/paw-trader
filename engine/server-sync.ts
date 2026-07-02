@@ -73,6 +73,18 @@ function buildPayload(db: Database.Database) {
     pnl_snapshots: db.prepare(
       "SELECT * FROM trader_pnl_snapshots ORDER BY date DESC LIMIT 90",
     ).all(),
+
+    // Go-live gate state (kv rows). Guarded: kv_settings is created lazily
+    // by the gate module, so it may not exist on a fresh DB yet.
+    kv: (() => {
+      try {
+        return db.prepare(
+          "SELECT key, value FROM kv_settings WHERE key IN ('trader.gate.last', 'trader.gate.regimes_seen')",
+        ).all()
+      } catch {
+        return []
+      }
+    })(),
   }
 }
 

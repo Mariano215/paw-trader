@@ -53,6 +53,8 @@ router.get('/api/v1/trader/status', async (_req: Request, res: Response) => {
       // field (older build); the frontend hides the Coinbase pill in
       // that case rather than showing "Coinbase ERROR".
       coinbase_connected: health.coinbase_connected ?? null,
+      reconciler_halted: (health as { reconciler_halted?: boolean }).reconciler_halted ?? false,
+      halt_reason: (health as { halt_reason?: string | null }).halt_reason ?? null,
       last_reconcile: reconcile,
     })
   } catch (err) {
@@ -219,6 +221,104 @@ router.get('/api/v1/trader/overview', async (_req: Request, res: Response) => {
     res.json({ nav, today_pnl, week_pnl })
   } catch {
     res.json({ nav: null, today_pnl: null, week_pnl: null })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/trader/broker-pnl
+// Realized P&L from ENGINE filled orders (FIFO per asset) + open unrealized
+// from engine positions. Broker truth: matches scripts/verify-trader-pnl.mjs
+// and src/trader/go-live-gate.ts computeBrokerTruth. FIFO is inlined here
+// because the server compiles independently of bot source.
+// ---------------------------------------------------------------------------
+
+interface EngineOrderLite {
+  asset: string
+  side: 'buy' | 'sell'
+  status: string
+  filled_qty: number
+  filled_avg_price: number | null
+  updated_at: number
+}
+
+interface EnginePositionLite {
+  asset: string
+  qty: number
+  unrealized_pnl?: number
+}
+
+function fifoRealized(fills: Array<{ side: string; qty: number; price: number }>): { roundTrips: number; realized: number } {
+  const open: Array<{ qty: number; price: number }> = []
+  let roundTrips = 0
+  let realized = 0
+  for (const f of fills) {
+    if (f.side === 'buy') { open.push({ qty: f.qty, price: f.price }); continue }
+    let rem = f.qty
+    while (rem > 1e-12 && open.length > 0) {
+      const lot = open[0]
+      const m = Math.min(rem, lot.qty)
+      realized += (f.price - lot.price) * m
+      roundTrips++
+      lot.qty -= m; rem -= m
+      if (lot.qty <= 1e-12) open.shift()
+    }
+  }
+  return { roundTrips, realized }
+}
+
+router.get('/api/v1/trader/broker-pnl', async (_req: Request, res: Response) => {
+  const cfg = getEngineConfig()
+  if (!cfg) {
+    res.json({ available: false })
+    return
+  }
+  try {
+    const [orders, positions] = await Promise.all([
+      engineFetch<EngineOrderLite[]>(cfg, '/orders'),
+      engineFetch<EnginePositionLite[]>(cfg, '/positions'),
+    ])
+    // Dedup by order id first: if the engine ever returns a partially_filled
+    // snapshot AND the final filled row for the same order, counting both
+    // would inflate realized P&L. filled_qty only grows, so keep the max.
+    const latestByOrder = new Map<string, EngineOrderLite & { client_order_id?: string }>()
+    for (const o of (Array.isArray(orders) ? orders : []) as Array<EngineOrderLite & { client_order_id?: string }>) {
+      const key = o.client_order_id ?? `${o.asset}:${o.side}:${o.updated_at}`
+      const prev = latestByOrder.get(key)
+      if (!prev || (o.filled_qty ?? 0) > (prev.filled_qty ?? 0)) latestByOrder.set(key, o)
+    }
+    const byAsset = new Map<string, Array<{ side: string; qty: number; price: number; ts: number }>>()
+    for (const o of latestByOrder.values()) {
+      const status = (o.status ?? '').toLowerCase()
+      if (!(o.filled_qty > 0) || (status !== 'filled' && status !== 'partially_filled')) continue
+      const rows = byAsset.get(o.asset) ?? []
+      rows.push({ side: o.side, qty: o.filled_qty, price: o.filled_avg_price ?? 0, ts: o.updated_at })
+      byAsset.set(o.asset, rows)
+    }
+    let realizedTotal = 0
+    let roundTrips = 0
+    const perAsset: Array<{ asset: string; round_trips: number; realized: number }> = []
+    for (const [asset, fills] of byAsset) {
+      fills.sort((a, b) => a.ts - b.ts)
+      const r = fifoRealized(fills)
+      if (r.roundTrips > 0) perAsset.push({ asset, round_trips: r.roundTrips, realized: r.realized })
+      realizedTotal += r.realized
+      roundTrips += r.roundTrips
+    }
+    const openUnrealized = (Array.isArray(positions) ? positions : []).reduce(
+      (s, p) => s + (Math.abs(p.qty) > 1e-9 ? (p.unrealized_pnl ?? 0) : 0), 0)
+    res.json({
+      available: true,
+      realized_total: realizedTotal,
+      round_trips: roundTrips,
+      open_unrealized: openUnrealized,
+      net: realizedTotal + openUnrealized,
+      per_asset: perAsset.sort((a, b) => b.realized - a.realized),
+    })
+  } catch (err) {
+    // Engine unreachable is a normal degraded state for this card. Never
+    // echo the raw error: a future engineFetch change could fold the engine
+    // URL into the message.
+    res.json({ available: false, error: 'engine unreachable' })
   }
 })
 

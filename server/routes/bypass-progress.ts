@@ -103,4 +103,36 @@ router.get('/api/v1/trader/bypass-progress', async (_req: Request, res: Response
   }
 })
 
+// GET /api/v1/trader/gate-progress
+//
+// Go-live gate state synced from the bot (kv_settings key 'trader.gate.last',
+// written weekly by src/trader/go-live-gate.ts). The bot enforces the gate;
+// this endpoint only surfaces the last evaluation for the dashboard card.
+router.get('/api/v1/trader/gate-progress', async (_req: Request, res: Response) => {
+  const bdb = getBotDb()
+  if (!bdb) {
+    res.status(503).json({ error: 'bot database unavailable' })
+    return
+  }
+  try {
+    const row = bdb
+      .prepare("SELECT value FROM kv_settings WHERE key = 'trader.gate.last'")
+      .get() as { value: string } | undefined
+    if (!row) {
+      res.json({ available: false })
+      return
+    }
+    res.json({ available: true, gate: JSON.parse(row.value) })
+  } catch (err) {
+    // Missing kv_settings table (fresh DB before first sync) is a normal
+    // "not evaluated yet" state, not an error.
+    if (String(err).includes('no such table')) {
+      res.json({ available: false })
+      return
+    }
+    logger.warn({ err }, 'trader: gate-progress query failed')
+    res.status(500).json({ error: String(err) })
+  }
+})
+
 export default router

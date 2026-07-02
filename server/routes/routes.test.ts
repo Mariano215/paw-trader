@@ -440,6 +440,70 @@ describe('GET /api/v1/trader/status (Phase 5 Task 2c coinbase pass-through)', ()
     expect(body.engine_connected).toBe(true)
     expect(body.alpaca_connected).toBe(true)
     expect(body.coinbase_connected).toBe(true)
+    // reconciler halt passthrough: dashboard halt banner depends on these
+    expect((res.body as { reconciler_halted: boolean }).reconciler_halted).toBe(false)
+    expect((res.body as { halt_reason: string | null }).halt_reason).toBeNull()
+  })
+})
+
+describe('GET /api/v1/trader/broker-pnl (FIFO realized from engine orders)', () => {
+  const ORIGINAL_FETCH = globalThis.fetch
+  const ORIGINAL_URL = process.env.TRADER_ENGINE_URL
+  const ORIGINAL_TOKEN = process.env.TRADER_ENGINE_TOKEN
+
+  beforeAll(() => {
+    process.env.TRADER_ENGINE_URL = 'http://127.0.0.1:9999'
+    process.env.TRADER_ENGINE_TOKEN = 'fake-engine-token'
+  })
+
+  afterAll(() => {
+    globalThis.fetch = ORIGINAL_FETCH
+    if (ORIGINAL_URL === undefined) delete process.env.TRADER_ENGINE_URL
+    else process.env.TRADER_ENGINE_URL = ORIGINAL_URL
+    if (ORIGINAL_TOKEN === undefined) delete process.env.TRADER_ENGINE_TOKEN
+    else process.env.TRADER_ENGINE_TOKEN = ORIGINAL_TOKEN
+  })
+
+  it('FIFO-matches, dedups partial+full snapshots, sums open unrealized', async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+      const href = typeof url === 'string' ? url : url instanceof URL ? url.href : String(url)
+      if (href.endsWith('/orders')) {
+        return {
+          ok: true, status: 200,
+          json: async () => ([
+            { client_order_id: 'c1', asset: 'SPY', side: 'buy', status: 'filled', filled_qty: 10, filled_avg_price: 100, updated_at: 1 },
+            // partial snapshot of the same order: must not double-count
+            { client_order_id: 'c1', asset: 'SPY', side: 'buy', status: 'partially_filled', filled_qty: 5, filled_avg_price: 100, updated_at: 1 },
+            { client_order_id: 'c2', asset: 'SPY', side: 'sell', status: 'filled', filled_qty: 10, filled_avg_price: 110, updated_at: 2 },
+            { client_order_id: 'c3', asset: 'SPY', side: 'buy', status: 'placed', filled_qty: 0, filled_avg_price: null, updated_at: 3 },
+          ]),
+        } as unknown as Response
+      }
+      if (href.endsWith('/positions')) {
+        return {
+          ok: true, status: 200,
+          json: async () => ([{ asset: 'QQQ', qty: 2, unrealized_pnl: -7.5 }]),
+        } as unknown as Response
+      }
+      return { ok: false, status: 404, json: async () => ({}) } as unknown as Response
+    }) as typeof fetch
+
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
+    expect(res.status).toBe(200)
+    const body = res.body as { available: boolean; realized_total: number; round_trips: number; open_unrealized: number }
+    expect(body.available).toBe(true)
+    expect(body.realized_total).toBeCloseTo(100) // (110-100)*10, dedup holds
+    expect(body.round_trips).toBe(1)
+    expect(body.open_unrealized).toBeCloseTo(-7.5)
+  })
+
+  it('returns available:false with a generic error when the engine is down', async () => {
+    globalThis.fetch = vi.fn(async () => { throw new Error('boom http://secret-engine:9999') }) as typeof fetch
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
+    expect(res.status).toBe(200)
+    const body = res.body as { available: boolean; error?: string }
+    expect(body.available).toBe(false)
+    expect(body.error).toBe('engine unreachable') // raw error never echoed
   })
 })
 

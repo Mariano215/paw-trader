@@ -47,9 +47,11 @@ describe('computeBrokerTruth', () => {
   it('FIFO-matches engine filled orders into realized round-trips', async () => {
     const client = mockClient(
       [
-        order({ broker_order_id: 'b1', side: 'buy', filled_qty: 10, filled_avg_price: 100, updated_at: 1 }),
-        order({ broker_order_id: 'b2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 2 }),
-        order({ broker_order_id: 'b3', side: 'buy', filled_avg_price: 50, updated_at: 3, status: 'placed', filled_qty: 0 }),
+        order({ client_order_id: 'c1', broker_order_id: 'b1', side: 'buy', filled_qty: 10, filled_avg_price: 100, updated_at: 1 }),
+        // partial snapshot of the SAME buy order: must dedup, not double-count
+        order({ client_order_id: 'c1', broker_order_id: 'b1', side: 'buy', filled_qty: 5, filled_avg_price: 100, updated_at: 1, status: 'partially_filled' }),
+        order({ client_order_id: 'c2', broker_order_id: 'b2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 2 }),
+        order({ client_order_id: 'c3', broker_order_id: 'b3', side: 'buy', filled_avg_price: 50, updated_at: 3, status: 'placed', filled_qty: 0 }),
       ],
       [{ asset: 'QQQ', qty: 2, unrealized_pnl: -7.5, market_value: 1000 }],
     )
@@ -73,8 +75,8 @@ describe('runGoLiveGate', () => {
 
   it('fails the gate on a thin record and persists the result', async () => {
     const client = mockClient([
-      order({ broker_order_id: 'b1', side: 'buy', filled_qty: 10, filled_avg_price: 100, updated_at: 1 }),
-      order({ broker_order_id: 'b2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 2 }),
+      order({ client_order_id: 'g1', broker_order_id: 'b1', side: 'buy', filled_qty: 10, filled_avg_price: 100, updated_at: 1 }),
+      order({ client_order_id: 'g2', broker_order_id: 'b2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 2 }),
     ])
     const r = await runGoLiveGate(db, client, 1_000_000)
     expect(r.passed).toBe(false) // 1 trade vs 100 floor, 1 regime, no backtest

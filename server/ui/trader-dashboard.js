@@ -214,6 +214,12 @@ function ensureTraderPageDOM() {
   bypassCard.className = 'stat-card';
   footer.appendChild(bypassCard);
 
+  // Go-live gate card placeholder (rendered by refreshTraderGateProgress)
+  var gateCard = document.createElement('div');
+  gateCard.id = 'trader-gate-card';
+  gateCard.className = 'stat-card';
+  footer.appendChild(gateCard);
+
   // Halt button
   var haltWrap = document.createElement('div');
   haltWrap.id = 'trader-halt-wrap';
@@ -234,10 +240,12 @@ function initTraderPage() {
   // Initial renders
   refreshTraderKPI_nav();
   refreshTraderKPI_engine();
+  refreshTraderKPI_brokerPnl();
   refreshTraderCol1();
   refreshTraderCol2();
   refreshTraderCol3();
   refreshTraderBypassProgress();
+  refreshTraderGateProgress();
   _renderTraderTicker();
   _renderBottomRow();
 
@@ -246,10 +254,12 @@ function initTraderPage() {
     _traderPollStarted = true;
     addPollingInterval(refreshTraderKPI_nav,    60000);  // NAV + committee
     addPollingInterval(refreshTraderKPI_engine,  5000);  // engine status
+  addPollingInterval(refreshTraderKPI_brokerPnl, 60000); // broker-truth realized
     addPollingInterval(refreshTraderCol1,        5000);  // positions
     addPollingInterval(refreshTraderCol2,        5000);  // signals + decisions
     addPollingInterval(refreshTraderCol3,        5000);  // risk/circuit breakers
     addPollingInterval(refreshTraderBypassProgress, 60000);
+  addPollingInterval(refreshTraderGateProgress, 60000);
   }
 }
 
@@ -323,6 +333,21 @@ async function refreshTraderKPI_nav() {
   _renderTraderTicker();
 }
 
+async function refreshTraderKPI_brokerPnl() {
+  try {
+    var data = await fetchFromAPI('/api/v1/trader/broker-pnl');
+    if (!data || !data.available) return;
+    var v = Number(data.realized_total) || 0;
+    var colorAttr = v >= 0 ? 'style="color:var(--green,#3ddc84)"' : 'style="color:#ff5c5c"';
+    var fmtd = (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
+    _renderKpiCell('kpi-realized', 'REALIZED P&L',
+      '<span ' + colorAttr + '>' + fmtd + '</span>',
+      (data.round_trips || 0) + ' round-trips',
+      'Realized P&L (broker truth)',
+      'Locked-in profit from closed round-trips, computed from the broker\'s actual filled orders. This is the number that matters.', null);
+  } catch (_) { /* non-fatal */ }
+}
+
 async function refreshTraderKPI_engine() {
   try {
     var st = await fetchFromAPI('/api/v1/trader/status');
@@ -375,10 +400,38 @@ function _renderKpiNavCells(data) {
 function _renderKpiEngineCell(st) {
   var mode   = (st && st.alpaca_mode) ? st.alpaca_mode : 'unknown';
   var live   = mode === 'live';
-  var pill   = '<span class="status-pill ' + (live ? 'pill-live' : 'pill-paper') + '">' + (live ? '● Live' : '○ Paper') + '</span>';
+  var halted = !!(st && st.reconciler_halted);
+  var pill;
+  if (halted) {
+    pill = '<span class="status-pill" style="background:rgba(255,60,60,0.18);color:#ff5c5c;border:1px solid #ff5c5c;">■ HALTED</span>';
+  } else {
+    pill = '<span class="status-pill ' + (live ? 'pill-live' : 'pill-paper') + '">' + (live ? '● Live' : '○ Paper') + '</span>';
+  }
   var brokerLabel = (st && st.alpaca_connected) ? 'Alpaca' : '';
   var brokerHtml = brokerLabel ? ' <small style="font-size:10px;opacity:0.6">' + brokerLabel + '</small>' : '';
   _renderKpiCell('kpi-engine', 'ENGINE', pill + brokerHtml, null, null, null, null);
+  _renderTraderHaltBanner(st);
+}
+
+// Red banner above the KPI strip while the engine reconciler is halted.
+function _renderTraderHaltBanner(st) {
+  var strip = document.getElementById('trader-kpi-strip');
+  if (!strip || !strip.parentNode) return;
+  var banner = document.getElementById('trader-halt-banner');
+  var halted = !!(st && st.reconciler_halted);
+  if (!halted) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'trader-halt-banner';
+    banner.style.cssText = 'background:rgba(255,60,60,0.12);border:1px solid #ff5c5c;color:#ff5c5c;' +
+      'padding:8px 14px;border-radius:8px;margin-bottom:10px;font-size:0.85rem;font-weight:600;';
+    strip.parentNode.insertBefore(banner, strip);
+  }
+  banner.textContent = 'ENGINE HALTED: ' + (st.halt_reason || 'no reason given') +
+    ' — no orders will fill until cleared.';
 }
 
 // ---------------------------------------------------------------------------
@@ -2417,6 +2470,68 @@ async function refreshTraderBypassProgress() {
     container.appendChild(modeRow);
   } catch (e) {
     container.textContent = 'Bypass progress unavailable: ' + String(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Go-live gate card (paper -> live readiness)
+// ---------------------------------------------------------------------------
+
+async function refreshTraderGateProgress() {
+  var container = document.getElementById('trader-gate-card');
+  if (!container) return;
+  try {
+    var data = await fetchFromAPI('/api/v1/trader/gate-progress');
+    if (data === null) return; // auth redirect
+    while (container.firstChild) container.removeChild(container.firstChild);
+
+    var heading = document.createElement('div');
+    heading.style.cssText = 'font-weight:600;margin-bottom:10px;';
+    heading.textContent = 'Go-Live Gate (paper to real money)';
+    container.appendChild(heading);
+
+    if (!data.available || !data.gate) {
+      var none = document.createElement('div');
+      none.style.cssText = 'opacity:0.7;font-size:0.85rem;';
+      none.textContent = 'Not evaluated yet. Runs weekly on the trader tick.';
+      container.appendChild(none);
+      return;
+    }
+
+    var g = data.gate;
+    var passedCount = 0;
+    (g.criteria || []).forEach(function (c) { if (c.passed) passedCount++; });
+
+    var statusRow = document.createElement('div');
+    statusRow.style.cssText = 'font-size:1.6rem;font-weight:700;margin-bottom:4px;' +
+      (g.passed ? 'color:var(--positive, #3ddc84);' : '');
+    statusRow.textContent = g.passed
+      ? 'PASSED'
+      : passedCount + ' / ' + (g.criteria || []).length + ' criteria';
+    container.appendChild(statusRow);
+
+    var pnlRow = document.createElement('div');
+    pnlRow.style.cssText = 'opacity:0.7;font-size:0.85rem;margin-bottom:8px;';
+    var net = (g.realizedTotal || 0) + (g.openUnrealized || 0);
+    pnlRow.textContent = (g.roundTrips || 0) + ' round-trips, broker-truth net $' + net.toFixed(2);
+    container.appendChild(pnlRow);
+
+    (g.criteria || []).forEach(function (c) {
+      var row = document.createElement('div');
+      row.style.cssText = 'font-size:0.8rem;margin-bottom:2px;' + (c.passed ? 'opacity:0.75;' : '');
+      row.textContent = (c.passed ? 'PASS  ' : 'BLOCK ') + c.name.replace(/_/g, ' ');
+      row.title = c.detail || '';
+      container.appendChild(row);
+    });
+
+    if (g.evaluatedAt) {
+      var ts = document.createElement('div');
+      ts.style.cssText = 'opacity:0.5;font-size:0.75rem;margin-top:6px;';
+      ts.textContent = 'Evaluated ' + new Date(g.evaluatedAt).toLocaleString();
+      container.appendChild(ts);
+    }
+  } catch (e) {
+    container.textContent = 'Gate status unavailable: ' + String(e);
   }
 }
 

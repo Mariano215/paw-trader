@@ -6,7 +6,7 @@
  * indicators (RSI-14, momentum, price levels), and stores the result as
  * JSON so the committee has real market context instead of "(none)".
  *
- * This runs between pollAndStoreSignals() and sendPendingApprovals() in
+ * This runs between pollAndStoreSignals() and autoDispatchPendingSignals() in
  * the trader scheduler. One price fetch per unique asset per cycle; the
  * engine endpoint is /prices/{asset}?from_ms=&to_ms= which Alpaca backs.
  */

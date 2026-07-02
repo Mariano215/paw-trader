@@ -6,7 +6,6 @@ import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { reconcileOpenOrders } from './order-reconciler.js'
 import { runRetrySweep } from './order-retry.js'
 import { syncSignalStatuses } from './signal-state-sync.js'
-import { formatTimeoutNotice, timeoutExpiredApprovals, type TraderApprovalKeyboard } from './approval-manager.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { runExitSweep } from './exit-evaluator.js'
 import { maybeFireWeeklyReport } from './weekly-report.js'
@@ -57,8 +56,6 @@ export interface TraderSchedulerDeps {
    * `send` when omitted (tests that don't wrap).
    */
   rawSend?: (text: string) => Promise<void>
-  /** Sends an approval card with inline keyboard buttons. */
-  sendWithKeyboard: (text: string, keyboard: TraderApprovalKeyboard) => Promise<void>
   /** Tick interval override. Defaults to DEFAULT_TICK_MS (5 min). */
   tickMs?: number
   /**
@@ -249,7 +246,6 @@ export function _getAndResetZeroPollCountForTest(): number {
 export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   polled: boolean
   sent: number
-  timedOut: number
   reconcilerHalted: boolean
   closedOut: number
   exited: number
@@ -262,7 +258,6 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     return {
       polled: false,
       sent: 0,
-      timedOut: 0,
       reconcilerHalted: false,
       closedOut: 0,
       exited: 0,
@@ -275,7 +270,6 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
 
   let polled = false
   let sent = 0
-  let timedOut = 0
   let reconcilerHalted = false
   let closedOut = 0
   let exited = 0
@@ -387,6 +381,26 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         _haltAlertSent = false
       }
       _phantomConfirm = {}
+    }
+
+    // Go-live gate enforcement: the engine must never run in live mode
+    // unless the last persisted gate evaluation passed. Survives bot
+    // restarts because the result lives in kv_settings.
+    if (health && health.alpaca_mode === 'live') {
+      const { readLastGateResult } = await import('./go-live-gate.js')
+      const gate = readLastGateResult(deps.db)
+      if (!gate?.passed) {
+        logger.error({ gate }, 'Trader: engine in LIVE mode without a passed go-live gate, halting')
+        try {
+          await client.haltTrading('go-live gate not passed')
+        } catch (haltErr) {
+          logger.error({ err: haltErr }, 'Trader: halt call failed while blocking ungated live mode')
+        }
+        await deps.send(
+          'TRADER ALERT: engine switched to LIVE mode but the go-live validation gate has not passed. ' +
+          'Trading halted. Flip the engine back to paper or clear the gate first.',
+        ).catch(() => {})
+      }
     }
   } catch (err) {
     _healthCheckConsecutiveFailures++
@@ -523,31 +537,6 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   }
 
-  // 3. Time out approvals older than 30 min and notify the operator so a
-  //    missed signal is never silent. Notification failures do not block
-  //    the DB transition -- we would rather log than leave rows pending.
-  try {
-    const expired = timeoutExpiredApprovals(deps.db)
-    timedOut = expired.length
-    if (timedOut > 0) {
-      logger.info({ timedOut }, 'Trader tick: timed out stale approvals')
-      for (const row of expired) {
-        const notice = formatTimeoutNotice(row)
-        if (!notice) {
-          logger.warn({ approvalId: row.id, signalId: row.signalId }, 'Skipping timeout notice: signal metadata missing')
-          continue
-        }
-        try {
-          await deps.send(notice)
-        } catch (sendErr) {
-          logger.error({ err: sendErr, approvalId: row.id }, 'Trader tick: timeout notice send failed')
-        }
-      }
-    }
-  } catch (err) {
-    logger.error({ err }, 'Trader tick: approval timeout sweep failed')
-  }
-
   // 4. Close-out sweep -- detect positions that fully closed since last
   //    tick and write a verdict + ReasoningBank case for each. Pure
   //    deterministic math + DB writes, zero LLM calls. Skipped silently
@@ -629,6 +618,20 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     logger.warn({ err }, 'Trader tick: weekly report gate failed')
   }
 
+  // 5a-bis. Weekly go-live gate evaluation against broker truth. Persists
+  //     the result (the live-mode guard in phase 0 enforces it) and buffers
+  //     a plain-English progress summary into the digest.
+  try {
+    const { gateRunDue, runGoLiveGate, renderGateSummary } = await import('./go-live-gate.js')
+    if (gateRunDue(deps.db, Date.now())) {
+      const gate = await runGoLiveGate(deps.db, deps.getEngineClient())
+      logger.info({ passed: gate.passed, roundTrips: gate.roundTrips }, 'Trader tick: go-live gate evaluated')
+      await deps.send(renderGateSummary(gate)).catch(() => {})
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader tick: go-live gate evaluation failed')
+  }
+
   // 5b. Twice-daily plain-English digest of routine activity. Routine messages
   //     are buffered by the digesting send (notify-digest.ts); this drains them
   //     into one summary at the 08:00 / 20:00 slots. Uses rawSend so the digest
@@ -656,7 +659,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //    -- a sync failure never stalls the tick or surfaces to the operator.
   void syncTraderTablesToServer(deps.db)
 
-  return { polled, sent, timedOut, reconcilerHalted, closedOut, exited, exitErrors, weeklyReportFired }
+  return { polled, sent, reconcilerHalted, closedOut, exited, exitErrors, weeklyReportFired }
   } finally {
     _tickInProgress = false
   }

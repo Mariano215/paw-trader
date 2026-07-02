@@ -12,7 +12,6 @@ import {
 } from './trader-scheduler.js'
 import * as loggerModule from '../logger.js'
 import type { EngineClient } from './engine-client.js'
-import type { TraderApprovalKeyboard } from './approval-manager.js'
 
 vi.mock('./decision-dispatcher.js', () => ({
   autoDispatchPendingSignals: vi.fn().mockResolvedValue([]),
@@ -37,6 +36,9 @@ function makeDb() {
   `).run()
   db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
     .run('trader.lastWeeklyReport', String(Date.now()))
+  // Same for the weekly go-live gate run, exercised in its own test file.
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last_run_ms', String(Date.now()))
   return db
 }
 
@@ -60,7 +62,6 @@ const healthOk = {
 describe('trader-scheduler', () => {
   let db: ReturnType<typeof makeDb>
   let sendMock: ReturnType<typeof vi.fn>
-  let sendWithKeyboardMock: ReturnType<typeof vi.fn>
   let engineClient: Partial<EngineClient>
   let getEngineClientMock: ReturnType<typeof vi.fn>
 
@@ -68,9 +69,6 @@ describe('trader-scheduler', () => {
   const send = (text: string): Promise<void> =>
     (sendMock as unknown as (text: string) => Promise<void>)(text)
 
-  /** Approval card send with inline keyboard. */
-  const sendWithKeyboard = (text: string, keyboard: TraderApprovalKeyboard): Promise<void> =>
-    (sendWithKeyboardMock as unknown as (t: string, k: TraderApprovalKeyboard) => Promise<void>)(text, keyboard)
 
   const getEngineClient = (): EngineClient =>
     (getEngineClientMock as unknown as () => EngineClient)()
@@ -78,7 +76,6 @@ describe('trader-scheduler', () => {
   beforeEach(() => {
     db = makeDb()
     sendMock = vi.fn().mockResolvedValue(undefined)
-    sendWithKeyboardMock = vi.fn().mockResolvedValue(undefined)
     engineClient = {
       getHealth: vi.fn().mockResolvedValue(healthOk),
       getSignals: vi.fn().mockResolvedValue([]),
@@ -101,13 +98,11 @@ describe('trader-scheduler', () => {
 
   describe('runTraderTick', () => {
     it('runs all phases successfully with no signals', async () => {
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(0)
-      expect(result.timedOut).toBe(0)
       expect(result.reconcilerHalted).toBe(false)
       expect(sendMock).not.toHaveBeenCalled()
-      expect(sendWithKeyboardMock).not.toHaveBeenCalled()
     })
 
     it('polls engine and calls autoDispatchPendingSignals for new signals', async () => {
@@ -120,58 +115,13 @@ describe('trader-scheduler', () => {
       vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
         { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
       ])
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
-      expect(sendWithKeyboardMock).not.toHaveBeenCalled()
     })
 
-    it('times out approvals older than 30 min', async () => {
-      const thirtyOneMinAgo = Date.now() - 31 * 60 * 1000
-      db.prepare('INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES (?, ?, ?)')
-        .run('ap-stale', 'sig-x', thirtyOneMinAgo)
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-      expect(result.timedOut).toBe(1)
 
-      const row = db.prepare("SELECT response FROM trader_approvals WHERE id='ap-stale'").get() as any
-      expect(row.response).toBe('timeout')
-      // Orphan approval (no signal row) -- metadata is null so no Telegram notice is sent.
-      expect(sendMock).not.toHaveBeenCalled()
-    })
-
-    it('sends a plain-text expiry notice when a joined signal row is present', async () => {
-      const thirtyOneMinAgo = Date.now() - 31 * 60 * 1000
-      db.prepare(`
-        INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
-        VALUES (?, 'momentum-stocks', 'NVDA', 'buy', 0.73, 20, ?, 'pending')
-      `).run('sig-expire', Date.now())
-      db.prepare('INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES (?, ?, ?)')
-        .run('ap-expire', 'sig-expire', thirtyOneMinAgo)
-
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-      expect(result.timedOut).toBe(1)
-      expect(sendMock).toHaveBeenCalledTimes(1)
-      const text = sendMock.mock.calls[0][0] as string
-      expect(text).toBe('Signal expired: NVDA BUY $200 - no trade placed.')
-    })
-
-    it('continues when the timeout notifier throws', async () => {
-      const thirtyOneMinAgo = Date.now() - 31 * 60 * 1000
-      db.prepare(`
-        INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
-        VALUES (?, 'momentum-stocks', 'TSLA', 'sell', 0.65, 20, ?, 'pending')
-      `).run('sig-e2', Date.now())
-      db.prepare('INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES (?, ?, ?)')
-        .run('ap-e2', 'sig-e2', thirtyOneMinAgo)
-
-      sendMock.mockRejectedValueOnce(new Error('telegram 503'))
-
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-      expect(result.timedOut).toBe(1)
-      const row = db.prepare("SELECT response FROM trader_approvals WHERE id='ap-e2'").get() as any
-      expect(row.response).toBe('timeout') // DB transition still committed
-    })
 
     it('continues even when engine poll fails', async () => {
       vi.mocked(engineClient.getSignals!).mockRejectedValue(new Error('engine down'))
@@ -180,7 +130,7 @@ describe('trader-scheduler', () => {
         { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
       ])
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
     })
@@ -194,7 +144,7 @@ describe('trader-scheduler', () => {
         { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
       ])
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(false)
       expect(result.sent).toBe(1)
     })
@@ -203,7 +153,7 @@ describe('trader-scheduler', () => {
       insertSignal(db, 'sig-1', 0.9, 'buy')
       vi.mocked(autoDispatchPendingSignals).mockRejectedValueOnce(new Error('committee blew up'))
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       // auto-dispatch failed so sent stays 0, but the tick still completes
       expect(result.sent).toBe(0)
       expect(result.polled).toBe(true)
@@ -211,7 +161,7 @@ describe('trader-scheduler', () => {
 
     it('calls autoDispatchPendingSignals with db and correct deps shape', async () => {
       vi.mocked(autoDispatchPendingSignals).mockClear()
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
       expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
       const [calledDb, calledDeps] = vi.mocked(autoDispatchPendingSignals).mock.calls[0]
       expect(calledDb).toBe(db)
@@ -228,12 +178,11 @@ describe('trader-scheduler', () => {
         halt_reason: 'daily_loss_limit',
       })
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.reconcilerHalted).toBe(true)
       expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('reconciler halted'))
       expect(sendMock.mock.calls[0][0]).toContain('daily_loss_limit')
-      // Approval cards go through sendWithKeyboard, not send
-      expect(sendWithKeyboardMock).not.toHaveBeenCalled()
+      // Approval cards go through not send
     })
 
     it('does not spam halt alerts on repeated ticks when halted', async () => {
@@ -243,9 +192,9 @@ describe('trader-scheduler', () => {
         halt_reason: 'daily_loss_limit',
       })
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
       sendMock.mockClear()
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       const haltCalls = sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))
       expect(haltCalls).toHaveLength(0)
@@ -253,17 +202,17 @@ describe('trader-scheduler', () => {
 
     it('resets halt flag and re-alerts when reconciler recovers then halts again', async () => {
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r1' })
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
       expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(1)
 
       sendMock.mockClear()
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: false })
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
       expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(0)
 
       sendMock.mockClear()
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r2' })
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
       expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(1)
     })
 
@@ -276,7 +225,7 @@ describe('trader-scheduler', () => {
         halt_reason: 'NVDA: broker shows qty=10 but local has no record',
       })
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.reconcilerHalted).toBe(false)
       expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('NVDA')
       expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
@@ -292,7 +241,7 @@ describe('trader-scheduler', () => {
         halt_reason: 'EEM: notional mismatch local=$6363.41 broker=$6402.35 diff=$38.94 threshold=$31.82',
       })
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.reconcilerHalted).toBe(false)
       expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('EEM')
       expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
@@ -308,13 +257,13 @@ describe('trader-scheduler', () => {
       engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
 
       // Tick 1: not yet confirmed -> alert, no heal.
-      const r1 = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const r1 = await runTraderTick({ db, getEngineClient, send})
       expect(r1.reconcilerHalted).toBe(true)
       expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
       expect(sendMock.mock.calls.some(c => String(c[0]).includes('held for review'))).toBe(true)
 
       // Tick 2: second consecutive halt confirms -> adopt + clear.
-      const r2 = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const r2 = await runTraderTick({ db, getEngineClient, send})
       expect(r2.reconcilerHalted).toBe(false)
       expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('AAPL')
       expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
@@ -330,9 +279,9 @@ describe('trader-scheduler', () => {
       engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({})
       engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
+      await runTraderTick({ db, getEngineClient, send})
+      await runTraderTick({ db, getEngineClient, send})
       expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
       expect(engineClient.clearReconcilerHalt).not.toHaveBeenCalled()
     })
@@ -344,7 +293,7 @@ describe('trader-scheduler', () => {
         { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
       ])
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
     })
@@ -369,7 +318,7 @@ describe('trader-scheduler', () => {
           filled_qty: 1, filled_avg_price: 110, source: 't', created_at: 5000, updated_at: 5000 },
       ])
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.closedOut).toBe(1)
 
       const verdict = db.prepare('SELECT pnl_gross FROM trader_verdicts WHERE decision_id=?').get('dec-c') as any
@@ -391,7 +340,7 @@ describe('trader-scheduler', () => {
         VALUES ('dec-x', 'sig-poll', 'buy', 'AAPL', 100, 'limit', 't', 0.7, NULL, 1000, 'executed')
       `).run()
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)
       expect(result.sent).toBe(1)
       expect(result.closedOut).toBe(0)
@@ -446,7 +395,7 @@ describe('trader-scheduler', () => {
       // 4 abstains in the past 24h, no prior alert row.
       for (let i = 0; i < 4; i++) insertAbstain(db, i)
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result).toBeDefined()
 
       // The abstain digest must have been sent via the plain-text channel.
@@ -471,7 +420,7 @@ describe('trader-scheduler', () => {
         VALUES ('sharpe_last_sign:momentum-stocks', 1)
       `).run()
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       const flipCalls = sendMock.mock.calls.filter(
         (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('Sharpe flip'),
@@ -493,7 +442,7 @@ describe('trader-scheduler', () => {
         coinbase_connected: false,
       })
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       const coinbaseCalls = sendMock.mock.calls.filter(
         (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('Coinbase connection down'),
@@ -517,7 +466,7 @@ describe('trader-scheduler', () => {
       const haltMock = vi.fn().mockResolvedValue({ status: 'halted' })
       ;(engineClient as any).haltEngine = haltMock
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       // The Telegram alert and the engine halt call BOTH happen.
       const navCalls = sendMock.mock.calls.filter(
@@ -564,7 +513,7 @@ describe('trader-scheduler', () => {
       ])
       ;(engineClient as any).haltEngine = vi.fn().mockResolvedValue({ status: 'halted' })
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       // Abstain, sharpe, and NAV-drop alerts must all have fired even
       // though the Coinbase check threw.
@@ -606,7 +555,7 @@ describe('trader-scheduler', () => {
       ;(engineClient as any).getNavSnapshots = getNavSpy
       ;(engineClient as any).haltEngine = haltSpy
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       // Abstain + sharpe must have fired via deps.send.
       const messages = sendMock.mock.calls.map((c: unknown[]) => c[0] as string)
@@ -631,7 +580,7 @@ describe('trader-scheduler', () => {
       // Halt call throws.
       ;(engineClient as any).haltEngine = vi.fn().mockRejectedValue(new Error('engine 503'))
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       // Two sends: the original NAV drop alert + the halt-failure follow-up.
       const navCalls = sendMock.mock.calls.filter(
@@ -658,7 +607,7 @@ describe('trader-scheduler', () => {
       // Run 15 ticks (> drought threshold of 12); all outside market hours.
       // Each tick must reset the counter to 0 rather than increment it.
       for (let i = 0; i < 15; i++) {
-        await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+        await runTraderTick({ db, getEngineClient, send})
       }
 
       // Counter must be 0 -- overnight silence must not carry into the next session.
@@ -697,16 +646,15 @@ describe('trader-scheduler', () => {
         return []
       })
 
-      const firstPromise = runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const firstPromise = runTraderTick({ db, getEngineClient, send})
 
       // Yield so the first tick enters its phases before we fire the second.
       await new Promise((resolve) => setImmediate(resolve))
 
-      const secondResult = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const secondResult = await runTraderTick({ db, getEngineClient, send})
       expect(secondResult.skipped).toBe(true)
       expect(secondResult.polled).toBe(false)
       expect(secondResult.sent).toBe(0)
-      expect(secondResult.timedOut).toBe(0)
       expect(secondResult.reconcilerHalted).toBe(false)
       expect(secondResult.closedOut).toBe(0)
       expect(secondResult.weeklyReportFired).toBe(false)
@@ -716,7 +664,6 @@ describe('trader-scheduler', () => {
       // getSignals hang, so any Telegram activity here would have come
       // from the skipped second tick.
       expect(sendMock).not.toHaveBeenCalled()
-      expect(sendWithKeyboardMock).not.toHaveBeenCalled()
 
       // Let the first tick finish cleanly.
       releaseFirst()
@@ -726,11 +673,11 @@ describe('trader-scheduler', () => {
     })
 
     it('allows a subsequent tick once the first has resolved', async () => {
-      const first = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const first = await runTraderTick({ db, getEngineClient, send})
       expect(first.polled).toBe(true)
       expect(first.skipped).toBeFalsy()
 
-      const second = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const second = await runTraderTick({ db, getEngineClient, send})
       expect(second.polled).toBe(true)
       expect(second.skipped).toBeFalsy()
     })
@@ -749,14 +696,14 @@ describe('trader-scheduler', () => {
       vi.mocked(engineClient.getSignals!).mockRejectedValue(new Error('poll boom'))
       vi.mocked(engineClient.getHealth!).mockRejectedValue(new Error('health boom'))
 
-      const first = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const first = await runTraderTick({ db, getEngineClient, send})
       expect(first.skipped).toBeFalsy()
 
       // Restore a happy engine for the second tick.
       vi.mocked(engineClient.getSignals!).mockResolvedValue([])
       vi.mocked(engineClient.getHealth!).mockResolvedValue(healthOk)
 
-      const second = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const second = await runTraderTick({ db, getEngineClient, send})
       expect(second.skipped).toBeFalsy()
       expect(second.polled).toBe(true)
     })
@@ -773,10 +720,10 @@ describe('trader-scheduler', () => {
         return []
       })
 
-      const firstPromise = runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const firstPromise = runTraderTick({ db, getEngineClient, send})
       await new Promise((resolve) => setImmediate(resolve))
 
-      await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      await runTraderTick({ db, getEngineClient, send})
 
       const skipLog = infoSpy.mock.calls.find((args: unknown[]) => {
         const message = typeof args[0] === 'string' ? args[0] : args[1]
@@ -793,16 +740,16 @@ describe('trader-scheduler', () => {
   describe('initTraderScheduler', () => {
     it('runs an immediate tick on start', async () => {
       insertSignal(db, 'sig-1')
-      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
       await new Promise((resolve) => setTimeout(resolve, 10))
       expect(autoDispatchPendingSignals).toHaveBeenCalled()
     })
 
     it('does not start twice', async () => {
-      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
       const firstCount = getEngineClientMock.mock.calls.length
 
-      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
       await new Promise((resolve) => setTimeout(resolve, 10))
 
       // Each tick makes up to 9 getEngineClient() calls across its phases
@@ -817,7 +764,7 @@ describe('trader-scheduler', () => {
 
     it('stopTraderScheduler halts future ticks', async () => {
       vi.useFakeTimers()
-      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 1000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 1000 })
 
       // The initial tick fires synchronously at the end of
       // initTraderScheduler and its runTraderTick awaits ~5 engine-
@@ -854,7 +801,7 @@ describe('trader-scheduler', () => {
         (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, submit_attempts)
         VALUES ('d-down','s-ghost','buy','AAPL',150,'market','t',0.7,?, 'engine_down', 2)`).run(Date.now())
 
-      initTraderScheduler({ db, getEngineClient, send, sendWithKeyboard, tickMs: 60_000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
       stopTraderScheduler()
 
       const row = db.prepare("SELECT status FROM trader_decisions WHERE id='d-down'").get() as any
@@ -882,7 +829,7 @@ describe('trader-scheduler', () => {
       ])
       engineClient.submitDecision = submitDecision
 
-      const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+      const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.exited).toBe(1)
       expect(submitDecision.mock.calls.some((c: any[]) => c[0].side === 'sell')).toBe(true)
     })

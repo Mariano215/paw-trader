@@ -219,6 +219,12 @@ export async function maybeFireTraderDigest(args: {
       .prepare('SELECT id, text, created_at FROM trader_digest_buffer ORDER BY created_at ASC')
       .all() as BufferRow[]
 
+    // Nothing buffered = nothing worth a ping. Skip the "quiet stretch"
+    // message entirely; silence IS the all-clear.
+    if (rows.length === 0) {
+      return { fired: false, reason: 'buffer empty, skipping quiet digest', count: 0 }
+    }
+
     const summary = renderDigest(rows, nowMs)
     await args.send(summary)
 

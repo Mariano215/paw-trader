@@ -5,7 +5,6 @@ import {
   maskChatId,
   type BroadcastChannelManager,
 } from './operator-broadcast.js'
-import type { TraderApprovalKeyboard } from './approval-manager.js'
 
 /**
  * Unit tests for Phase 6 Task 6 -- multi-operator alert routing.
@@ -72,16 +71,10 @@ describe('maskChatId', () => {
 
 describe('makeOperatorSend', () => {
   let sendMock: ReturnType<typeof vi.fn>
-  let sendWithKeyboardMock: ReturnType<typeof vi.fn>
   let channelManager: BroadcastChannelManager
-
-  const keyboard: TraderApprovalKeyboard = {
-    inline_keyboard: [[{ text: 'APPROVE', callback_data: 'trader:approve:x' }]],
-  }
 
   beforeEach(() => {
     sendMock = vi.fn().mockResolvedValue(undefined)
-    sendWithKeyboardMock = vi.fn().mockResolvedValue(undefined)
     channelManager = {
       send: (channelId: string, chatId: string, text: string) =>
         (sendMock as unknown as (c: string, i: string, t: string) => Promise<void>)(
@@ -89,18 +82,6 @@ describe('makeOperatorSend', () => {
           chatId,
           text,
         ),
-      sendWithKeyboard: (
-        channelId: string,
-        chatId: string,
-        text: string,
-        kb: TraderApprovalKeyboard,
-      ) =>
-        (sendWithKeyboardMock as unknown as (
-          c: string,
-          i: string,
-          t: string,
-          k: TraderApprovalKeyboard,
-        ) => Promise<void>)(channelId, chatId, text, kb),
     }
   })
 
@@ -120,27 +101,6 @@ describe('makeOperatorSend', () => {
     expect(sendMock.mock.calls[2]).toEqual(['telegram:trader', '333', 'halt alert'])
   })
 
-  it('sendWithKeyboard fans out to every operator id in order', async () => {
-    const { sendWithKeyboard } = makeOperatorSend(channelManager, 'telegram:trader', [
-      '111',
-      '222',
-    ])
-    await sendWithKeyboard('approval card', keyboard)
-
-    expect(sendWithKeyboardMock).toHaveBeenCalledTimes(2)
-    expect(sendWithKeyboardMock.mock.calls[0]).toEqual([
-      'telegram:trader',
-      '111',
-      'approval card',
-      keyboard,
-    ])
-    expect(sendWithKeyboardMock.mock.calls[1]).toEqual([
-      'telegram:trader',
-      '222',
-      'approval card',
-      keyboard,
-    ])
-  })
 
   it('send continues to remaining operators when one fails', async () => {
     sendMock.mockImplementationOnce(() => Promise.resolve())
@@ -155,19 +115,6 @@ describe('makeOperatorSend', () => {
     expect(sendMock.mock.calls.map((c) => c[1])).toEqual(['111', '222', '333'])
   })
 
-  it('sendWithKeyboard continues to remaining operators when one fails', async () => {
-    sendWithKeyboardMock.mockRejectedValueOnce(new Error('telegram 500'))
-    sendWithKeyboardMock.mockResolvedValueOnce(undefined)
-
-    const { sendWithKeyboard } = makeOperatorSend(channelManager, 'telegram:trader', [
-      '111',
-      '222',
-    ])
-    await sendWithKeyboard('approval card', keyboard)
-
-    expect(sendWithKeyboardMock).toHaveBeenCalledTimes(2)
-    expect(sendWithKeyboardMock.mock.calls.map((c) => c[1])).toEqual(['111', '222'])
-  })
 
   it('send is serial -- each call awaits the previous before moving on', async () => {
     // Order-of-completion test: we resolve each send with a staggered delay
@@ -199,19 +146,12 @@ describe('makeOperatorSend', () => {
   })
 
   it('single-operator broadcast behaves identically to the legacy single-id send', async () => {
-    const { send, sendWithKeyboard } = makeOperatorSend(channelManager, 'telegram:trader', [
+    const { send } = makeOperatorSend(channelManager, 'telegram:trader', [
       '111111111',
     ])
     await send('halt alert')
-    await sendWithKeyboard('approval card', keyboard)
 
     expect(sendMock).toHaveBeenCalledWith('telegram:trader', '111111111', 'halt alert')
-    expect(sendWithKeyboardMock).toHaveBeenCalledWith(
-      'telegram:trader',
-      '111111111',
-      'approval card',
-      keyboard,
-    )
   })
 })
 

@@ -562,7 +562,7 @@ describe('renderReportHtml', () => {
     const report: WeeklyReport = {
       weekStartMs: 0, weekEndMs: 1, generatedAtMs: 2,
       verdictCount: 0, winCount: 0, lossCount: 0, breakEvenCount: 0,
-      winRate: 0, totalPnlNet: 0,
+      winRate: 0, totalPnlNet: 0, brokerTruth: null,
       bestTrades: [], worstTrades: [],
       strategyRollups: [{
         strategy_id: '<script>alert(1)</script>', trade_count: 1, win_count: 1,

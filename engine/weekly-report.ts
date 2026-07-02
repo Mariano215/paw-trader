@@ -129,6 +129,13 @@ export interface WeeklyReport {
   attribution: AttributionTally
   nav: NavDelta
   /**
+   * All-time realized + open P&L computed from ENGINE filled orders and
+   * positions (broker truth). Null when the engine was unreachable. The
+   * verdict-derived totalPnlNet above can diverge from broker truth
+   * (2026-06-29 adopted-close batch); this is the authoritative number.
+   */
+  brokerTruth: { realizedTotal: number; openUnrealized: number; roundTrips: number } | null
+  /**
    * Open-position accounting at report time: count, summed cost basis, and
    * unrealized MTM from the live engine positions. Distinct from `nav`
    * (account equity) and from realized P&L (closed verdicts). `mtmAvailable`
@@ -502,6 +509,16 @@ export async function buildReport(
   const strategyRollups = safeListTrackRecords(db)
   const attribution = tallyAttribution(verdicts)
   const nav = await fetchNavDelta(engineClient, weekStartMs, weekEndMs)
+  let brokerTruth: WeeklyReport['brokerTruth'] = null
+  if (engineClient) {
+    try {
+      const { computeBrokerTruth } = await import('./go-live-gate.js')
+      const t = await computeBrokerTruth(engineClient)
+      brokerTruth = { realizedTotal: t.realizedTotal, openUnrealized: t.openUnrealized, roundTrips: t.roundTrips }
+    } catch {
+      // Engine unreachable: renderer shows "unavailable" instead of a fake $0.
+    }
+  }
   const { summary: openPositions, mtmAvailable: openMtmAvailable } =
     await buildOpenPositionsSection(db, engineClient)
   const killSwitchEvents = buildKillSwitchEvents(opts.killSwitch ?? null, weekStartMs, weekEndMs)
@@ -523,6 +540,7 @@ export async function buildReport(
     gradeBreakdown,
     attribution,
     nav,
+    brokerTruth,
     openPositions,
     openMtmAvailable,
     killSwitchEvents,
@@ -751,7 +769,10 @@ function renderMoneySummary(report: WeeklyReport): string {
   const navDelta = report.nav.available
     ? `<tr><th>Account equity change (NAV delta, includes cash/interest)</th><td class="${pnlClass(report.nav.deltaUsd ?? 0)}">${formatUsd(report.nav.deltaUsd)}</td></tr>`
     : `<tr><th>Account equity change (NAV delta)</th><td>unavailable</td></tr>`
-  return `<table>${realized}${unrealized}${navDelta}</table>
+  const brokerTruth = report.brokerTruth
+    ? `<tr><th>Broker truth, all time (realized on ${report.brokerTruth.roundTrips} closed round-trips + open MTM)</th><td class="${pnlClass(report.brokerTruth.realizedTotal + report.brokerTruth.openUnrealized)}">${formatUsd(report.brokerTruth.realizedTotal)} realized, ${formatUsd(report.brokerTruth.openUnrealized)} open</td></tr>`
+    : `<tr><th>Broker truth, all time</th><td>unavailable (engine unreachable)</td></tr>`
+  return `<table>${realized}${unrealized}${navDelta}${brokerTruth}</table>
     <div class="muted">Realized = closed trades only; net of fees when fill data is available. Unrealized = open-position mark-to-market. NAV delta is account drift (cash + interest + MTM), not strategy performance.</div>`
 }
 

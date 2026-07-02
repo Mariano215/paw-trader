@@ -1,4 +1,3 @@
-import type { TraderApprovalKeyboard } from './approval-manager.js'
 import { logger } from '../logger.js'
 
 /**
@@ -8,19 +7,11 @@ import { logger } from '../logger.js'
  */
 export interface BroadcastChannelManager {
   send(channelId: string, chatId: string, text: string): Promise<void>
-  sendWithKeyboard(
-    channelId: string,
-    chatId: string,
-    text: string,
-    keyboard: TraderApprovalKeyboard,
-  ): Promise<void>
 }
 
 export interface OperatorSendFns {
-  /** Plain-text broadcast (engine halts, alerts, timeout notices). */
+  /** Plain-text broadcast (engine halts, alerts, digests, reports). */
   send: (text: string) => Promise<void>
-  /** Approval card broadcast with inline keyboard. */
-  sendWithKeyboard: (text: string, keyboard: TraderApprovalKeyboard) => Promise<void>
 }
 
 /**
@@ -85,21 +76,5 @@ export function makeOperatorSend(
     }
   }
 
-  const sendWithKeyboard = async (
-    text: string,
-    keyboard: TraderApprovalKeyboard,
-  ): Promise<void> => {
-    for (const chatId of operatorIds) {
-      try {
-        await channelManager.sendWithKeyboard(channelId, chatId, text, keyboard)
-      } catch (err) {
-        logger.warn(
-          { err, channelId, chatId: maskChatId(chatId) },
-          'Trader operator approval broadcast failed for one recipient, continuing',
-        )
-      }
-    }
-  }
-
-  return { send, sendWithKeyboard }
+  return { send }
 }

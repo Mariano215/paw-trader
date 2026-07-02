@@ -32,7 +32,6 @@ import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import { runTraderTick, _resetHaltAlertForTest } from './trader-scheduler.js'
 import type { EngineClient } from './engine-client.js'
-import type { TraderApprovalKeyboard } from './approval-manager.js'
 import type { EngineOrder } from './types.js'
 import * as killSwitch from '../cost/kill-switch-client.js'
 
@@ -58,6 +57,9 @@ function makeDb() {
   `).run()
   db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
     .run('trader.lastWeeklyReport', String(Date.now()))
+  // Same for the weekly go-live gate run, exercised in its own test file.
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last_run_ms', String(Date.now()))
   return db
 }
 
@@ -125,12 +127,7 @@ function makeGatedSends() {
     if (sw) return
     await networkSend(text)
   }
-  const sendWithKeyboard = async (text: string, keyboard: TraderApprovalKeyboard): Promise<void> => {
-    const sw = await killSwitch.checkKillSwitch()
-    if (sw) return
-    await networkSendWithKeyboard(text, keyboard)
-  }
-  return { send, sendWithKeyboard, networkSend, networkSendWithKeyboard }
+  return { send, networkSend, networkSendWithKeyboard }
 }
 
 describe('runTraderTick + kill switch', () => {
@@ -180,8 +177,8 @@ describe('runTraderTick + kill switch', () => {
       },
     ])
 
-    const { send, sendWithKeyboard } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send} = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.polled).toBe(true)
     const stored = db.prepare("SELECT id FROM trader_signals WHERE id = 'sig-ks-poll'").get() as any
@@ -203,8 +200,8 @@ describe('runTraderTick + kill switch', () => {
       fillOrder({ side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ])
 
-    const { send, sendWithKeyboard } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send} = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.closedOut).toBe(1)
     const verdict = db.prepare(
@@ -230,41 +227,14 @@ describe('runTraderTick + kill switch', () => {
     // should try to fire a card.
     insertSignal(db, 'sig-ks-card', 0.9)
 
-    const { send, sendWithKeyboard, networkSend, networkSendWithKeyboard } = makeGatedSends()
-    await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send, networkSend, networkSendWithKeyboard } = makeGatedSends()
+    await runTraderTick({ db, getEngineClient, send})
 
     // The downstream network send must not have fired.
     expect(networkSendWithKeyboard).not.toHaveBeenCalled()
     expect(networkSend).not.toHaveBeenCalled()
   })
 
-  it('switch TRIPPED: timeout expiry notice send is blocked downstream', async () => {
-    vi.spyOn(killSwitch, 'checkKillSwitch').mockResolvedValue({
-      set_at: Date.now(),
-      reason: 'maintenance',
-    })
-
-    // Seed a signal + stale approval row so the timeout sweep fires.
-    const thirtyOneMinAgo = Date.now() - 31 * 60 * 1000
-    db.prepare(`
-      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
-      VALUES ('sig-ks-timeout', 'momentum-stocks', 'NVDA', 'buy', 0.73, 20, ?, 'pending')
-    `).run(Date.now())
-    db.prepare(
-      'INSERT INTO trader_approvals (id, decision_id, sent_at) VALUES (?, ?, ?)',
-    ).run('ap-ks-timeout', 'sig-ks-timeout', thirtyOneMinAgo)
-
-    const { send, sendWithKeyboard, networkSend } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
-
-    // DB transition still happens (timeout sweep runs before send).
-    expect(result.timedOut).toBe(1)
-    const row = db.prepare("SELECT response FROM trader_approvals WHERE id = 'ap-ks-timeout'").get() as any
-    expect(row.response).toBe('timeout')
-
-    // But the operator notice never hits the network.
-    expect(networkSend).not.toHaveBeenCalled()
-  })
 
   it('switch TRIPPED: engine halt alert send is blocked downstream', async () => {
     vi.spyOn(killSwitch, 'checkKillSwitch').mockResolvedValue({
@@ -278,8 +248,8 @@ describe('runTraderTick + kill switch', () => {
       halt_reason: 'daily_loss_limit',
     })
 
-    const { send, sendWithKeyboard, networkSend } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send, networkSend } = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.reconcilerHalted).toBe(true)
     // Halt alert does not reach Telegram under the switch.
@@ -299,8 +269,8 @@ describe('runTraderTick + kill switch', () => {
       { action: 'executed', signalId: 'sig-clear-card', asset: 'AAPL', side: 'buy', reason: 'committee approved' },
     ])
 
-    const { send, sendWithKeyboard, networkSend, networkSendWithKeyboard } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send, networkSend, networkSendWithKeyboard } = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.sent).toBe(1)
     expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
@@ -317,8 +287,8 @@ describe('runTraderTick + kill switch', () => {
       halt_reason: 'daily_loss_limit',
     })
 
-    const { send, sendWithKeyboard, networkSend } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send, networkSend } = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.reconcilerHalted).toBe(true)
     expect(networkSend).toHaveBeenCalledTimes(1)
@@ -343,8 +313,8 @@ describe('runTraderTick + kill switch', () => {
       { action: 'executed', signalId: 'sig-clear-e2e', asset: 'AAPL', side: 'buy', reason: 'committee approved' },
     ])
 
-    const { send, sendWithKeyboard } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send, sendWithKeyboard })
+    const { send} = makeGatedSends()
+    const result = await runTraderTick({ db, getEngineClient, send})
 
     expect(result.polled).toBe(true)
     expect(result.closedOut).toBe(1)

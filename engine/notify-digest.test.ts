@@ -92,4 +92,15 @@ describe('makeDigestingSend + maybeFireTraderDigest', () => {
     const r2 = await maybeFireTraderDigest({ db, send: async () => {}, nowMs: slot + 1000 })
     expect(r2.fired).toBe(false)
   })
+
+  it('skips the send entirely when the buffer is empty', async () => {
+    const raw: string[] = []
+    const slot = new Date(2026, 5, 30, 20, 0).getTime()
+    const r = await maybeFireTraderDigest({ db, send: async (t) => { raw.push(t) }, nowMs: slot })
+    expect(r.fired).toBe(false)
+    expect(r.count).toBe(0)
+    expect(raw).toEqual([])
+    // the slot is still consumed so the tick loop does not re-check all hour
+    expect(readLastDigestMs(db)).toBe(slot)
+  })
 })

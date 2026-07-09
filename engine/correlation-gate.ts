@@ -60,6 +60,15 @@ export const CLUSTER_MAP: Record<string, string> = {
  *  50% keeps a real concentration guard while letting trades flow. */
 export const DEFAULT_CLUSTER_CAP_PCT = 0.50
 
+/** Default gross exposure cap per SYMBOL as a fraction of NAV. Tighter than
+ *  the cluster cap on purpose: a cluster can hold several tickers so 50% NAV
+ *  spread across them is fine, but a singleton symbol (e.g. EEM, the only
+ *  member of 'intl-equity' in most books) could otherwise absorb the whole
+ *  cluster cap alone via repeated same-symbol signals, since nothing else
+ *  checked for an existing position before sizing a new one. Added 2026-07-09
+ *  after a 100%-EEM concentration incident. */
+export const DEFAULT_SYMBOL_CAP_PCT = 0.15
+
 export function clusterFor(asset: string): string {
   return CLUSTER_MAP[asset.toUpperCase()] ?? asset.toUpperCase()
 }
@@ -82,46 +91,72 @@ export interface ClusterGateResult {
   reason: string
 }
 
+/** Shared gross-exposure math: given current exposure in some grouping
+ *  (cluster or single symbol) and a proposed additional size, checks against
+ *  NAV * capPct. NAV unavailable (null/<=0) -> no-op pass (we do not block
+ *  trades on a missing NAV; the per-strategy cap and engine rails still
+ *  apply). */
+function evaluateExposureCap(
+  groupLabel: string,
+  currentExposureUsd: number,
+  proposedSizeUsd: number,
+  nav: number | null,
+  capPct: number,
+  groupKind: string,
+): ClusterGateResult {
+  if (nav == null || nav <= 0) {
+    return {
+      allowed: true,
+      cluster: groupLabel,
+      currentExposureUsd,
+      capUsd: Infinity,
+      allowedSizeUsd: proposedSizeUsd,
+      reason: `NAV unavailable; ${groupKind} gate skipped`,
+    }
+  }
+
+  const capUsd = nav * capPct
+  const headroom = Math.max(0, capUsd - currentExposureUsd)
+  const allowed = proposedSizeUsd <= headroom
+
+  return {
+    allowed,
+    cluster: groupLabel,
+    currentExposureUsd,
+    capUsd,
+    allowedSizeUsd: Math.min(proposedSizeUsd, headroom),
+    reason: allowed
+      ? `${groupKind} ${groupLabel} exposure ${currentExposureUsd.toFixed(0)} + ${proposedSizeUsd.toFixed(0)} <= cap ${capUsd.toFixed(0)}`
+      : `${groupKind} ${groupLabel} would breach cap: current ${currentExposureUsd.toFixed(0)} + proposed ${proposedSizeUsd.toFixed(0)} > cap ${capUsd.toFixed(0)} (headroom ${headroom.toFixed(0)})`,
+  }
+}
+
 /**
  * Deterministic gross-exposure gate. Sums |market_value| of open positions in
  * the same cluster as the proposed asset and checks proposed + current against
  * the cluster cap (NAV * capPct). Buy-side only book, but we use abs
  * market_value so the math is side-agnostic.
- *
- * NAV unavailable (null/<=0) -> gate is a no-op pass (we do not block trades
- * on a missing NAV; the per-strategy cap and engine rails still apply).
  */
 export function evaluateClusterGate(input: ClusterGateInput): ClusterGateResult {
   const cluster = clusterFor(input.asset)
   const capPct = input.capPct ?? DEFAULT_CLUSTER_CAP_PCT
-
   const currentExposureUsd = input.positions
     .filter((p) => clusterFor(p.asset) === cluster)
     .reduce((sum, p) => sum + Math.abs(p.market_value), 0)
+  return evaluateExposureCap(cluster, currentExposureUsd, input.proposedSizeUsd, input.nav, capPct, 'cluster')
+}
 
-  if (input.nav == null || input.nav <= 0) {
-    return {
-      allowed: true,
-      cluster,
-      currentExposureUsd,
-      capUsd: Infinity,
-      allowedSizeUsd: input.proposedSizeUsd,
-      reason: 'NAV unavailable; cluster gate skipped',
-    }
-  }
-
-  const capUsd = input.nav * capPct
-  const headroom = Math.max(0, capUsd - currentExposureUsd)
-  const allowed = input.proposedSizeUsd <= headroom
-
-  return {
-    allowed,
-    cluster,
-    currentExposureUsd,
-    capUsd,
-    allowedSizeUsd: Math.min(input.proposedSizeUsd, headroom),
-    reason: allowed
-      ? `cluster ${cluster} exposure ${currentExposureUsd.toFixed(0)} + ${input.proposedSizeUsd.toFixed(0)} <= cap ${capUsd.toFixed(0)}`
-      : `cluster ${cluster} would breach cap: current ${currentExposureUsd.toFixed(0)} + proposed ${input.proposedSizeUsd.toFixed(0)} > cap ${capUsd.toFixed(0)} (headroom ${headroom.toFixed(0)})`,
-  }
+/**
+ * Deterministic gross-exposure gate scoped to a single symbol, not its whole
+ * cluster. Prevents one ticker from repeatedly absorbing signals (each sized
+ * under the cluster cap individually) until it alone accounts for most of the
+ * cluster's -- or the book's -- exposure. See DEFAULT_SYMBOL_CAP_PCT.
+ */
+export function evaluateSymbolGate(input: ClusterGateInput): ClusterGateResult {
+  const symbol = input.asset.toUpperCase()
+  const capPct = input.capPct ?? DEFAULT_SYMBOL_CAP_PCT
+  const currentExposureUsd = input.positions
+    .filter((p) => p.asset.toUpperCase() === symbol)
+    .reduce((sum, p) => sum + Math.abs(p.market_value), 0)
+  return evaluateExposureCap(symbol, currentExposureUsd, input.proposedSizeUsd, input.nav, capPct, 'symbol')
 }

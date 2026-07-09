@@ -390,7 +390,7 @@ export async function dispatchApproval(
     // headroom <= 0 (cluster already at or over cap).
     let finalSizeUsd = sizeUsd
     {
-      const { evaluateClusterGate } = await import('./correlation-gate.js')
+      const { evaluateClusterGate, evaluateSymbolGate } = await import('./correlation-gate.js')
       const clusterGate = evaluateClusterGate({
         asset: signal.asset,
         proposedSizeUsd: sizeUsd,
@@ -408,6 +408,28 @@ export async function dispatchApproval(
         logger.info(
           { signalId: signal.id, original: sizeUsd, trimmed: finalSizeUsd, cluster: clusterGate.cluster },
           'cluster cap: trimmed order to headroom',
+        )
+      }
+
+      // Per-symbol gate, tighter than the cluster gate -- stops one ticker
+      // (e.g. a singleton-cluster symbol) from repeatedly absorbing signals
+      // until it alone accounts for most of the book's exposure.
+      const symbolGate = evaluateSymbolGate({
+        asset: signal.asset,
+        proposedSizeUsd: finalSizeUsd,
+        positions: manualSizePositions,
+        nav: manualNavForSize,
+      })
+      if (!symbolGate.allowed) {
+        if (symbolGate.allowedSizeUsd <= 0) {
+          db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cap' WHERE id = ?").run(signal.id)
+          recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cap', now)
+          return `Trade blocked: ${symbolGate.reason}. No order placed.`
+        }
+        finalSizeUsd = Math.round(symbolGate.allowedSizeUsd * 100) / 100
+        logger.info(
+          { signalId: signal.id, trimmed: finalSizeUsd, symbol: symbolGate.cluster },
+          'symbol cap: trimmed order to headroom',
         )
       }
     }
@@ -716,7 +738,7 @@ export async function autoDispatchPendingSignals(
       // Product decision: TRIM to headroom rather than block. Suppress only when
       // headroom <= 0 (cluster already at or over cap).
       {
-        const { evaluateClusterGate } = await import('./correlation-gate.js')
+        const { evaluateClusterGate, evaluateSymbolGate } = await import('./correlation-gate.js')
         const clusterGate = evaluateClusterGate({
           asset: signal.asset,
           proposedSizeUsd: sizeUsd,
@@ -738,6 +760,33 @@ export async function autoDispatchPendingSignals(
           logger.info(
             { event: 'trader.gate.cluster_trim', signalId: signal.id, cluster: clusterGate.cluster, original: sizeUsd, trimmed },
             'cluster cap: trimmed order to headroom',
+          )
+          sizeUsd = trimmed
+        }
+
+        // Per-symbol gate, tighter than the cluster gate -- stops one ticker
+        // (e.g. a singleton-cluster symbol) from repeatedly absorbing signals
+        // until it alone accounts for most of the book's exposure.
+        const symbolGate = evaluateSymbolGate({
+          asset: signal.asset,
+          proposedSizeUsd: sizeUsd,
+          positions: autoSizePositions,
+          nav: autoNavForSize,
+        })
+        if (!symbolGate.allowed) {
+          if (symbolGate.allowedSizeUsd <= 0) {
+            logger.warn(
+              { event: 'trader.gate.symbol_block', signalId: signal.id, symbol: symbolGate.cluster, current: symbolGate.currentExposureUsd, cap: symbolGate.capUsd, proposed: sizeUsd },
+              'symbol exposure cap reached, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cap' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cap', Date.now())
+            continue
+          }
+          const trimmed = Math.round(symbolGate.allowedSizeUsd * 100) / 100
+          logger.info(
+            { event: 'trader.gate.symbol_trim', signalId: signal.id, symbol: symbolGate.cluster, original: sizeUsd, trimmed },
+            'symbol cap: trimmed order to headroom',
           )
           sizeUsd = trimmed
         }

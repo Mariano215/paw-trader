@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { evaluateClusterGate, clusterFor, DEFAULT_CLUSTER_CAP_PCT } from './correlation-gate.js'
+import { evaluateClusterGate, evaluateSymbolGate, clusterFor, DEFAULT_CLUSTER_CAP_PCT, DEFAULT_SYMBOL_CAP_PCT } from './correlation-gate.js'
 import type { EnginePosition } from './types.js'
 
 function pos(asset: string, mv: number): EnginePosition {
@@ -120,5 +120,44 @@ describe('correlation cluster gate', () => {
     })
     expect(exceeds.allowed).toBe(false)
     expect(exceeds.allowedSizeUsd).toBe(500)
+  })
+})
+
+describe('per-symbol exposure gate', () => {
+  it('blocks a singleton-cluster symbol from absorbing the whole cluster cap alone', () => {
+    // Regression: EEM is the only member of 'intl-equity' in most books, so
+    // the cluster gate alone let it consume up to 50% NAV via repeated
+    // same-symbol buys. The symbol gate must catch this even when the
+    // cluster gate would allow it.
+    const r = evaluateSymbolGate({
+      asset: 'EEM',
+      proposedSizeUsd: 500,
+      positions: [pos('EEM', 1400)],
+      nav: 10000, // default symbol cap 0.15 -> capUsd=1500, headroom=100
+    })
+    expect(r.allowed).toBe(false)
+    expect(r.allowedSizeUsd).toBe(100)
+    expect(r.cluster).toBe('EEM')
+  })
+
+  it('does not count other symbols in the same cluster toward the symbol cap', () => {
+    const r = evaluateSymbolGate({
+      asset: 'EEM',
+      proposedSizeUsd: 500,
+      positions: [pos('VEA', 4000)], // same cluster, different symbol
+      nav: 10000,
+    })
+    expect(r.allowed).toBe(true)
+    expect(r.currentExposureUsd).toBe(0)
+  })
+
+  it('uses DEFAULT_SYMBOL_CAP_PCT (0.15) when capPct is omitted', () => {
+    expect(DEFAULT_SYMBOL_CAP_PCT).toBe(0.15)
+  })
+
+  it('is a no-op pass when NAV is unavailable', () => {
+    const r = evaluateSymbolGate({ asset: 'EEM', proposedSizeUsd: 5000, positions: [pos('EEM', 9999)], nav: null })
+    expect(r.allowed).toBe(true)
+    expect(r.allowedSizeUsd).toBe(5000)
   })
 })

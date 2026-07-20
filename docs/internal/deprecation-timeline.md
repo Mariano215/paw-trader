@@ -81,17 +81,17 @@ After the Phase 5 removal both repos return zero matches:
 
 ```bash
 # Brain: confirm no PHASE1_ references remain
-grep -rn "PHASE1_" /Volumes/T7/Projects/ClaudePaw/src
+grep -rn "PHASE1_" <claudepaw>/src
 # Expected: zero matches
 
 # Engine: confirm no PHASE1_ references remain
-grep -rn "PHASE1_" /Volumes/T7/Projects/Tech/trader-engine/src \
-  /Volumes/T7/Projects/Tech/trader-engine/tests
+grep -rn "PHASE1_" <trader-engine>/src \
+  <trader-engine>/tests
 # Expected: zero matches
 
 # Run full test suites
-cd /Volumes/T7/Projects/ClaudePaw && npm test
-cd /Volumes/T7/Projects/Tech/trader-engine && pytest
+cd <claudepaw> && npm test
+cd <trader-engine> && pytest
 ```
 
 ## Timeline summary
@@ -107,7 +107,7 @@ cd /Volumes/T7/Projects/Tech/trader-engine && pytest
 
 - `src/trader/approval-manager.ts` -- canonical brain-side constants (`DEFAULT_SIZE_USD`, `BIGGER_SIZE_USD`)
 - `src/trader/approval-sender.ts` -- `TIER1_TRADE_COUNT_TARGET` (renamed module-internal const)
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/risk/position_sizer.py` -- canonical engine-side constant (`DEFAULT_SIZE_USD`)
+- `<trader-engine>/src/trader_engine/risk/position_sizer.py` -- canonical engine-side constant (`DEFAULT_SIZE_USD`)
 - `src/trader/approval-manager.test.ts` -- migrated to canonical names
 - `src/trader/telegram-reply-handler.test.ts` -- migrated to canonical names
-- `/Volumes/T7/Projects/Tech/trader-engine/tests/test_position_sizer.py` -- alias-equality test removed
+- `<trader-engine>/tests/test_position_sizer.py` -- alias-equality test removed

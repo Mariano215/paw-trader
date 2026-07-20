@@ -130,6 +130,6 @@ journalctl -u trader-engine --since "today" | grep "volatility.insufficient_data
 
 ## Related source files
 
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/signals/volatility.py` -- EWMA implementation
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/api/routes/volatility.py` -- FastAPI endpoint
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/signals/regime.py` -- regime classifier that uses `spy_20d_vol` (same annualisation convention)
+- `<trader-engine>/src/trader_engine/signals/volatility.py` -- EWMA implementation
+- `<trader-engine>/src/trader_engine/api/routes/volatility.py` -- FastAPI endpoint
+- `<trader-engine>/src/trader_engine/signals/regime.py` -- regime classifier that uses `spy_20d_vol` (same annualisation convention)

@@ -349,7 +349,7 @@ but it will silently stop recording until cleared.
 
 ## Related source files
 
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/signals/regime.py` -- classifier, feature computation, model cache, shadow log wire-in
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/signals/regime_predictions_log.py` -- shadow log module (`init_log`, `append_prediction`, `read_recent`)
-- `/Volumes/T7/Projects/Tech/trader-engine/scripts/train_regime.py` -- walk-forward training script
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/signals/volatility.py` -- EWMA vol (used to compute `spy_20d_vol` feature)
+- `<trader-engine>/src/trader_engine/signals/regime.py` -- classifier, feature computation, model cache, shadow log wire-in
+- `<trader-engine>/src/trader_engine/signals/regime_predictions_log.py` -- shadow log module (`init_log`, `append_prediction`, `read_recent`)
+- `<trader-engine>/scripts/train_regime.py` -- walk-forward training script
+- `<trader-engine>/src/trader_engine/signals/volatility.py` -- EWMA vol (used to compute `spy_20d_vol` feature)

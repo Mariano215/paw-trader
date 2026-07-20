@@ -7,7 +7,7 @@
  * locally that never reach the server copy.
  *
  * Runs IN the bot process on purpose: the bot's launchd context already has
- * disk access to /Volumes/T7 and SSH access to the server, so it sidesteps the
+ * disk access to <volume> and SSH access to the server, so it sidesteps the
  * TCC block that hits launchd+bash jobs reading the external volume directly.
  * No LLM -- this is a pure shell-out to scripts/sync-trader-db.sh (upsert), the
  * same script `npm run sync:trader-db` runs.

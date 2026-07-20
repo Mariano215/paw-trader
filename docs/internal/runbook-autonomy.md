@@ -73,7 +73,7 @@ Reverting to the true computed value: run `recomputeAllTrackRecords()` from a
 maintenance script or call the track-record module directly:
 
 ```bash
-cd /Volumes/T7/Projects/ClaudePaw
+cd <claudepaw>
 node -e "
 const db = require('better-sqlite3')('./store/claudepaw.db');
 const { recomputeAllTrackRecords } = require('./dist/trader/track-record.js');
@@ -130,4 +130,4 @@ card including current tier and scale.
 - `src/trader/autonomy-ladder.ts` -- tier logic and constants (`COLD_START_TRADES`, thresholds)
 - `src/trader/decision-dispatcher.ts` -- applies the ladder at dispatch time
 - `src/trader/track-record.ts` -- materialises `trader_strategy_track_record`
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/risk/position_sizer.py` -- engine-side cold-start rule (must stay in sync with brain constants)
+- `<trader-engine>/src/trader_engine/risk/position_sizer.py` -- engine-side cold-start rule (must stay in sync with brain constants)

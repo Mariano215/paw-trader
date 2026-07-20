@@ -110,7 +110,7 @@ the comparison:
 Two places to set it:
 
 - **Bot host (MacBook Pro)**: edit launchd plist env or `~/.zshrc`,
-  then `npm run restart` from `/Volumes/T7/Projects/ClaudePaw`.
+  then `npm run restart` from `<claudepaw>`.
 - **Engine host**: edit `/etc/trader-engine.env`,
   `systemctl restart trader-engine`.
 
@@ -123,7 +123,7 @@ logs a warning.
 **Replay the check in isolation**:
 
 ```bash
-cd /Volumes/T7/Projects/ClaudePaw
+cd <claudepaw>
 node -e "
 const Database = require('better-sqlite3');
 const { evaluateAndRecordNavDrop } = require('./dist/trader/monitor.js');
@@ -142,7 +142,7 @@ A healthy system prints `{"fire": false, "halt": false}`.
 **Inspect the dedup row**:
 
 ```bash
-sqlite3 /Volumes/T7/Projects/ClaudePaw/store/claudepaw.db \
+sqlite3 <claudepaw>/store/claudepaw.db \
   "SELECT alert_id, last_alerted_at, datetime(last_alerted_at/1000, 'unixepoch') AS iso_time FROM trader_alert_state WHERE alert_id='nav_drop_alert';"
 ```
 
@@ -154,5 +154,5 @@ halt.
 - `src/trader/monitor.ts` -- `evaluateAndRecordNavDrop`, `NAV_DROP_*` constants
 - `src/trader/trader-scheduler.ts` -- phase 6 wire-in, halt call, follow-up notice
 - `src/trader/engine-client.ts` -- `getNavSnapshots(limit)`, `haltEngine(reason)`
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/api/routes/risk.py` -- `/risk/halt`, `/risk/clear`, `/risk/clear-halt`
-- `/Volumes/T7/Projects/Tech/trader-engine/src/trader_engine/api/routes/nav.py` -- `/nav/snapshots`
+- `<trader-engine>/src/trader_engine/api/routes/risk.py` -- `/risk/halt`, `/risk/clear`, `/risk/clear-halt`
+- `<trader-engine>/src/trader_engine/api/routes/nav.py` -- `/nav/snapshots`

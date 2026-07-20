@@ -36,14 +36,14 @@ Pick whichever surface is handier. Both require a bot restart to pick up.
 
 1. Grab the operator's numeric chat id. They can send `/start` to
    `@userinfobot` on Telegram to look it up.
-2. Edit the bot's `.env` file at `/Volumes/T7/Projects/ClaudePaw/.env`:
+2. Edit the bot's `.env` file at `<claudepaw>/.env`:
 
    ```
    OPERATOR_CHAT_IDS=111111111,222222222,333333333
    ```
 
 3. Restart the bot with `npm run restart` from
-   `/Volumes/T7/Projects/ClaudePaw`.
+   `<claudepaw>`.
 4. Confirm the bot logged the new list:
 
    ```

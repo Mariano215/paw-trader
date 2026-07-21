@@ -279,6 +279,23 @@ describe("EngineClient", () => {
     expect((options as RequestInit).headers).toMatchObject({ 'X-Engine-Token': 'test-token' });
   });
 
+  // pingHealth is the watchdog's reachability signal. It must separate
+  // "the process answered" from "the socket never produced a response",
+  // which is the distinction getHealth's null collapses.
+  it("pingHealth is true whenever the engine answers, including 401 and 404", async () => {
+    const pingClient = new EngineClient({ baseUrl: 'http://localhost:8200', token: 'test-token' });
+    for (const status of [200, 401, 404, 500]) {
+      mockFetch.mockReturnValueOnce(mockResp({ detail: 'x' }, status));
+      await expect(pingClient.pingHealth()).resolves.toBe(true);
+    }
+  });
+
+  it("pingHealth is false when the fetch times out (wedged engine)", async () => {
+    mockFetch.mockImplementationOnce(() => Promise.reject(new Error('The operation was aborted due to timeout')));
+    const pingClient = new EngineClient({ baseUrl: 'http://localhost:8200', token: 'test-token' });
+    await expect(pingClient.pingHealth()).resolves.toBe(false);
+  });
+
   it("getHealth returns null on 404", async () => {
     mockFetch.mockReturnValueOnce(mockResp({ detail: 'not found' }, 404));
     const healthClient = new EngineClient({ baseUrl: 'http://localhost:8200', token: 'test-token' });

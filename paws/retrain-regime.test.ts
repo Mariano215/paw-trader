@@ -69,9 +69,11 @@ describe('trainRegimePawConfig', () => {
     expect(installIndex).toBeGreaterThan(bakIndex)
   })
 
-  it('act phase restarts the engine systemd service', () => {
+  it('act phase restarts the local engine launchd service', () => {
     const act = trainRegimePawConfig.phases.act
-    expect(act).toContain('sudo systemctl restart trader-engine')
+    expect(act).toContain('launchctl kickstart -k gui/$(id -u)/com.pawtrader.engine')
+    // the engine no longer runs under systemd on your-engine-host
+    expect(act).not.toContain('systemctl')
   })
 
   it('decide phase escalates regression to high severity', () => {

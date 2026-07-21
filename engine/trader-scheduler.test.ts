@@ -77,6 +77,7 @@ describe('trader-scheduler', () => {
     db = makeDb()
     sendMock = vi.fn().mockResolvedValue(undefined)
     engineClient = {
+      pingHealth: vi.fn().mockResolvedValue(true),
       getHealth: vi.fn().mockResolvedValue(healthOk),
       getSignals: vi.fn().mockResolvedValue([]),
       getPositions: vi.fn().mockResolvedValue([]),
@@ -97,6 +98,37 @@ describe('trader-scheduler', () => {
   })
 
   describe('runTraderTick', () => {
+    // A wedged engine holds the port in LISTEN but never answers. getHealth
+    // returns null for that AND for a 404, so the wedge used to look like a
+    // healthy tick and the auto-restart never fired (13h outage 2026-07-20).
+    // pingHealth is the unambiguous reachability signal.
+    describe('wedged engine (port open, nothing served)', () => {
+      // Wednesday 11:00 ET — inside equity market hours, which gates restart.
+      const duringMarketHours = new Date('2026-07-22T15:00:00Z')
+
+      it('restarts the engine when the health probe times out', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+        expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('Engine unreachable'))
+      })
+
+      it('does not restart while the engine still answers', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).not.toHaveBeenCalled()
+      })
+    })
+
     it('runs all phases successfully with no signals', async () => {
       const result = await runTraderTick({ db, getEngineClient, send})
       expect(result.polled).toBe(true)

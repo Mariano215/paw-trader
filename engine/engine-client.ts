@@ -116,6 +116,33 @@ export class EngineClient {
   }
 
   /**
+   * Reachability probe: true when the engine answered with ANY HTTP status
+   * (200, 401, 404 all count), false when the socket never produced a
+   * response inside the timeout.
+   *
+   * This exists because getHealth collapses "route 404s" and "fetch timed
+   * out" into the same null.  A wedged engine -- one whose event loop is
+   * blocked, so the port stays in LISTEN but nothing is ever served --
+   * therefore looked identical to a healthy tick, which reset the failure
+   * counter and meant the auto-restart never fired.  A 13h outage on
+   * 2026-07-20 went unrecovered for exactly that reason.
+   *
+   * Deliberately unauthenticated-safe: a 401 proves the process is alive
+   * and serving, which is all a watchdog needs to know.
+   */
+  async pingHealth(): Promise<boolean> {
+    try {
+      await fetch(this.baseUrl + "/health", {
+        headers: { "X-Engine-Token": this.token },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Phase 5 Task 2c -- returns the full health body (including
    * coinbase_connected) or null when the engine route 404s / the fetch
    * times out.  Mirrors the getNav pattern: null when the endpoint is

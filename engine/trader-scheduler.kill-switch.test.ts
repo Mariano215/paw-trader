@@ -138,6 +138,7 @@ describe('runTraderTick + kill switch', () => {
   beforeEach(() => {
     db = makeDb()
     engineClient = {
+      pingHealth: vi.fn().mockResolvedValue(true),
       getHealth: vi.fn().mockResolvedValue(healthOk),
       getSignals: vi.fn().mockResolvedValue([]),
       getPositions: vi.fn().mockResolvedValue([]),

@@ -282,6 +282,16 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   // network error; treat that as "unknown, do not toggle the halt alert".
   try {
     const client = deps.getEngineClient()
+    // Reachability first. getHealth returns null for BOTH "route 404s" and
+    // "fetch timed out", so a wedged engine (port in LISTEN, event loop
+    // blocked, nothing ever served) used to fall through to the success path
+    // below and reset the counter -- which is why the auto-restart never
+    // fired during the 13h wedge on 2026-07-20. Throwing here routes a wedge
+    // into the same catch block that a refused connection already uses.
+    const reachable = await client.pingHealth()
+    if (!reachable) {
+      throw new Error('Engine health probe timed out — process may be wedged')
+    }
     const health = await client.getHealth()
     // Engine reachable -- reset unreachable counter and send recovery notice if needed.
     if (_healthCheckConsecutiveFailures > 0) {
@@ -420,9 +430,9 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       isEquityMarketHours()
     ) {
       _engineRestartAttempted = true
-      logger.warn({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: attempting SSH restart')
+      logger.warn({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: attempting restart')
       deps.restartEngineAsync()
-      await deps.send(`TRADER: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} min. SSH restart issued — will confirm next tick.`)
+      await deps.send(`TRADER: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} min. Restart issued — will confirm next tick.`)
     }
     // The sustained-outage page is emitted by the persistent monitor check
     // (evaluateAndRecordEngineUnreachable in runMonitorPhase), not here --

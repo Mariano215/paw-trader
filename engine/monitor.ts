@@ -557,8 +557,9 @@ export async function evaluateAndRecordEngineUnreachable(
     fire: true,
     recovered: false,
     message:
-      `TRADER ALERT: Engine unreachable for ${mins}+ min. Win11 may be offline ` +
-      'or Tailscale disconnected. No signals, no exits, no reconciliation until it returns.',
+      `TRADER ALERT: Engine unreachable for ${mins}+ min. Engine process may be down or wedged ` +
+      '(check: launchctl kickstart -k gui/$(id -u)/com.pawtrader.engine). ' +
+      'No signals, no exits, no reconciliation until it returns.',
   }
 }
 

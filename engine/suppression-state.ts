@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 
-export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'portfolio_heat' | 'regime' | 'markov_gate'
+export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'symbol_cooldown' | 'portfolio_heat' | 'regime' | 'markov_gate'
 
 export interface SignalSuppressionSnapshot {
   signal_id: string

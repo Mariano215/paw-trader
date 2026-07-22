@@ -366,13 +366,13 @@ export async function dispatchApproval(
     }
     const sizeUsd = manualRiskSize.sizeUsd
 
-    let entryRef = 0
-    if (signal.enrichment_json) {
-      try {
-        const e = JSON.parse(signal.enrichment_json) as { price_current?: number | null }
-        if (typeof e.price_current === 'number' && e.price_current > 0) entryRef = e.price_current
-      } catch { /* malformed enrichment -> entryRef stays 0 */ }
-    }
+    // Falls back to the engine's latest close when enrichment carries no
+    // price. A 0 here means computeExits() returns null exits, i.e. a naked
+    // position -- that was 43% of the book before the fallback existed.
+    const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
+    const entryRef = await resolveEntryReferencePrice(
+      engineClient!, signal.asset, signal.enrichment_json, now,
+    )
     const exits = computeExits({
       side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
       entryPrice: entryRef,
@@ -409,6 +409,24 @@ export async function dispatchApproval(
           { signalId: signal.id, original: sizeUsd, trimmed: finalSizeUsd, cluster: clusterGate.cluster },
           'cluster cap: trimmed order to headroom',
         )
+      }
+
+      // Per-symbol re-entry gate -- see the auto-dispatch path for the
+      // full rationale. Same rules apply to an operator-approved signal.
+      {
+        const { evaluateSymbolCooldown } = await import('./symbol-cooldown.js')
+        const cooldown = evaluateSymbolCooldown({
+          db,
+          asset: signal.asset,
+          side: signal.side,
+          positions: manualSizePositions,
+          nowMs: now,
+        })
+        if (!cooldown.allowed) {
+          db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cooldown' WHERE id = ?").run(signal.id)
+          recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cooldown', now)
+          return `Trade blocked: ${cooldown.reason}. No order placed.`
+        }
       }
 
       // Per-symbol gate, tighter than the cluster gate -- stops one ticker
@@ -715,17 +733,16 @@ export async function autoDispatchPendingSignals(
       const decisionId = randomUUID()
       const now        = Date.now()
 
-      // Resolve an entry reference price from enrichment so the
-      // exit-calculator can size stop/target off it. entry_price stays
-      // 0 on the wire when unknown (engine resolves via market price),
-      // but exits need a concrete number; null entry -> null exits.
-      let entryRef = 0
-      if (signal.enrichment_json) {
-        try {
-          const e = JSON.parse(signal.enrichment_json) as { price_current?: number | null }
-          if (typeof e.price_current === 'number' && e.price_current > 0) entryRef = e.price_current
-        } catch { /* malformed enrichment -> entryRef stays 0 */ }
-      }
+      // Resolve an entry reference price so the exit-calculator can size
+      // stop/target off it. entry_price stays 0 on the wire when unknown
+      // (the engine resolves via market price), but exits need a concrete
+      // number: null entry -> null exits -> a position with no stop, which
+      // was 152 of 350 buys over the 60 days to 2026-07-22. Enrichment first,
+      // engine close as fallback.
+      const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
+      const entryRef = await resolveEntryReferencePrice(
+        engineClient, signal.asset, signal.enrichment_json, now,
+      )
       const exits = computeExits({
         side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
         entryPrice: entryRef,
@@ -762,6 +779,30 @@ export async function autoDispatchPendingSignals(
             'cluster cap: trimmed order to headroom',
           )
           sizeUsd = trimmed
+        }
+
+        // Per-symbol re-entry gate. Exposure caps are blind to outcome, so
+        // they let the book buy a symbol that just closed red (EEM, ten
+        // straight losers). Runs before the exposure gates: if the symbol is
+        // benched there is nothing to size.
+        {
+          const { evaluateSymbolCooldown } = await import('./symbol-cooldown.js')
+          const cooldown = evaluateSymbolCooldown({
+            db,
+            asset: signal.asset,
+            side: signal.side,
+            positions: autoSizePositions,
+            nowMs: Date.now(),
+          })
+          if (!cooldown.allowed) {
+            logger.warn(
+              { event: 'trader.gate.symbol_cooldown', signalId: signal.id, asset: signal.asset, rule: cooldown.rule, reason: cooldown.reason },
+              'symbol cooldown gate blocked entry',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cooldown' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cooldown', Date.now())
+            continue
+          }
         }
 
         // Per-symbol gate, tighter than the cluster gate -- stops one ticker

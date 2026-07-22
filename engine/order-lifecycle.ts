@@ -34,5 +34,16 @@ export function isTerminalSubmitError(err: unknown): boolean {
   const m = msg.match(/Engine API error (\d{3})/)
   if (!m) return false // no status code => network/timeout/abort => transient
   const status = Number(m[1])
-  return status >= 400 && status < 500
+  if (status < 400 || status >= 500) return false
+
+  // Not every 4xx is permanent. The engine returns 422 with a blocked_by
+  // payload for guard rails, and some of those clear on their own: the
+  // market opens, the reconciler goes clean. Burning the signal for those
+  // throws away work that would have succeeded minutes later -- on
+  // 2026-07-22 an after-hours retry sweep killed three otherwise valid
+  // signals on market_closed alone.
+  return !TRANSIENT_BLOCKERS.some((b) => msg.includes(b))
 }
+
+/** blocked_by reasons that resolve with time and must not kill a decision. */
+const TRANSIENT_BLOCKERS = ['market_closed', 'reconcile_drift'] as const

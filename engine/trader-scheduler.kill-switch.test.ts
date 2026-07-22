@@ -179,7 +179,7 @@ describe('runTraderTick + kill switch', () => {
     ])
 
     const { send} = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.polled).toBe(true)
     const stored = db.prepare("SELECT id FROM trader_signals WHERE id = 'sig-ks-poll'").get() as any
@@ -202,7 +202,7 @@ describe('runTraderTick + kill switch', () => {
     ])
 
     const { send} = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.closedOut).toBe(1)
     const verdict = db.prepare(
@@ -229,7 +229,7 @@ describe('runTraderTick + kill switch', () => {
     insertSignal(db, 'sig-ks-card', 0.9)
 
     const { send, networkSend, networkSendWithKeyboard } = makeGatedSends()
-    await runTraderTick({ db, getEngineClient, send})
+    await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     // The downstream network send must not have fired.
     expect(networkSendWithKeyboard).not.toHaveBeenCalled()
@@ -250,7 +250,7 @@ describe('runTraderTick + kill switch', () => {
     })
 
     const { send, networkSend } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.reconcilerHalted).toBe(true)
     // Halt alert does not reach Telegram under the switch.
@@ -271,7 +271,7 @@ describe('runTraderTick + kill switch', () => {
     ])
 
     const { send, networkSend, networkSendWithKeyboard } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.sent).toBe(1)
     expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
@@ -289,7 +289,7 @@ describe('runTraderTick + kill switch', () => {
     })
 
     const { send, networkSend } = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.reconcilerHalted).toBe(true)
     expect(networkSend).toHaveBeenCalledTimes(1)
@@ -315,7 +315,7 @@ describe('runTraderTick + kill switch', () => {
     ])
 
     const { send} = makeGatedSends()
-    const result = await runTraderTick({ db, getEngineClient, send})
+    const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
     expect(result.polled).toBe(true)
     expect(result.closedOut).toBe(1)

@@ -64,6 +64,9 @@ export interface TraderSchedulerDeps {
    * market hours. Wired in index.ts; omit in tests to skip the SSH call.
    */
   restartEngineAsync?: () => void
+  /** Injectable NYSE-open check. Defaults to the real clock. Tests set this
+   *  explicitly so the suite does not behave differently after 16:00 ET. */
+  isMarketOpen?: () => boolean
 }
 
 let intervalHandle: NodeJS.Timeout | null = null
@@ -243,6 +246,30 @@ export function _getAndResetZeroPollCountForTest(): number {
  * phase.  The lock is released in a finally block so a thrown error
  * inside any phase still unblocks the next tick.
  */
+/** True when a decision awaiting retry is a crypto pair, which trades 24/7. */
+function hasRetryableCryptoDecisions(db: Database.Database): boolean {
+  try {
+    const row = db.prepare(
+      "SELECT 1 FROM trader_decisions WHERE status IN ('retry_pending','engine_down') AND asset LIKE '%/%' LIMIT 1",
+    ).get()
+    return row !== undefined
+  } catch {
+    return false
+  }
+}
+
+/** True when any pending signal is a crypto pair, which trades 24/7. */
+function hasPendingCryptoSignals(db: Database.Database): boolean {
+  try {
+    const row = db.prepare(
+      "SELECT 1 FROM trader_signals WHERE status = 'pending' AND asset LIKE '%/%' LIMIT 1",
+    ).get()
+    return row !== undefined
+  } catch {
+    return false
+  }
+}
+
 export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   polled: boolean
   sent: number
@@ -502,7 +529,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //     never resent. engineHealthy gates the engine_down resume: a healthy
   //     engine (health check reset _healthCheckConsecutiveFailures to 0)
   //     un-parks engine_down rows so they resume cleanly.
-  if (!reconcilerHalted) {
+  //     Skipped outside NYSE hours unless a crypto decision is waiting: an
+  //     equity resubmit into a closed market returns 422 market_closed, and
+  //     the sweep charges that to submit_attempts. Three ticks of that (15
+  //     minutes) parks a perfectly good decision at engine_down for the whole
+  //     overnight, having burned its entire retry budget on a condition that
+  //     was never the decision's fault.
+  if (!reconcilerHalted && ((deps.isMarketOpen ?? isEquityMarketHours)() || hasRetryableCryptoDecisions(deps.db))) {
     try {
       const client = deps.getEngineClient()
       const engineHealthy = _healthCheckConsecutiveFailures === 0
@@ -533,8 +566,16 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   // cannot reconcile orders would push approvals that can never execute, which
   // misleads the operator and wastes committee budget. Wait for the halt to
   // clear (signalled by reconcilerHalted returning to false next tick).
+  // Also skipped outside NYSE hours. The engine rejects equity submissions
+  // with 422 market_closed, and dispatching into that burns committee budget
+  // and (before market_closed was reclassified as transient) killed the
+  // decision outright while paging the operator after hours. Signals stay
+  // pending and go out on the first in-hours tick. Crypto is unaffected --
+  // it has its own 24/7 path and no equity signal survives this gate.
   if (reconcilerHalted) {
     logger.info('Trader tick: skipping auto-dispatch because reconciler is halted')
+  } else if (!(deps.isMarketOpen ?? isEquityMarketHours)() && !hasPendingCryptoSignals(deps.db)) {
+    logger.info('Trader tick: skipping auto-dispatch, NYSE closed and no crypto signals pending')
   } else {
     try {
       const dispatched = await autoDispatchPendingSignals(deps.db, {

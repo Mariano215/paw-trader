@@ -26,3 +26,28 @@ describe('lifecycle constants', () => {
     expect(DECISION_STATUS.EXIT_SUBMITTED).toBe('exit_submitted')
   })
 })
+
+describe('isTerminalSubmitError: transient 4xx blockers', () => {
+  const err = (body: string) =>
+    new Error(`Engine API error 422 on /decisions/submit :: ${body}`)
+
+  it('does not kill a decision blocked only by a closed market', () => {
+    // 2026-07-22: an after-hours retry sweep burned three valid signals this
+    // way. The market reopens; the decision should still be there when it does.
+    expect(isTerminalSubmitError(err('{"detail":{"blocked_by":["market_closed"]}}'))).toBe(false)
+  })
+
+  it('does not kill a decision blocked only by reconcile drift', () => {
+    expect(isTerminalSubmitError(err('{"detail":{"blocked_by":["reconcile_drift"]}}'))).toBe(false)
+  })
+
+  it('still kills a genuinely terminal 4xx', () => {
+    expect(isTerminalSubmitError(err('{"detail":{"blocked_by":["position_sizer"]}}'))).toBe(true)
+    expect(isTerminalSubmitError(err('{"detail":{"blocked_by":["no_position"]}}'))).toBe(true)
+  })
+
+  it('leaves 5xx and network errors transient', () => {
+    expect(isTerminalSubmitError(new Error('Engine API error 503 on /decisions/submit'))).toBe(false)
+    expect(isTerminalSubmitError(new Error('fetch failed'))).toBe(false)
+  })
+})

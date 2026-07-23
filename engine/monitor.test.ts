@@ -614,7 +614,7 @@ describe('monitor: evaluateAndRecordEngineUnreachable', () => {
     recordAlertFired(db, 'engine_first_down', NOW - 20 * 60 * 1000)
     const r = await evaluateAndRecordEngineUnreachable(db, NOW, down)
     expect(r.fire).toBe(true)
-    expect(r.message).toContain('Engine unreachable')
+    expect(r.message).toContain('stopped responding')
   })
 
   it('treats a null health body as unreachable', async () => {

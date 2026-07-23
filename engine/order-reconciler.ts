@@ -3,6 +3,7 @@ import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
 import { DECISION_STATUS, OPEN_AT_BROKER } from './order-lifecycle.js'
 import { logger } from '../logger.js'
+import { renderAlert, explainLostOrder } from './plain-english.js'
 import { recordFill } from './audit-log.js'
 
 /**
@@ -130,7 +131,7 @@ export async function reconcileOpenOrders(
       summary.expiredOrphans++
       logger.warn({ decisionId: row.id, asset: row.asset, ageMs: age }, 'Order reconcile: orphan order expired (no broker record after horizon), marking failed')
       await send?.(
-        `TRADER ALERT: Decision ${row.id} (${row.asset} ${row.action}) has no broker record after ${Math.round(age / 3600000)}h. Marked failed -- possible silent submit loss.`,
+        renderAlert(explainLostOrder(row.asset, row.action, Math.round(age / 3600000))),
       ).catch(() => {/* send must not block */})
       continue
     }

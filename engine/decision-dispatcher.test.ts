@@ -611,7 +611,7 @@ describe('autoDispatchPendingSignals', () => {
     const sig = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-guard'`).get() as { status: string }
     expect(sig.status).toBe('failed')
     expect(sig.status).not.toBe('pending')
-    expect(sent.some((m) => m.includes('TRADER ALERT'))).toBe(true)
+    expect(sent.some((m) => m.includes('something went wrong'))).toBe(true)
   })
 
   it('does not re-dispatch a signal across ticks when engine_order_id is missing (loop guard)', async () => {
@@ -704,7 +704,7 @@ describe('autoDispatchPendingSignals', () => {
     const dec = testDb.prepare(`SELECT status FROM trader_decisions WHERE id='dec-outer'`).get() as { status: string }
     expect(dec.status).toBe('failed')
 
-    expect(sent.some((m) => m.includes('TRADER ALERT'))).toBe(true)
+    expect(sent.some((m) => m.includes('something went wrong'))).toBe(true)
   })
 
   it('parks a network-timeout submit at retry_pending (no terminal fail, no resend)', async () => {

@@ -115,7 +115,41 @@ describe('trader-scheduler', () => {
         await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
 
         expect(restartEngineAsync).toHaveBeenCalledTimes(1)
-        expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('Engine unreachable'))
+        expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('stopped responding'))
+      })
+
+      it('restarts a wedged engine outside market hours too', async () => {
+        // Regression: this used to be gated on NYSE hours, so an engine that
+        // wedged after the close stayed dead until 09:30 the next morning --
+        // no reconciliation, no exits, and crypto trades around the clock.
+        vi.useFakeTimers()
+        vi.setSystemTime(new Date('2026-07-22T23:30:00Z')) // 19:30 ET, market shut
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => false, db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+      })
+
+      it('retries the restart after the cooldown rather than giving up', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+
+        // Next tick, still down: inside the cooldown, so no second attempt.
+        vi.setSystemTime(new Date(duringMarketHours.getTime() + 5 * 60 * 1000))
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+
+        // Past the cooldown, still down: try again.
+        vi.setSystemTime(new Date(duringMarketHours.getTime() + 31 * 60 * 1000))
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(2)
       })
 
       it('does not restart while the engine still answers', async () => {
@@ -212,8 +246,8 @@ describe('trader-scheduler', () => {
 
       const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
       expect(result.reconcilerHalted).toBe(true)
-      expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('reconciler halted'))
-      expect(sendMock.mock.calls[0][0]).toContain('daily_loss_limit')
+      expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('disagree with the broker'))
+      expect(sendMock.mock.calls[0][0]).toContain('disagree with the broker')
       // Approval cards go through not send
     })
 
@@ -228,24 +262,24 @@ describe('trader-scheduler', () => {
       sendMock.mockClear()
       await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
 
-      const haltCalls = sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))
+      const haltCalls = sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))
       expect(haltCalls).toHaveLength(0)
     })
 
     it('resets halt flag and re-alerts when reconciler recovers then halts again', async () => {
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r1' })
       await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
-      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(1)
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(1)
 
       sendMock.mockClear()
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: false })
       await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
-      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(0)
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(0)
 
       sendMock.mockClear()
       vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r2' })
       await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
-      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('reconciler halted'))).toHaveLength(1)
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(1)
     })
 
     it('auto-heals a safe broker-only halt on the first tick', async () => {
@@ -261,7 +295,7 @@ describe('trader-scheduler', () => {
       expect(result.reconcilerHalted).toBe(false)
       expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('NVDA')
       expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
-      expect(sendMock.mock.calls.some(c => String(c[0]).includes('auto-healed'))).toBe(true)
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('fixed a mismatch'))).toBe(true)
     })
 
     it('auto-heals a notional mismatch (qty agrees, $ mark drifted) on the first tick', async () => {
@@ -292,7 +326,7 @@ describe('trader-scheduler', () => {
       const r1 = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
       expect(r1.reconcilerHalted).toBe(true)
       expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
-      expect(sendMock.mock.calls.some(c => String(c[0]).includes('held for review'))).toBe(true)
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('double-checking'))).toBe(true)
 
       // Tick 2: second consecutive halt confirms -> adopt + clear.
       const r2 = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})

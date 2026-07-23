@@ -5,6 +5,12 @@ import { enrichPendingSignals } from './enrichment-fetcher.js'
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { reconcileOpenOrders } from './order-reconciler.js'
 import { runRetrySweep } from './order-retry.js'
+import {
+  renderAlert,
+  explainPositionMismatch,
+  explainServiceDown,
+  explainServiceBack,
+} from './plain-english.js'
 import { syncSignalStatuses } from './signal-state-sync.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { runExitSweep } from './exit-evaluator.js'
@@ -99,8 +105,15 @@ let _tickInProgress = false
  * state is persisted in trader_alert_state so it survives bot restarts.
  */
 let _healthCheckConsecutiveFailures = 0
-let _engineRestartAttempted = false
-const ENGINE_RESTART_THRESHOLD = 1      // 1 × 5-min tick = restart after first failure (market hours only)
+/** When we last asked launchd to restart the engine, 0 if never this outage.
+ *  A timestamp rather than a boolean so a restart that does not take can be
+ *  retried, without the retry becoming a loop. */
+let _lastEngineRestartMs = 0
+const ENGINE_RESTART_THRESHOLD = 1      // 1 × 5-min tick = restart after the first failed health check
+/** Minimum gap between restart attempts within one outage. Long enough that a
+ *  slow-booting engine is not restarted mid-boot, short enough that a failed
+ *  restart is retried the same hour. */
+const ENGINE_RESTART_COOLDOWN_MS = 30 * 60 * 1000
 
 /**
  * Consecutive zero-fetched poll counter.  Incremented each tick that the
@@ -222,6 +235,8 @@ export function stopTraderScheduler(): void {
 export function _resetHaltAlertForTest(): void {
   _haltAlertSent = false
   _phantomConfirm = {}
+  _healthCheckConsecutiveFailures = 0
+  _lastEngineRestartMs = 0
 }
 
 /** Reset tick lock state. Exposed for tests only -- do not call in production code. */
@@ -325,7 +340,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       logger.info({ was: _healthCheckConsecutiveFailures }, 'Trader engine reachable again')
     }
     _healthCheckConsecutiveFailures = 0
-    _engineRestartAttempted = false
+    _lastEngineRestartMs = 0
     // Engine-unreachable alerting + recovery notice now live in the
     // persistent monitor check (evaluateAndRecordEngineUnreachable), which
     // survives bot restarts. This phase keeps only the in-memory counter
@@ -394,12 +409,12 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
           _haltAlertSent = false
           _phantomConfirm = {}
           logger.info('Trader: reconciler halt auto-cleared')
-          await deps.send(`TRADER: Reconciler auto-healed. Reconciled positions: ${healableAssets.join(', ')}. Trading resumed.`)
+          await deps.send(renderAlert(explainPositionMismatch(healableAssets, true)))
         } catch (err) {
           logger.error({ err }, 'Trader: auto-adopt failed, falling back to manual alert')
           if (!_haltAlertSent) {
             _haltAlertSent = true
-            await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}. Auto-heal failed — run: npx tsx scripts/trader-diagnose.ts --fix`)
+            await deps.send(renderAlert(explainPositionMismatch(healableAssets, false)))
           }
         }
       } else if (!_haltAlertSent) {
@@ -409,7 +424,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         const detail = blockedPhantoms.length > 0
           ? ` Phantom (${blockedPhantoms.join(', ')}) held for review — auto-heal needs ${PHANTOM_CONFIRM_TICKS} confirms and value under $${PHANTOM_HEAL_MAX_USD}.`
           : ''
-        await deps.send(`TRADER ALERT: Engine reconciler halted. Reason: ${reason}.${detail} No new orders will reconcile until cleared.`)
+        await deps.send(renderAlert(explainPositionMismatch(blockedPhantoms, blockedPhantoms.length > 0 ? 'checking' : 'stuck')))
       }
     } else if (health) {
       // Reconciler recovered -- reset flags so we alert / re-confirm on the next halt.
@@ -450,16 +465,33 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     // Auto-restart: after ENGINE_RESTART_THRESHOLD failures during market hours,
     // SSH-restart the engine once per outage event. Fires before the alert so
     // the operator message can reflect the restart attempt.
+    //
+    // Deliberately NOT gated on market hours. It used to be, which meant an
+    // engine that wedged at 17:00 stayed dead until 09:30 the next morning:
+    // sixteen hours with no reconciliation and no exit evaluation, and crypto
+    // trades around the clock, so those positions spent the night with no
+    // stop-loss cover at all. Restarting a service that is not answering is
+    // safe at any hour.
+    //
+    // The old one-shot latch is now a cooldown, so a restart that does not
+    // take is retried rather than being the only attempt of the outage. The
+    // cooldown is what stops it becoming a restart loop.
+    const restartDue =
+      _lastEngineRestartMs === 0 ||
+      Date.now() - _lastEngineRestartMs >= ENGINE_RESTART_COOLDOWN_MS
     if (
       _healthCheckConsecutiveFailures >= ENGINE_RESTART_THRESHOLD &&
-      !_engineRestartAttempted &&
-      deps.restartEngineAsync &&
-      isEquityMarketHours()
+      restartDue &&
+      deps.restartEngineAsync
     ) {
-      _engineRestartAttempted = true
-      logger.warn({ consecutiveFailures: _healthCheckConsecutiveFailures }, 'Trader engine unreachable: attempting restart')
+      const isRetry = _lastEngineRestartMs !== 0
+      _lastEngineRestartMs = Date.now()
+      logger.warn(
+        { consecutiveFailures: _healthCheckConsecutiveFailures, isRetry },
+        'Trader engine unreachable: attempting restart',
+      )
       deps.restartEngineAsync()
-      await deps.send(`TRADER: Engine unreachable for ${_healthCheckConsecutiveFailures * 5} min. Restart issued — will confirm next tick.`)
+      await deps.send(renderAlert(explainServiceDown(_healthCheckConsecutiveFailures * 5, true)))
     }
     // The sustained-outage page is emitted by the persistent monitor check
     // (evaluateAndRecordEngineUnreachable in runMonitorPhase), not here --
@@ -895,7 +927,7 @@ async function runMonitorPhase(deps: TraderSchedulerDeps): Promise<void> {
       await deps.send(r.message)
       logger.error('Trader tick: engine-unreachable alert sent')
     } else if (r.recovered) {
-      await deps.send('TRADER: Engine reachable again. Trading resumed.')
+      await deps.send(renderAlert(explainServiceBack()))
       logger.info('Trader tick: engine reachable again, recovery notice sent')
     }
   } catch (err) {

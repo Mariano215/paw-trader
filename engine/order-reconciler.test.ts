@@ -122,7 +122,7 @@ describe('reconcileOpenOrders', () => {
     expect(s.expiredOrphans).toBe(1)
     expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d-old'").get() as any).status).toBe('failed')
     expect(sendSpy).toHaveBeenCalledTimes(1)
-    expect((sendSpy.mock.calls as string[][])[0][0]).toContain('d-old')
+    expect((sendSpy.mock.calls as string[][])[0][0]).toContain('went missing')
   })
 
   // I1: confirmed fill must write exactly one trader_fills row, idempotent on re-run.

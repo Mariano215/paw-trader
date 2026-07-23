@@ -49,6 +49,7 @@
  */
 import type Database from 'better-sqlite3'
 import { isEquityMarketHours } from './signal-poller.js'
+import { renderAlert, explainServiceDown } from './plain-english.js'
 
 export interface AlertCheckResult {
   fire: boolean
@@ -557,9 +558,7 @@ export async function evaluateAndRecordEngineUnreachable(
     fire: true,
     recovered: false,
     message:
-      `TRADER ALERT: Engine unreachable for ${mins}+ min. Engine process may be down or wedged ` +
-      '(check: launchctl kickstart -k gui/$(id -u)/com.pawtrader.engine). ' +
-      'No signals, no exits, no reconciliation until it returns.',
+      renderAlert(explainServiceDown(mins, false)),
   }
 }
 

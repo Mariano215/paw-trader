@@ -98,8 +98,14 @@ export function evaluateSymbolCooldown(input: SymbolCooldownInput): SymbolCooldo
     }
   }
 
-  // --- Rule 2: already holding it, and it is underwater -------------------
-  const held = positions.find((p) => p.asset === asset && p.qty !== 0)
+  // --- Rule 2: already holding it long, and it is underwater --------------
+  // Longs only. Every strategy here is buy-only, so a held position is always
+  // a long (qty > 0). The basis identity below (cost = market_value minus
+  // unrealized_pnl) only holds for a long; for a short it would compute a
+  // wrong number, and a 'buy' against a short is a cover, not an add, which
+  // this rule should never block. Guarding on qty > 0 keeps the math honest
+  // if shorts ever appear rather than silently misfiring.
+  const held = positions.find((p) => p.asset === asset && p.qty > 0)
   if (held) {
     const basis = Math.abs(held.market_value) - held.unrealized_pnl
     if (basis > 0) {

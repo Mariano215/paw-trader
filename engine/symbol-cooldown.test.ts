@@ -56,6 +56,12 @@ describe('evaluateSymbolCooldown', () => {
     expect(r.rule).toBe('average_down')
   })
 
+  it('ignores a short position (buy-only system never holds one; a buy would cover)', () => {
+    const d = db()
+    const short = { asset: 'IWM', qty: -10, avg_entry_price: 1, market_value: -9000, unrealized_pnl: -1000, source: 'adopted', updated_at: NOW }
+    expect(evaluateSymbolCooldown({ db: d, asset: 'IWM', side: 'buy', positions: [short], nowMs: NOW }).allowed).toBe(true)
+  })
+
   it('allows adding to a winner, and to a position only trivially red', () => {
     const d = db()
     expect(evaluateSymbolCooldown({ db: d, asset: 'VTI', side: 'buy', positions: [pos('VTI', 10500, 500)], nowMs: NOW }).allowed).toBe(true)

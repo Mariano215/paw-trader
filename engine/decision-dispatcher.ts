@@ -29,6 +29,11 @@ import {
   invalidateCounters,
 } from './bypass-counter.js'
 import { computeExits } from './exit-calculator.js'
+import {
+  renderAlert,
+  explainOrderRefused,
+  explainUnexpectedFailure,
+} from './plain-english.js'
 import { HARD_CEILING_USD } from './trader-constants.js'
 
 export interface AutoDispatchResult {
@@ -897,9 +902,7 @@ export async function autoDispatchPendingSignals(
           )
           db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
           await deps.send(
-            `TRADER ALERT: Signal ${signal.id} (${signal.asset} ${signal.side}) could not be dispatched -- ` +
-              `duplicate-guard query failed (likely schema drift). Signal marked failed and will NOT retry. ` +
-              `Error: ${guardErr instanceof Error ? guardErr.message : String(guardErr)}`,
+            renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
           ).catch(() => {/* send errors must not block the continue */})
           continue
         }
@@ -952,7 +955,7 @@ export async function autoDispatchPendingSignals(
             db.prepare("UPDATE trader_decisions SET status = ? WHERE id = ?").run(DECISION_STATUS.FAILED, decisionId)
             db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
             await deps.send(
-              `TRADER ALERT: Signal ${signal.id} (${signal.asset} ${signal.side}) rejected by engine and will not retry. Error: ${msg}`,
+              renderAlert(explainOrderRefused(signal.asset, signal.side, msg, false)),
             ).catch(() => {/* send must not block */})
             continue
           }
@@ -999,8 +1002,7 @@ export async function autoDispatchPendingSignals(
         // Terminal-fail and alert, consistent with the engine-submit no-retry policy.
         db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
         await deps.send(
-          `TRADER ALERT: Signal ${signal.id} (${signal.asset} ${signal.side}) hit an unexpected dispatch error ` +
-            `and was marked failed (no retry). Error: ${err instanceof Error ? err.message : String(err)}`,
+          renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
         ).catch(() => {})
       }
 
@@ -1015,8 +1017,7 @@ export async function autoDispatchPendingSignals(
       db.prepare("UPDATE trader_decisions SET status = 'failed' WHERE signal_id = ? AND status = 'submitting'")
         .run(signal.id)
       await deps.send(
-        `TRADER ALERT: Signal ${signal.id} (${signal.asset} ${signal.side}) hit an unexpected loop error ` +
-          `and was marked failed (no retry). Error: ${err instanceof Error ? err.message : String(err)}`,
+        renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
       ).catch(() => {})
     }
   }

@@ -293,7 +293,7 @@ describe('runTraderTick + kill switch', () => {
 
     expect(result.reconcilerHalted).toBe(true)
     expect(networkSend).toHaveBeenCalledTimes(1)
-    expect(networkSend.mock.calls[0][0]).toContain('reconciler halted')
+    expect(networkSend.mock.calls[0][0]).toContain('disagree with the broker')
   })
 
   it('switch CLEAR: close-out sweep + poll + send all complete together', async () => {

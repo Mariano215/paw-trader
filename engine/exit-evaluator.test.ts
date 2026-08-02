@@ -17,6 +17,11 @@ function row(over: Partial<OpenExitRow> = {}): OpenExitRow {
   }
 }
 
+// Tuesday 2026-04-21 10:00 ET = 14:00 UTC, inside NYSE hours. The exit sweep
+// is now market-hours gated per asset class, so equity tests must pin a clock
+// or they pass or fail depending on when the suite runs.
+const MARKET_OPEN_MS = new Date('2026-04-21T14:00:00Z').getTime()
+
 describe('evaluateExit', () => {
   it('exits a long when the last price is at/below the stop', () => {
     const r = evaluateExit(row(), { lastPrice: 91, nowMs: Date.now() })
@@ -104,7 +109,7 @@ describe('runExitSweep', () => {
     } as unknown as EngineClient
     const send = vi.fn().mockResolvedValue(undefined)
 
-    const out = await runExitSweep(db, client, send)
+    const out = await runExitSweep(db, client, send, { nowMs: MARKET_OPEN_MS })
     expect(out.exited).toBe(1)
     expect(submitDecision).toHaveBeenCalledTimes(1)
     // I2: size_usd must be 0 (full-close sentinel per E3 contract), NOT market_value
@@ -132,7 +137,7 @@ describe('runExitSweep', () => {
       getPrices: vi.fn(),
       submitDecision: vi.fn(),
     } as unknown as EngineClient
-    const out = await runExitSweep(db, client, vi.fn())
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out.exited).toBe(0)
     expect(client.submitDecision).not.toHaveBeenCalled()
   })
@@ -150,7 +155,7 @@ describe('runExitSweep', () => {
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
       submitDecision: vi.fn(),
     } as unknown as EngineClient
-    const out = await runExitSweep(db, client, vi.fn())
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out.exited).toBe(0)
     expect(client.submitDecision).not.toHaveBeenCalled()
   })
@@ -173,7 +178,7 @@ describe('runExitSweep', () => {
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
       submitDecision,
     } as unknown as EngineClient
-    const out = await runExitSweep(db, client, vi.fn())
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
     // d2 should fire an exit (price 91 <= stop 92); d1 is already guarded
     expect(out.exited).toBe(1)
     expect(submitDecision).toHaveBeenCalledTimes(1)
@@ -191,7 +196,7 @@ describe('runExitSweep', () => {
       submitDecision,
     } as unknown as EngineClient
 
-    const out = await runExitSweep(db, client, vi.fn())
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
     // no_position is not a real error -- the bracket already closed it
     expect(out.errors).toBe(0)
     expect(out.exited).toBe(0)
@@ -205,7 +210,7 @@ describe('runExitSweep', () => {
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
       submitDecision: submitDecision2,
     } as unknown as EngineClient
-    const out2 = await runExitSweep(db, client2, vi.fn())
+    const out2 = await runExitSweep(db, client2, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out2.exited).toBe(1)
     expect(submitDecision2).toHaveBeenCalledTimes(1)
   })
@@ -222,7 +227,7 @@ describe('runExitSweep', () => {
       submitDecision: vi.fn().mockRejectedValue(new Error('Engine API error 503 on /decisions/submit :: broker_unavailable')),
     } as unknown as EngineClient
 
-    const out = await runExitSweep(db, failing, vi.fn())
+    const out = await runExitSweep(db, failing, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out.errors).toBe(1)
     expect(out.exited).toBe(0)
     // Intent row removed -- not left to block the guard.
@@ -234,7 +239,92 @@ describe('runExitSweep', () => {
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
       submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'x3', broker_order_id: 'y3', status: 'placed', approved_size_usd: 0 }),
     } as unknown as EngineClient
-    const out2 = await runExitSweep(db, ok, vi.fn())
+    const out2 = await runExitSweep(db, ok, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out2.exited).toBe(1)
+  })
+})
+
+describe('runExitSweep market-hours gate', () => {
+  // Saturday 2026-04-18 14:00 UTC: NYSE shut.
+  const MARKET_CLOSED_MS = new Date('2026-04-18T14:00:00Z').getTime()
+
+  function makeDbFor(asset: string) {
+    const db = new Database(':memory:')
+    db.pragma('foreign_keys = ON')
+    initTraderTables(db)
+    db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
+      VALUES ('momentum-stocks','M','equity',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('s1','momentum-stocks',?,'buy',0.8,20,?,'executed')`).run(asset, Date.now())
+    db.prepare(`INSERT INTO trader_decisions
+      (id,signal_id,action,asset,size_usd,entry_type,entry_price,stop_loss,take_profit,thesis,confidence,decided_at,status)
+      VALUES ('d1','s1','buy',?,150,'market',100,92,116,'t',0.7,?,'executed')`).run(asset, Date.now())
+    return db
+  }
+
+  function clientFor(asset: string, positions: EnginePosition[]) {
+    return {
+      getPositions: vi.fn().mockResolvedValue(positions),
+      // Last close 91 is below the 92 stop, so a stop exit WOULD fire.
+      getPrices: vi.fn().mockResolvedValue([{ date: '2026-04-17', close: 91, ts_ms: 1 }]),
+      submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 0 }),
+    } as unknown as EngineClient & { submitDecision: ReturnType<typeof vi.fn> }
+  }
+
+  const posFor = (asset: string): EnginePosition =>
+    ({ asset, qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() })
+
+  it('does not touch equities while NYSE is shut, and writes no intent row', async () => {
+    // Before this gate the sweep ran every 5 minutes around the clock: insert
+    // exit_submitted, get 422 blocked_by:["market_closed"], delete the row,
+    // rethrow. 4,119 insert-delete cycles by 2026-08-02, 3,547 of them purely
+    // market_closed, against 11 exits that actually submitted.
+    const db = makeDbFor('AAPL')
+    const client = clientFor('AAPL', [posFor('AAPL')])
+
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_CLOSED_MS })
+
+    expect(out.exited).toBe(0)
+    expect(out.errors).toBe(0)
+    expect(out.skippedClosed).toBe(1)
+    expect(client.submitDecision).not.toHaveBeenCalled()
+    const rows = db.prepare("SELECT COUNT(*) n FROM trader_decisions WHERE status='exit_submitted'").get() as any
+    expect(rows.n).toBe(0)
+  })
+
+  it('still exits crypto while NYSE is shut, because crypto trades 24/7', async () => {
+    const db = makeDbFor('BTC/USD')
+    const client = clientFor('BTC/USD', [posFor('BTC/USD')])
+
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_CLOSED_MS })
+
+    expect(out.exited).toBe(1)
+    expect(out.skippedClosed).toBe(0)
+    expect(client.submitDecision).toHaveBeenCalledTimes(1)
+  })
+
+  it('counts broker drift instead of skipping it silently', async () => {
+    // Six QQQ lots drifted for 52 days behind a bare `continue` with no log and
+    // no counter, so the sweep reported a clean {exited:0, errors:0}.
+    const db = makeDbFor('QQQ')
+    const client = clientFor('QQQ', [])  // broker holds nothing
+
+    const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
+
+    expect(out.drifted).toBe(1)
+    expect(out.checked).toBe(0)
+    expect(client.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('honours the scheduler isMarketOpen dep over the wall clock', async () => {
+    const db = makeDbFor('AAPL')
+    const client = clientFor('AAPL', [posFor('AAPL')])
+
+    const out = await runExitSweep(db, client, vi.fn(), {
+      nowMs: MARKET_CLOSED_MS,
+      isMarketOpen: () => true,
+    })
+
+    expect(out.exited).toBe(1)
   })
 })

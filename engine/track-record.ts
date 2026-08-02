@@ -387,8 +387,29 @@ const HOLDING_STATUSES = [
  */
 export function isAssetHeld(
   db: Database.Database,
-  params: { asset: string; side: string; strategyId: string },
+  params: {
+    asset: string
+    side: string
+    strategyId: string
+    /**
+     * Live broker positions. When supplied, an asset the broker is flat on can
+     * NEVER be reported as held, whatever the decision rows say.
+     *
+     * This is not belt-and-braces, it is the difference between a guard and an
+     * outage. On 2026-08-02 six QQQ decisions sat at status='executed' with the
+     * broker flat since June, because the close-out watcher could not grade
+     * them and left them open forever. A DB-only guard reads that as "we hold
+     * QQQ" and blocks every future QQQ signal permanently. Broker truth wins.
+     */
+    positions?: Array<{ asset: string; qty: number }>
+  },
 ): boolean {
+  if (params.positions) {
+    const flatAtBroker = !params.positions.some(
+      (p) => p.asset === params.asset && Math.abs(p.qty) > 1e-9,
+    )
+    if (flatAtBroker) return false
+  }
   const placeholders = HOLDING_STATUSES.map(() => '?').join(', ')
   const row = db.prepare(`
     SELECT 1

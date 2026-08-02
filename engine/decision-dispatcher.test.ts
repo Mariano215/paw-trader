@@ -880,7 +880,11 @@ describe('autoDispatchPendingSignals', () => {
     const fakeEngine = {
       submitDecision: vi.fn(),
       getNav: vi.fn().mockResolvedValue(100000),
-      getPositions: vi.fn().mockResolvedValue([]),
+      // Broker confirms we really hold TLT. The guard only blocks when brain
+      // state AND broker truth agree.
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'TLT', qty: 180.6, avg_entry_price: 82, market_value: 14857, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+      ]),
     } as any
     const runCommittee = vi.fn(makeApproveCommittee(1973.25))
 
@@ -897,6 +901,41 @@ describe('autoDispatchPendingSignals', () => {
     expect(runCommittee).not.toHaveBeenCalled()
     const decisions = testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='TLT'").get() as any
     expect(decisions.n).toBe(1)
+  })
+
+  it('does NOT block re-entry when the broker is flat but stale rows say we hold it', async () => {
+    // The 2026-08-02 regression: six QQQ decisions sat at status='executed'
+    // with the broker flat since June, because the close-out watcher could
+    // never grade them. A DB-only guard reads that as "we hold QQQ" and blocks
+    // every future QQQ signal permanently. Broker truth has to win.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-stale','momentum-stocks','QQQ','buy',0.7,20,?,'submitted')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-stale','sig-stale','buy','QQQ',2008.03,'limit','t',0.7,NULL,?,'executed')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-new','momentum-stocks','QQQ','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    const fakeEngine = {
+      submitDecision: vi.fn().mockResolvedValue({
+        client_order_id: 'c', broker_order_id: 'b', status: 'placed', approved_size_usd: 200,
+      }),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),  // broker holds nothing
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(200) },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-new'").get() as any
+    expect(sig.status).not.toBe('suppressed_already_held')
   })
 
   it('dispatches highest-score signal first (rank-aware daily cap)', async () => {

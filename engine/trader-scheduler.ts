@@ -646,7 +646,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   } else {
     try {
       const client = deps.getEngineClient()
-      const sweep = await runExitSweep(deps.db, client, deps.send)
+      const sweep = await runExitSweep(deps.db, client, deps.send, { isMarketOpen: deps.isMarketOpen })
       exited = sweep.exited
       exitErrors = sweep.errors
       if (sweep.exited > 0 || sweep.errors > 0) {

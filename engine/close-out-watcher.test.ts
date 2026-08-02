@@ -13,6 +13,7 @@ import { seedAllStrategies } from './strategy-manager.js'
 import {
   findOpenDecisions,
   processClosure,
+  DRIFT_TERMINAL_AGE_MS,
   runCloseOutSweep,
   fetchReturnsForDecision,
 } from './close-out-watcher.js'
@@ -253,15 +254,50 @@ describe('processClosure', () => {
     expect(verdict.agent_attribution_json).toBe('[]')
   })
 
-  it('skips no-fills branch and does not write a verdict', () => {
+  it('skips no-fills branch and does not write a verdict while the decision is recent', () => {
     insertSignal(db, 'sig-1')
-    insertExecutedDecision(db, 'dec-1', 'sig-1', { decidedAt: 1000 })
+    const decidedAt = 1_000_000
+    insertExecutedDecision(db, 'dec-1', 'sig-1', { decidedAt })
 
-    // Asset is closed (no position) and no orders match.
-    const result = processClosure(db, getOpen('dec-1'), [], [])
+    // Asset is closed (no position) and no orders match, but the entry is
+    // recent enough that a fill may still propagate. Retry, do not terminate.
+    const result = processClosure(db, getOpen('dec-1'), [], [], undefined, decidedAt + 60_000)
     expect(result.reason).toBe('no-fills')
     const count = db.prepare('SELECT COUNT(*) as n FROM trader_verdicts').get() as { n: number }
     expect(count.n).toBe(0)
+  })
+
+  it('closes as drift once the broker is flat and the entry is past the orders window', () => {
+    // The QQQ case: six lots from 2026-06-11 sat at status='executed' for 52
+    // days because this branch always said "retry". The engine's /orders window
+    // had long since moved past them, so no fill could ever appear and the
+    // sweep logged the same six decisions 21,960 times.
+    insertSignal(db, 'sig-1')
+    const decidedAt = 1_000_000
+    insertExecutedDecision(db, 'dec-1', 'sig-1', { decidedAt })
+
+    const result = processClosure(
+      db, getOpen('dec-1'), [], [], undefined,
+      decidedAt + DRIFT_TERMINAL_AGE_MS + 1,
+    )
+    expect(result.reason).toBe('closed-drift')
+    expect(result.fullyClosed).toBe(true)
+    // Still no verdict: the P&L is genuinely unrecoverable, we only stop lying
+    // about the position being open.
+    const count = db.prepare('SELECT COUNT(*) as n FROM trader_verdicts').get() as { n: number }
+    expect(count.n).toBe(0)
+  })
+
+  it('does not declare drift while the asset still has a live position', () => {
+    insertSignal(db, 'sig-1')
+    const decidedAt = 1_000_000
+    insertExecutedDecision(db, 'dec-1', 'sig-1', { asset: 'AAPL', decidedAt })
+    const result = processClosure(
+      db, getOpen('dec-1'),
+      [{ asset: 'AAPL', qty: 10, avg_entry_price: 100, market_value: 1000, unrealized_pnl: 0, source: 't', updated_at: 1 }],
+      [], undefined, decidedAt + DRIFT_TERMINAL_AGE_MS + 1,
+    )
+    expect(result.reason).toBe('still-open')
   })
 
   it('partial close: defers verdict and returns partial reason', () => {
@@ -341,7 +377,7 @@ describe('runCloseOutSweep', () => {
 
   it('returns zeros when no decisions are open', async () => {
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 0 })
+    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 0, driftClosed: 0 })
     // getPositions is called by writeDailySnapshot (open MTM); getOrders is
     // NOT called when open.length === 0 (no close-out processing needed).
     expect(getOrders).not.toHaveBeenCalled()
@@ -353,7 +389,7 @@ describe('runCloseOutSweep', () => {
     getPositions.mockRejectedValue(new Error('engine 503'))
 
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 1 })
+    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 1, driftClosed: 0 })
     const count = db.prepare('SELECT COUNT(*) as n FROM trader_verdicts').get() as { n: number }
     expect(count.n).toBe(0)
   })
@@ -375,7 +411,7 @@ describe('runCloseOutSweep', () => {
     ])
 
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 1, stillOpen: 1, errors: 0 })
+    expect(result).toEqual({ processed: 1, stillOpen: 1, errors: 0, driftClosed: 0 })
 
     const verdicts = db.prepare('SELECT decision_id, pnl_gross FROM trader_verdicts ORDER BY decision_id').all() as any[]
     expect(verdicts).toHaveLength(1)
@@ -387,7 +423,9 @@ describe('runCloseOutSweep', () => {
     insertSignal(db, 'sig-good', { asset: 'AAPL' })
     insertSignal(db, 'sig-bad', { asset: 'BAD' })
     insertExecutedDecision(db, 'dec-good', 'sig-good', { asset: 'AAPL', decidedAt: 1000, filledQty: 1, filledAvgPrice: 100 })
-    insertExecutedDecision(db, 'dec-bad',  'sig-bad',  { asset: 'BAD',  decidedAt: 1000 })
+    // Recent, so it stays on the retryable no-fills branch rather than being
+    // terminated as drift (which is what an old decision now does).
+    insertExecutedDecision(db, 'dec-bad',  'sig-bad',  { asset: 'BAD',  decidedAt: Date.now() - 1000 })
 
     getPositions.mockResolvedValue([])
     getOrders.mockResolvedValue([
@@ -402,6 +440,30 @@ describe('runCloseOutSweep', () => {
     // The good decision still got a verdict despite the bad one's no-fills.
     const verdict = db.prepare('SELECT * FROM trader_verdicts WHERE decision_id=?').get('dec-good') as any
     expect(verdict).toBeDefined()
+  })
+
+  it('terminates a drifted decision so it stops being swept forever', async () => {
+    // The live QQQ case: broker flat, entry far outside the orders window. The
+    // row must leave status='executed' or it is re-processed every 5 minutes
+    // forever and blocks the re-entry guard on that asset.
+    insertSignal(db, 'sig-drift', { asset: 'QQQ' })
+    insertExecutedDecision(db, 'dec-drift', 'sig-drift', {
+      asset: 'QQQ',
+      decidedAt: Date.now() - (DRIFT_TERMINAL_AGE_MS + 86_400_000),
+    })
+
+    getPositions.mockResolvedValue([])
+    getOrders.mockResolvedValue([])
+
+    const result = await runCloseOutSweep(db, engine)
+    expect(result.driftClosed).toBe(1)
+    expect(result.errors).toBe(0)
+    const row = db.prepare('SELECT status FROM trader_decisions WHERE id=?').get('dec-drift') as any
+    expect(row.status).toBe('closed')
+    // Second sweep must find nothing left to do.
+    const again = await runCloseOutSweep(db, engine)
+    expect(again.driftClosed).toBe(0)
+    expect(again.processed).toBe(0)
   })
 
   it('makes exactly one close-out engine round-trip regardless of decision count', async () => {

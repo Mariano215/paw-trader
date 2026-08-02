@@ -72,7 +72,7 @@ export interface ClosureResult {
   fullyClosed: boolean
   outcome: VerdictOutcome | null
   attribution: AgentAttribution[]
-  reason: 'closed' | 'still-open' | 'no-fills' | 'partial' | 'closed-no-fill-data'
+  reason: 'closed' | 'still-open' | 'no-fills' | 'partial' | 'closed-no-fill-data' | 'closed-drift'
 }
 
 /**
@@ -141,12 +141,27 @@ function relevantOrders(
  * zero placeholders and `returns_backfilled=0` so the backfill script
  * can retry later. When the fetch succeeds, `returns_backfilled=1`.
  */
+/** One day in ms. */
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * How long a decision may sit with the broker flat and no matching fill before
+ * it is declared position drift and closed without a verdict.
+ *
+ * 7 days is far beyond any settlement or propagation delay, and comfortably
+ * outside the engine's /orders window, so anything older can never be graded no
+ * matter how many times it is retried. Deliberately generous: closing a
+ * still-resolvable decision loses its P&L, so the bias is toward waiting.
+ */
+export const DRIFT_TERMINAL_AGE_MS = 7 * DAY_MS
+
 export function processClosure(
   db: Database.Database,
   decision: OpenDecisionRow,
   positions: EnginePosition[],
   orders: EngineOrder[],
   priceFetchResult?: PriceFetchResult,
+  nowMs: number = Date.now(),
 ): ClosureResult {
   if (!isAssetClosed(decision.asset, positions)) {
     return {
@@ -163,6 +178,35 @@ export function processClosure(
   let sells = rollUpFills(relevant, 'sell')
 
   if (buys.qty <= 0 && sells.qty <= 0) {
+    // The broker holds nothing for this asset and no order in the engine's
+    // window matches the decision. Two different situations look identical
+    // here, and they need opposite handling:
+    //
+    //  - Recent decision: the fill may simply not have propagated yet. Retry.
+    //  - Old decision: the engine's /orders window has moved past the entry,
+    //    so a matching order will NEVER appear. Retrying is not eventual
+    //    consistency, it is an infinite loop.
+    //
+    // Treating both as retryable is what stranded six QQQ lots from 2026-06-11
+    // and 2026-06-30 at status='executed' forever. Every 5-minute tick logged
+    // 'asset closed but no matching fills' for the same six decisions: 21,960
+    // lines by 2026-08-02, while the positions had been flat at the broker for
+    // over a month. Those rows also count as open positions in every rollup and
+    // block the re-entry guard from ever trading QQQ again.
+    const ageMs = nowMs - decision.decided_at
+    if (ageMs > DRIFT_TERMINAL_AGE_MS) {
+      logger.warn(
+        { decisionId: decision.id, asset: decision.asset, decidedAt: decision.decided_at, ageDays: (ageMs / DAY_MS).toFixed(1) },
+        'Close-out sweep: asset flat at broker and past the orders window, closing without verdict (position drift)',
+      )
+      return {
+        decisionId: decision.id,
+        fullyClosed: true,
+        outcome: null,
+        attribution: [],
+        reason: 'closed-drift',
+      }
+    }
     logger.warn(
       { decisionId: decision.id, asset: decision.asset, decidedAt: decision.decided_at },
       'Close-out sweep: asset closed but no matching fills',
@@ -448,13 +492,14 @@ export async function runCloseOutSweep(
   db: Database.Database,
   engineClient: EngineClient,
   opts: { nowMs?: number } = {},
-): Promise<{ processed: number; stillOpen: number; errors: number }> {
+): Promise<{ processed: number; stillOpen: number; errors: number; driftClosed: number }> {
   const open = findOpenDecisions(db)
   const nowMs = opts.nowMs ?? Date.now()
 
   let processed = 0
   let stillOpen = 0
   let errors = 0
+  let driftClosed = 0
 
   if (open.length > 0) {
     let positions: EnginePosition[]
@@ -468,7 +513,7 @@ export async function runCloseOutSweep(
       logger.warn({ err, openDecisions: open.length }, 'Close-out sweep: engine fetch failed')
       // Still write snapshot even when close-out fetch fails.
       await writeDailySnapshot(db, engineClient, nowMs)
-      return { processed: 0, stillOpen: 0, errors: 1 }
+      return { processed: 0, stillOpen: 0, errors: 1, driftClosed: 0 }
     }
 
     for (const decision of open) {
@@ -497,8 +542,25 @@ export async function runCloseOutSweep(
           }
         }
 
-        const result = processClosure(db, decision, positions, orders, priceFetchResult)
+        const result = processClosure(db, decision, positions, orders, priceFetchResult, nowMs)
         if (result.reason === 'closed') processed += 1
+        else if (result.reason === 'closed-drift') {
+          // Broker flat, entry older than the orders window: no verdict will
+          // ever be possible. Terminate the row so it stops being re-processed
+          // every tick, stops counting as an open position, and stops blocking
+          // the re-entry guard on this asset.
+          db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
+          try {
+            recomputeRealizedPnlForAsset(db, decision.asset)
+          } catch (err) {
+            logger.warn(
+              { err, decisionId: decision.id, asset: decision.asset },
+              'Close-out sweep: recomputeRealizedPnlForAsset failed on drift close',
+            )
+          }
+          driftClosed += 1
+          processed += 1
+        }
         else if (result.reason === 'closed-no-fill-data') {
           // Position closed but this decision has no cached fill of its own
           // (legacy pre-fill-tracking row). No honest verdict is possible --
@@ -551,7 +613,14 @@ export async function runCloseOutSweep(
     )
   }
 
-  return { processed, stillOpen, errors }
+  if (driftClosed > 0) {
+    logger.warn(
+      { driftClosed },
+      'Close-out sweep: closed decisions the broker had already flattened (position drift, no verdict possible)',
+    )
+  }
+
+  return { processed, stillOpen, errors, driftClosed }
 }
 
 /**

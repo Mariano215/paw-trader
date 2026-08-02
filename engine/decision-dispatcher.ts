@@ -559,6 +559,23 @@ export async function autoDispatchPendingSignals(
 
   const results: AutoDispatchResult[] = []
 
+  // One broker snapshot for the whole sweep. Needed up front by the re-entry
+  // guard: a DB-only guard trusts decision rows, and stale rows (an entry the
+  // close-out watcher could never grade) would block an asset forever. Also
+  // reused for sizing below instead of re-fetching per signal.
+  let brokerPositions: EnginePosition[] | undefined
+  try {
+    if (!engineClient) {
+      const { getEngineClient } = await import('./engine-client.js')
+      engineClient = getEngineClient()
+    }
+    brokerPositions = await engineClient.getPositions()
+  } catch (err) {
+    // Engine unreachable: leave undefined so the guard falls back to DB rows.
+    // Conservative direction (may over-suppress, never over-trades).
+    logger.warn({ err }, 'auto-dispatch: broker positions unavailable, re-entry guard falls back to DB state')
+  }
+
   for (const signal of pending) {
     // Atomic claim -- if another dispatch already grabbed it, changes === 0
     const claimed = db.prepare(
@@ -582,7 +599,12 @@ export async function autoDispatchPendingSignals(
       // only covers pending/dispatching signals, so a re-emitted candidate
       // would open a second identical lot on the very next tick. Costs one
       // indexed query and saves the whole committee call.
-      if (isAssetHeld(db, { asset: signal.asset, side: signal.side, strategyId: signal.strategy_id })) {
+      if (isAssetHeld(db, {
+        asset: signal.asset,
+        side: signal.side,
+        strategyId: signal.strategy_id,
+        positions: brokerPositions,
+      })) {
         logger.info(
           { event: 'trader.gate.already_held', signalId: signal.id, asset: signal.asset, side: signal.side, strategy: strategy.id },
           'already holding this asset for this strategy, suppressing re-entry',
@@ -753,7 +775,7 @@ export async function autoDispatchPendingSignals(
         autoCapUsd = Math.min(autoNavUsable ? autoNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD, HARD_CEILING_USD)
       }
       const { computeRiskBasedSize } = await import('./risk-sizing.js')
-      const autoSizePositions = await engineClient.getPositions().catch(() => [] as EnginePosition[])
+      const autoSizePositions = brokerPositions ?? await engineClient.getPositions().catch(() => [] as EnginePosition[])
       const autoRiskSize = computeRiskBasedSize({
         nav: autoNavForSize,
         positions: autoSizePositions,

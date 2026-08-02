@@ -31,6 +31,7 @@ import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
 import { logger } from '../logger.js'
 import { DECISION_STATUS } from './order-lifecycle.js'
+import { isEquityMarketHours } from './signal-poller.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -165,29 +166,64 @@ export async function runExitSweep(
   db: Database.Database,
   engineClient: EngineClient,
   send: (text: string) => Promise<void>,
-): Promise<{ checked: number; exited: number; errors: number }> {
+  /**
+   * Injectable clock and market-hours check. The scheduler already owns an
+   * isMarketOpen dep; the exit sweep honours the same one so a single source
+   * decides whether equities are tradeable.
+   */
+  opts?: { nowMs?: number; isMarketOpen?: () => boolean },
+): Promise<{ checked: number; exited: number; errors: number; drifted: number; skippedClosed: number }> {
   const candidates = findOpenExitCandidates(db)
-  if (candidates.length === 0) return { checked: 0, exited: 0, errors: 0 }
+  if (candidates.length === 0) return { checked: 0, exited: 0, errors: 0, drifted: 0, skippedClosed: 0 }
 
   let positions: EnginePosition[]
   try {
     positions = await engineClient.getPositions()
   } catch (err) {
     logger.warn({ err, candidates: candidates.length }, 'Exit sweep: getPositions failed')
-    return { checked: 0, exited: 0, errors: 1 }
+    return { checked: 0, exited: 0, errors: 1, drifted: 0, skippedClosed: 0 }
   }
   const hasPosition = (asset: string): EnginePosition | undefined =>
     positions.find(p => p.asset === asset && Math.abs(p.qty) > 1e-9)
 
-  const nowMs = Date.now()
+  const nowMs = opts?.nowMs ?? Date.now()
+  const equitiesOpen = opts?.isMarketOpen ?? (() => isEquityMarketHours(nowMs))
   let checked = 0
   let exited = 0
   let errors = 0
+  let drifted = 0
+  let skippedClosed = 0
 
   for (const row of candidates) {
     try {
+      // Market-hours gate, per asset class. Crypto ('/' in the ticker) trades
+      // 24/7 and must never be gated here, or crypto positions could never be
+      // closed. Equities outside NYSE hours are skipped BEFORE the intent row
+      // is written.
+      //
+      // Without this the sweep ran every 5 minutes around the clock: it
+      // inserted an exit_submitted row, the engine rejected it with
+      // 422 blocked_by:["market_closed"], the row was deleted, and the error
+      // was rethrown. 4,119 insert-delete cycles by 2026-08-02, 3,547 of them
+      // purely market_closed, against 11 exits that actually submitted. The
+      // signal poller already gates the same way (signal-poller.ts:193).
+      const isCrypto = row.asset.includes('/')
+      if (!isCrypto && !equitiesOpen()) {
+        skippedClosed += 1
+        continue
+      }
+
       const pos = hasPosition(row.asset)
-      if (!pos) continue  // closed already; close-out-watcher will grade it
+      if (!pos) {
+        // Broker is flat but the brain still holds the decision. Usually the
+        // engine's bracket order closed the position without telling us. This
+        // used to be a bare `continue` with no log and no counter, so six QQQ
+        // lots drifted for 52 days completely invisibly. Count it; the
+        // close-out watcher terminates the row once it is past the orders
+        // window, and the drift collector alerts if the count stays high.
+        drifted += 1
+        continue
+      }
       checked += 1
 
       const bars = await engineClient.getPrices(row.asset, nowMs - 7 * DAY_MS, nowMs)
@@ -277,5 +313,12 @@ export async function runExitSweep(
     }
   }
 
-  return { checked, exited, errors }
+  if (drifted > 0) {
+    logger.warn(
+      { drifted, checked, candidates: candidates.length },
+      'Exit sweep: decisions whose asset is flat at the broker (position drift)',
+    )
+  }
+
+  return { checked, exited, errors, drifted, skippedClosed }
 }

@@ -789,27 +789,29 @@ describe('autoDispatchPendingSignals', () => {
     testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
       (id, name, asset_class, tier, status, params_json, created_at, updated_at)
       VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
-    // Explicit max_size_usd=150 so risk sizing produces $150 (no NAV needed).
-    testDb.prepare("UPDATE trader_strategies SET max_size_usd=150 WHERE id='momentum-stocks'").run()
+    // Explicit max_size_usd=400 so risk sizing produces $400 (no NAV needed).
+    testDb.prepare("UPDATE trader_strategies SET max_size_usd=400 WHERE id='momentum-stocks'").run()
     testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
       VALUES ('sig-trim','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
 
-    // NAV=2000, cluster cap 50%=$1000. Existing SPY market_value=$900 ->
-    // cluster exposure=$900, headroom=$100. Risk sizing: explicit cap=$150 ->
-    // sizeUsd=$150 (no heat issue). Cluster gate: 150 > 100 headroom -> TRIM to 100.
+    // NAV=6000, cluster cap 50%=$3000. Existing SPY market_value=$2700 ->
+    // cluster exposure=$2700, headroom=$300. Risk sizing: explicit cap=$400 ->
+    // sizeUsd=$400. Cluster gate: 400 > 300 headroom -> TRIM to 300. The
+    // headroom stays above DEFAULT_SIZE_USD ($200) so the trim is a real
+    // order, not dust.
     const fakeEngine = {
       submitDecision: vi.fn().mockResolvedValue({
-        client_order_id: 'coid-trim', broker_order_id: 'boid-trim', status: 'placed', approved_size_usd: 100,
+        client_order_id: 'coid-trim', broker_order_id: 'boid-trim', status: 'placed', approved_size_usd: 300,
       }),
-      getNav: vi.fn().mockResolvedValue(2000),
+      getNav: vi.fn().mockResolvedValue(6000),
       getPositions: vi.fn().mockResolvedValue([
-        { asset: 'SPY', qty: 1, avg_entry_price: 900, market_value: 900, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+        { asset: 'SPY', qty: 1, avg_entry_price: 2700, market_value: 2700, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
       ]),
     } as any
 
     await autoDispatchPendingSignals(
       testDb,
-      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(150) },
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(400) },
       fakeEngine,
     )
 
@@ -817,10 +819,84 @@ describe('autoDispatchPendingSignals', () => {
     const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-trim'").get() as any
     expect(sig.status).toBe('submitted')
     expect(fakeEngine.submitDecision).toHaveBeenCalledTimes(1)
-    // Engine was called with size <= 100 (the headroom: 1000 - 900 = 100).
+    // Engine was called with size <= 300 (the headroom: 3000 - 2700 = 300).
     const call = vi.mocked(fakeEngine.submitDecision).mock.calls[0][0]
-    expect(call.size_usd).toBeLessThanOrEqual(100)
-    expect(call.size_usd).toBeGreaterThan(0)
+    expect(call.size_usd).toBeLessThanOrEqual(300)
+    expect(call.size_usd).toBeGreaterThanOrEqual(200)
+  })
+
+  it('blocks rather than trims when cluster headroom is below the minimum order size', async () => {
+    // The dust-lot bug: on 2026-07-31 the symbol cap reopened a few dollars of
+    // headroom each cycle and every re-emitted signal was trimmed to fit it,
+    // producing $27.31, $8.12, $3.94 and $1.80 TLT lots. A trim below
+    // DEFAULT_SIZE_USD must block instead.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare("UPDATE trader_strategies SET max_size_usd=400 WHERE id='momentum-stocks'").run()
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-dust','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    // NAV=6000, cluster cap 50%=$3000. SPY market_value=$2990 -> headroom $10.
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(6000),
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'SPY', qty: 1, avg_entry_price: 2990, market_value: 2990, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+      ]),
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(400) },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-dust'").get() as any
+    expect(sig.status).toBe('suppressed_below_min_size')
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    const supp = testDb.prepare("SELECT reason FROM trader_signal_suppressions WHERE signal_id='sig-dust'").get() as any
+    expect(supp.reason).toBe('below_min_size')
+  })
+
+  it('suppresses a re-emitted signal for an asset the book already holds', async () => {
+    // The root cause of the 44-open-position report: the signal dedupe index is
+    // scoped to pending/dispatching, so a dispatched signal frees its slot and
+    // the next tick opens a second identical lot.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    // An already-executed TLT buy with no verdict: the book is holding it.
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-held','momentum-stocks','TLT','buy',0.7,20,?,'submitted')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-held','sig-held','buy','TLT',1973.25,'limit','t',0.7,NULL,?,'executed')`).run(Date.now())
+    // The engine re-emits the same candidate five minutes later.
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-dup','momentum-stocks','TLT','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(1973.25))
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-dup'").get() as any
+    expect(sig.status).toBe('suppressed_already_held')
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    // The guard runs before the committee, so it costs no LLM call.
+    expect(runCommittee).not.toHaveBeenCalled()
+    const decisions = testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='TLT'").get() as any
+    expect(decisions.n).toBe(1)
   })
 
   it('dispatches highest-score signal first (rank-aware daily cap)', async () => {

@@ -1,5 +1,18 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
+
+// Pin the score thresholds. signal-poller.ts captures
+// TRADER_SIGNAL_SCORE_THRESHOLD into a module-level const at import time, so
+// without this the suite reads whatever the operator has in .env. It currently
+// holds 0.01, which silently broke the "filters signals below threshold" case:
+// a 0.01 candidate clears a 0.01 floor. A test that changes result when someone
+// tunes a live env var is not testing the poller.
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
+  TRADER_SIGNAL_SCORE_THRESHOLD: 0.02,
+  TRADER_BLIND_SIGNAL_SCORE_THRESHOLD: 0.10,
+}))
+
 import { initTraderTables } from './db.js'
 import { seedAllStrategies, seedMomentumStrategy } from './strategy-manager.js'
 

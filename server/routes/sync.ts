@@ -74,7 +74,7 @@ const TABLE_MAP: Record<keyof TraderSyncPayload, { table: string; cols: string[]
   },
   verdicts: {
     table: 'trader_verdicts',
-    cols: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled'],
+    cols: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled', 'excluded_at'],
   },
   track_records: {
     table: 'trader_strategy_track_record',

@@ -14,6 +14,7 @@ import {
 import { DEFAULT_SIZE_USD } from './approval-manager.js'
 import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
+import { isAssetHeld } from './track-record.js'
 import { isTerminalSubmitError, DECISION_STATUS } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 import {
@@ -525,6 +526,23 @@ export interface AutoDispatchDeps {
   alertOnReject?: boolean
 }
 
+/**
+ * Round a gate-trimmed order size to cents, or return null when the headroom
+ * left is below the minimum order size.
+ *
+ * computeRiskBasedSize applies floorUsd internally (risk-sizing.ts:92-95), but
+ * the cluster and symbol trims below overwrite sizeUsd afterwards and never
+ * re-apply it. That is how $27.31, $8.12, $3.94 and $1.80 TLT lots reached the
+ * broker on 2026-07-31: as NAV ticked up a few dollars each cycle, the symbol
+ * cap reopened a few dollars of headroom and every re-emitted signal was
+ * trimmed to fit it. Sub-minimum lots are noise -- they pollute FIFO lot
+ * matching and each one still writes a full verdict row.
+ */
+function trimToSize(allowedSizeUsd: number): number | null {
+  const trimmed = Math.round(allowedSizeUsd * 100) / 100
+  return trimmed < DEFAULT_SIZE_USD ? null : trimmed
+}
+
 export async function autoDispatchPendingSignals(
   db: Database.Database,
   deps: AutoDispatchDeps,
@@ -556,6 +574,21 @@ export async function autoDispatchPendingSignals(
       if (!strategy || strategy.status === 'paused') {
         db.prepare("UPDATE trader_signals SET status = 'suppressed_strategy_paused' WHERE id = ?")
           .run(signal.id)
+        continue
+      }
+
+      // Gate -1: re-entry guard. Runs before every other gate because it is
+      // both the cheapest and the one that was missing: the signal dedupe index
+      // only covers pending/dispatching signals, so a re-emitted candidate
+      // would open a second identical lot on the very next tick. Costs one
+      // indexed query and saves the whole committee call.
+      if (isAssetHeld(db, { asset: signal.asset, side: signal.side, strategyId: signal.strategy_id })) {
+        logger.info(
+          { event: 'trader.gate.already_held', signalId: signal.id, asset: signal.asset, side: signal.side, strategy: strategy.id },
+          'already holding this asset for this strategy, suppressing re-entry',
+        )
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_already_held' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'already_held')
         continue
       }
 
@@ -777,8 +810,18 @@ export async function autoDispatchPendingSignals(
             recordSignalSuppressionBySignalId(db, signal.id, 'cluster_cap', Date.now())
             continue
           }
-          // Headroom > 0: trim to allowedSizeUsd and proceed.
-          const trimmed = Math.round(clusterGate.allowedSizeUsd * 100) / 100
+          // Headroom > 0: trim to allowedSizeUsd and proceed, unless what is
+          // left is below the minimum order size.
+          const trimmed = trimToSize(clusterGate.allowedSizeUsd)
+          if (trimmed === null) {
+            logger.warn(
+              { event: 'trader.gate.cluster_trim_below_min', signalId: signal.id, cluster: clusterGate.cluster, headroom: clusterGate.allowedSizeUsd, min: DEFAULT_SIZE_USD },
+              'cluster headroom below minimum order size, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_below_min_size' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'below_min_size')
+            continue
+          }
           logger.info(
             { event: 'trader.gate.cluster_trim', signalId: signal.id, cluster: clusterGate.cluster, original: sizeUsd, trimmed },
             'cluster cap: trimmed order to headroom',
@@ -829,7 +872,16 @@ export async function autoDispatchPendingSignals(
             recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cap', Date.now())
             continue
           }
-          const trimmed = Math.round(symbolGate.allowedSizeUsd * 100) / 100
+          const trimmed = trimToSize(symbolGate.allowedSizeUsd)
+          if (trimmed === null) {
+            logger.warn(
+              { event: 'trader.gate.symbol_trim_below_min', signalId: signal.id, symbol: symbolGate.cluster, headroom: symbolGate.allowedSizeUsd, min: DEFAULT_SIZE_USD },
+              'symbol headroom below minimum order size, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_below_min_size' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'below_min_size')
+            continue
+          }
           logger.info(
             { event: 'trader.gate.symbol_trim', signalId: signal.id, symbol: symbolGate.cluster, original: sizeUsd, trimmed },
             'symbol cap: trimmed order to headroom',

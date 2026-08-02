@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
-import { DECISION_STATUS, MAX_SUBMIT_RETRIES } from './order-lifecycle.js'
+import { DECISION_STATUS, MAX_SUBMIT_RETRIES, matchesBrokerOrder } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 
 export interface RetrySweepSummary {
@@ -20,14 +20,18 @@ interface RetryRow {
   entry_type: string
   confidence: number
   submit_attempts: number
+  engine_order_id: string | null
 }
 
 /**
  * Re-attempt decisions parked at retry_pending whose next_retry_at has
  * elapsed. Duplicate-safe: BEFORE resending, fetch GET /orders and skip
- * any decision whose order already exists at the broker (matched by
- * client_order_id == decision.id) -- that order is the reconcile phase's
- * job, not ours. After MAX_SUBMIT_RETRIES, park at engine_down (terminal
+ * any decision whose order already exists at the broker (matchesBrokerOrder,
+ * shared with the reconciler) -- that order is the reconcile phase's job, not
+ * ours. This guard previously compared client_order_id to the decision id,
+ * which the engine never echoes back, so it matched nothing and the sweep
+ * could place a second real broker order for a decision already live.
+ * After MAX_SUBMIT_RETRIES, park at engine_down (terminal
  * but resumable). On the next tick where the engine is healthy, callers
  * pass engineHealthy=true and any engine_down rows are returned to
  * retry_pending so they resume cleanly.
@@ -58,7 +62,7 @@ export async function runRetrySweep(
 
   const due = db
     .prepare(
-      `SELECT id, signal_id, asset, action, size_usd, entry_type, confidence, submit_attempts
+      `SELECT id, signal_id, asset, action, size_usd, entry_type, confidence, submit_attempts, engine_order_id
        FROM trader_decisions
        WHERE status = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)`,
     )
@@ -81,7 +85,7 @@ export async function runRetrySweep(
   }
 
   for (const row of due) {
-    const alreadyAtBroker = orders.some((o) => o.client_order_id === row.id)
+    const alreadyAtBroker = orders.some((o) => matchesBrokerOrder(o, row))
     if (alreadyAtBroker) {
       // The original submit DID reach the broker. Reconcile owns it now;
       // flip back to submitted so the reconcile phase tracks it.

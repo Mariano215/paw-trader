@@ -14,6 +14,7 @@ import {
   recomputeTrackRecord,
   recomputeAllTrackRecords,
   listTrackRecords,
+  isAssetHeld,
 } from './track-record.js'
 
 function makeDb() {
@@ -113,14 +114,44 @@ describe('computeTrackRecord (pure function)', () => {
     expect(r.rolling_sharpe).toBe(0)
   })
 
-  it('max_dd_pct is the worst peak-to-trough decline of cumulative net pnl', () => {
+  it('max_dd_pct is the worst peak-to-trough decline as a fraction of account equity', () => {
     const r = computeTrackRecord('s', [
       { pnl_gross:  20, pnl_net:  20, closed_at: 1, cost_basis_usd: 100 },  // cum=20, peak=20
       { pnl_gross:  30, pnl_net:  30, closed_at: 2, cost_basis_usd: 100 },  // cum=50, peak=50
-      { pnl_gross: -40, pnl_net: -40, closed_at: 3, cost_basis_usd: 100 },  // cum=10, dd=40/50=0.8
+      { pnl_gross: -40, pnl_net: -40, closed_at: 3, cost_basis_usd: 100 },  // cum=10, dd=$40
       { pnl_gross:  10, pnl_net:  10, closed_at: 4, cost_basis_usd: 100 },  // cum=20
-    ])
-    expect(r.max_dd_pct).toBeCloseTo(-0.8, 6)
+    ], 1, 1000)
+    expect(r.max_dd_pct).toBeCloseTo(-0.04, 6)  // $40 drawdown on $1000 equity
+  })
+
+  it('max_dd_pct stays in [-1, 0] when a small peak precedes a large decline', () => {
+    // The 2026-08-02 report printed -259.20% from this exact shape: dividing
+    // the dollar drawdown by the peak of the P&L curve is unbounded when that
+    // peak sits near zero.
+    const r = computeTrackRecord('s', [
+      { pnl_gross:   4.20, pnl_net:   4.20, closed_at: 1, cost_basis_usd: 100 },
+      { pnl_gross: -14.88, pnl_net: -14.88, closed_at: 2, cost_basis_usd: 100 },
+    ], 1, 1000)
+    expect(r.max_dd_pct).toBeGreaterThanOrEqual(-1)
+    expect(r.max_dd_pct).toBeLessThanOrEqual(0)
+    expect(r.max_dd_pct).toBeCloseTo(-0.01488, 6)
+  })
+
+  it('max_dd_pct clamps at -1 rather than reporting more than a total loss', () => {
+    const r = computeTrackRecord('s', [
+      { pnl_gross:    1, pnl_net:    1, closed_at: 1, cost_basis_usd: 100 },
+      { pnl_gross: -900, pnl_net: -900, closed_at: 2, cost_basis_usd: 100 },
+    ], 1, 100)
+    expect(r.max_dd_pct).toBe(-1)
+  })
+
+  it('max_dd_pct is 0 with no equity base, since no honest percentage exists', () => {
+    const r = computeTrackRecord('s', [
+      { pnl_gross:  20, pnl_net:  20, closed_at: 1, cost_basis_usd: 100 },
+      { pnl_gross: -40, pnl_net: -40, closed_at: 2, cost_basis_usd: 100 },
+    ], 1, null)
+    expect(r.max_dd_pct).toBe(0)
+    expect(r.net_pnl_usd).toBe(-20)  // the loss is carried here instead
   })
 
   it('max_dd_pct is 0 when curve never declines', () => {
@@ -247,5 +278,121 @@ describe('listTrackRecords', () => {
 
   it('returns empty array when no track records exist', () => {
     expect(listTrackRecords(db)).toEqual([])
+  })
+})
+
+describe('quarantined verdicts (schema v6)', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it('excludes quarantined verdicts from the track record', () => {
+    insertSignal(db, 'sig-a')
+    insertDecision(db, 'dec-a', 'sig-a', 100)
+    insertVerdict(db, 'v-a', 'dec-a', 25, 1000)
+    insertSignal(db, 'sig-b')
+    insertDecision(db, 'dec-b', 'sig-b', 100)
+    insertVerdict(db, 'v-b', 'dec-b', -10, 2000)
+
+    expect(recomputeTrackRecord(db, 'momentum-stocks')!.trade_count).toBe(2)
+
+    // Quarantine the pre-fix verdict: it was graded per duplicate decision,
+    // not per real position, so it must not count toward the record or the
+    // go-live gate's trade threshold.
+    db.prepare("UPDATE trader_verdicts SET excluded_at = 1 WHERE id = 'v-a'").run()
+    const after = recomputeTrackRecord(db, 'momentum-stocks')!
+    expect(after.trade_count).toBe(1)
+    expect(after.net_pnl_usd).toBe(-10)
+  })
+
+  it('goes to zero when every verdict is quarantined', () => {
+    insertSignal(db, 'sig-a')
+    insertDecision(db, 'dec-a', 'sig-a', 100)
+    insertVerdict(db, 'v-a', 'dec-a', 25, 1000)
+    db.prepare('UPDATE trader_verdicts SET excluded_at = 1').run()
+    const r = recomputeTrackRecord(db, 'momentum-stocks')!
+    expect(r.trade_count).toBe(0)
+    expect(r.net_pnl_usd).toBe(0)
+  })
+
+  it('keeps the quarantined rows for forensics', () => {
+    insertSignal(db, 'sig-a')
+    insertDecision(db, 'dec-a', 'sig-a', 100)
+    insertVerdict(db, 'v-a', 'dec-a', 25, 1000)
+    db.prepare('UPDATE trader_verdicts SET excluded_at = 1').run()
+    const n = db.prepare('SELECT COUNT(*) AS n FROM trader_verdicts').get() as any
+    expect(n.n).toBe(1)
+  })
+})
+
+describe('isAssetHeld (re-entry guard)', () => {
+  let db: Database.Database
+  beforeEach(() => { db = makeDb() })
+
+  function held(asset = 'TLT', side = 'buy', strategyId = 'momentum-stocks') {
+    return isAssetHeld(db, { asset, side, strategyId })
+  }
+
+  function seedPosition(opts: {
+    id: string
+    status: string
+    asset?: string
+    side?: string
+    strategy?: string
+    verdict?: boolean
+  }) {
+    const asset = opts.asset ?? 'TLT'
+    const side = opts.side ?? 'buy'
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, ?, ?, ?, 0.7, 20, ?, 'decided')
+    `).run(`sig-${opts.id}`, opts.strategy ?? 'momentum-stocks', asset, side, Date.now())
+    db.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+         committee_transcript_id, decided_at, status)
+      VALUES (?, ?, ?, ?, 1973.25, 'limit', 't', 0.7, NULL, 1000, ?)
+    `).run(opts.id, `sig-${opts.id}`, side, asset, opts.status)
+    if (opts.verdict) insertVerdict(db, `v-${opts.id}`, opts.id, 10, 2000)
+  }
+
+  it('is false with no decisions at all', () => {
+    expect(held()).toBe(false)
+  })
+
+  // The bug: the trader tick runs every 5 minutes and the engine re-emits the
+  // same candidate. Each of these statuses means we already have (or are about
+  // to have) exposure, so a second lot must not open.
+  for (const status of ['submitting', 'submitted', 'pending_fill', 'executed', 'exit_submitted']) {
+    it(`is true while a decision sits at '${status}'`, () => {
+      seedPosition({ id: `d-${status}`, status })
+      expect(held()).toBe(true)
+    })
+  }
+
+  it('is false once the position closed out and produced a verdict', () => {
+    seedPosition({ id: 'd-closed', status: 'executed', verdict: true })
+    expect(held()).toBe(false)
+  })
+
+  it('is false for a failed decision, which never reached the book', () => {
+    seedPosition({ id: 'd-failed', status: 'failed' })
+    expect(held()).toBe(false)
+  })
+
+  it('does not block a different asset, side, or strategy', () => {
+    seedPosition({ id: 'd-tlt', status: 'executed' })
+    expect(held('TLT', 'buy')).toBe(true)
+    expect(held('QQQ', 'buy')).toBe(false)
+    expect(held('TLT', 'sell')).toBe(false)
+    expect(held('TLT', 'buy', 'mean-reversion-stocks')).toBe(false)
+  })
+
+  it('blocks the eight-identical-lots case from the 2026-08-02 report', () => {
+    // One TLT signal became 8 lots of $1973.25 because nothing asked whether
+    // the book already held TLT. The first lot must make the rest unreachable.
+    seedPosition({ id: 'd-tlt-1', status: 'executed' })
+    for (let i = 2; i <= 8; i++) {
+      expect(held()).toBe(true)
+    }
   })
 })

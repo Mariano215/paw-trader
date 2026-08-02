@@ -24,6 +24,28 @@ export const OPEN_AT_BROKER: DecisionStatus[] = [
 export const MAX_SUBMIT_RETRIES = 3
 
 /**
+ * Does this broker order correspond to this decision?
+ *
+ * Primary key: the engine echoes the brain decision id in decision_id. The
+ * engine mints its own random client_order_id, so client_order_id == decision
+ * id NEVER matches on current engine builds; it is kept only as a fallback for
+ * older builds that did not serialize decision_id.
+ *
+ * Shared by the reconciler and the retry sweep. It lives here because the retry
+ * sweep used to test client_order_id alone, which never matched, so its
+ * duplicate guard was dead code and the sweep could resubmit a decision that
+ * was already live at the broker as a second real order.
+ */
+export function matchesBrokerOrder(
+  order: { decision_id?: string | null; client_order_id?: string | null; broker_order_id?: string | null },
+  decision: { id: string; engine_order_id?: string | null },
+): boolean {
+  if (order.decision_id != null && order.decision_id === decision.id) return true
+  if (decision.engine_order_id != null && order.broker_order_id === decision.engine_order_id) return true
+  return order.client_order_id === decision.id
+}
+
+/**
  * Classify an engine submit error as terminal (4xx, do not retry) or
  * transient (network / timeout / 5xx, retry-eligible). The engine client
  * throws Error("Engine API error NNN on /path :: body") on non-2xx

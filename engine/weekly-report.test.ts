@@ -572,10 +572,11 @@ describe('renderReportHtml', () => {
       gradeBreakdown: { A: 0, B: 0, C: 0, D: 0 },
       attribution: {},
       nav: { weekOpen: null, weekClose: null, deltaUsd: null, deltaPct: null, snapshotCount: 0, available: false, unavailableReason: 'test' },
-      openPositions: { openCount: 0, totalCostBasisUsd: 0, totalUnrealizedPnlUsd: 0, totalMarketValueUsd: 0, unmatchedCount: 0, positions: [] },
+      openPositions: { openCount: 0, totalCostBasisUsd: 0, unmatchedCostBasisUsd: 0, totalUnrealizedPnlUsd: 0, totalMarketValueUsd: 0, unmatchedCount: 0, positions: [] },
       openMtmAvailable: false,
       killSwitchEvents: [],
       killSwitchLog: [],
+      guards: [],
     }
     const html = renderReportHtml(report)
     expect(html).not.toContain('<script>alert(1)</script>')
@@ -947,5 +948,76 @@ describe('Phase 5 Task 3 -- weekly report kill-switch log integration', () => {
     expect(report.killSwitchLog).toEqual([])
     const summary = renderReportSummary(report)
     expect(summary).toContain('Kill switch: clean (no toggles)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Evaluation guards
+// ---------------------------------------------------------------------------
+
+describe('evaluation guards in the weekly report', () => {
+  function reportWithGuards(guards: Array<{ name: string; ok: boolean; reason: string }>) {
+    return {
+      weekStartMs: 0, weekEndMs: 1, generatedAtMs: 2,
+      verdictCount: 1, winCount: 1, lossCount: 0, breakEvenCount: 0, winRate: 1,
+      totalPnlNet: 10, bestTrades: [], worstTrades: [], strategyRollups: [],
+      gradeBreakdown: { A: 1, B: 0, C: 0, D: 0 }, attribution: {},
+      nav: { weekOpen: null, weekClose: null, deltaUsd: null, deltaPct: null, snapshotCount: 0, available: false, unavailableReason: 'test' },
+      brokerTruth: null,
+      openPositions: { openCount: 0, totalCostBasisUsd: 0, unmatchedCostBasisUsd: 0, totalUnrealizedPnlUsd: 0, totalMarketValueUsd: 0, unmatchedCount: 0, positions: [] },
+      openMtmAvailable: false, killSwitchEvents: [], killSwitchLog: [],
+      guards,
+    } as any
+  }
+
+  it('renders no banner when every guard passes', () => {
+    const html = renderReportHtml(reportWithGuards([
+      { name: 'costs-included', ok: true, reason: 'fees present' },
+    ]))
+    // The CSS class always ships in the <style> block; the banner div does not.
+    expect(html).not.toContain('<div class="guard-warning">')
+    expect(html).not.toContain('data-integrity')
+  })
+
+  it('renders a warning banner above the money numbers when a guard fails', () => {
+    const html = renderReportHtml(reportWithGuards([
+      { name: 'reconciles-with-broker', ok: false, reason: 'internal diverges from broker truth by 12.2%' },
+      { name: 'costs-included', ok: true, reason: 'fees present' },
+    ]))
+    expect(html).toContain('<div class="guard-warning">')
+    expect(html).toContain('1 data-integrity check(s) failed')
+    expect(html).toContain('reconciles-with-broker')
+    // The warning must precede the money section, not trail it.
+    expect(html.indexOf('guard-warning')).toBeLessThan(html.indexOf('Money: Realized'))
+  })
+
+  it('leads the Telegram summary with the failure, before any number', () => {
+    const text = renderReportSummary(reportWithGuards([
+      { name: 'costs-included', ok: false, reason: 'every fill has zero fees and zero slippage' },
+    ]))
+    expect(text).toContain('WARNING: 1 data-integrity check(s) failed')
+    expect(text.indexOf('WARNING')).toBeLessThan(text.indexOf('Account equity'))
+  })
+
+  it('buildReport flags zero-fee fills, which is the live state today', async () => {
+    const db = makeDb()
+    const closedAt = SUN_APR_19_9AM_UTC - 2 * 86_400_000
+    seedClosedTrade(db, {
+      signalId: 'sig-g', decisionId: 'dec-g', strategyId: 'momentum-stocks',
+      asset: 'AAPL', side: 'buy', sizeUsd: 100, pnlGross: 10, grade: 'A', closedAt,
+    })
+    // The reconciler hardcodes fee_usd 0 and slippage_usd 0 on every fill it
+    // writes, so the costs guard must fail rather than quietly pass.
+    db.prepare(`INSERT INTO trader_fills
+      (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price,
+       intended_price, intended_ts_ms, fill_ts_ms, fee_usd, slippage_usd, entry_thesis, exit_reason, recorded_at)
+      VALUES ('f1','dec-g','c1','b1','AAPL','buy',1,100,100,?,?,0,0,'t',NULL,?)`)
+      .run(closedAt, closedAt, closedAt)
+
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const report = await buildReport(db, null, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+    const costs = report.guards.find(g => g.name === 'costs-included')
+    expect(costs?.ok).toBe(false)
+    expect(renderReportHtml(report)).toContain('<div class="guard-warning">')
   })
 })

@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
+  guardMatchesBrokerTruth,
   guardNoNavDriftAsPnl, guardNoSameBarClose, guardCostsIncluded, guardMonotonicCurve,
 } from './eval-guards.js'
 import type { FillRow } from './audit-log.js'
@@ -61,5 +62,30 @@ describe('guardMonotonicCurve', () => {
   it('passes on strictly increasing timestamps', () => {
     const c: EquityPoint[] = [{ ts_ms: 1000, equity: 1 }, { ts_ms: 2000, equity: 1 }]
     expect(guardMonotonicCurve(c).ok).toBe(true)
+  })
+})
+
+describe('guardMatchesBrokerTruth', () => {
+  it('passes when internal realized P&L agrees with broker truth', () => {
+    expect(guardMatchesBrokerTruth(-763.00, -763.27).ok).toBe(true)
+  })
+
+  it('passes when both sides are effectively zero', () => {
+    expect(guardMatchesBrokerTruth(0, 0).ok).toBe(true)
+  })
+
+  it('fails on the 2026-08-02 divergence', () => {
+    // Internal verdicts said -$680.56; broker FIFO truth said -$763.27.
+    const r = guardMatchesBrokerTruth(-680.56, -763.27)
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('diverges from broker truth')
+  })
+
+  it('fails when the sign disagrees', () => {
+    expect(guardMatchesBrokerTruth(130.62, -763.27).ok).toBe(false)
+  })
+
+  it('respects a wider tolerance', () => {
+    expect(guardMatchesBrokerTruth(-680.56, -763.27, 0.5).ok).toBe(true)
   })
 })

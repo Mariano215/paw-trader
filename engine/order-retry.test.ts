@@ -53,6 +53,43 @@ describe('runRetrySweep', () => {
     expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
   })
 
+  it('does NOT resend when the engine echoes decision_id and mints its own client_order_id', async () => {
+    // The real-world shape, and the one the old guard missed: it compared
+    // client_order_id to the decision id, but the engine mints a random
+    // client_order_id and echoes the brain id in decision_id instead. The
+    // guard therefore never matched and the sweep placed a second real broker
+    // order for a decision that was already live.
+    parkRetry(db, 'd1', 1, 1000)
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([{
+        client_order_id: 'engine-minted-uuid-not-d1', decision_id: 'd1', broker_order_id: 'boid-1',
+        asset: 'AAPL', side: 'buy', qty: 1, order_type: 'market', limit_price: null,
+        status: 'new', filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1,
+      }]),
+      submitDecision: vi.fn(),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(0)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
+  })
+
+  it('does NOT resend when only engine_order_id matches the broker order', async () => {
+    parkRetry(db, 'd1', 1, 1000)
+    db.prepare("UPDATE trader_decisions SET engine_order_id = 'boid-1' WHERE id = 'd1'").run()
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([{
+        client_order_id: 'unrelated', broker_order_id: 'boid-1',
+        asset: 'AAPL', side: 'buy', qty: 1, order_type: 'market', limit_price: null,
+        status: 'new', filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1,
+      }]),
+      submitDecision: vi.fn(),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(0)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+  })
+
   it('parks engine_down after MAX_SUBMIT_RETRIES', async () => {
     parkRetry(db, 'd1', 3, 1000) // already at the cap
     const client = { getOrders: vi.fn().mockResolvedValue([]), submitDecision: vi.fn() }

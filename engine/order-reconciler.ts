@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
-import { DECISION_STATUS, OPEN_AT_BROKER } from './order-lifecycle.js'
+import { DECISION_STATUS, OPEN_AT_BROKER, matchesBrokerOrder } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 import { renderAlert, explainLostOrder } from './plain-english.js'
 import { recordFill } from './audit-log.js'
@@ -40,6 +40,18 @@ interface OpenRow {
   status: string
   decided_at: number
   parent_decision_id: string | null
+  /** Entry reference price resolved at dispatch; the slippage baseline. */
+  entry_price: number | null
+}
+
+/**
+ * The price we expected to trade at, used as the slippage baseline. Null when
+ * the dispatcher could not resolve an entry reference (enrichment missing and
+ * the engine price fetch failed), in which case slippage stays 0 because there
+ * is nothing to measure against, rather than being silently assumed perfect.
+ */
+function intendedPriceOf(row: OpenRow): number | null {
+  return row.entry_price != null && row.entry_price > 0 ? row.entry_price : null
 }
 
 /**
@@ -68,7 +80,8 @@ export async function reconcileOpenOrders(
   // any retry, so they MUST be reconciled against the broker every tick.
   const open = db
     .prepare(
-      `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at, parent_decision_id
+      `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at, parent_decision_id,
+              entry_price
        FROM trader_decisions
        WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?)`,
     )
@@ -95,16 +108,7 @@ export async function reconcileOpenOrders(
 
   for (const row of open) {
     const isExit = row.status === DECISION_STATUS.EXIT_SUBMITTED
-    // Primary key: engine echoes the brain decision id in decision_id. The
-    // engine mints its own random client_order_id, so client_order_id ==
-    // row.id NEVER matches -- it is kept only as a legacy fallback for older
-    // engine builds that did not serialize decision_id.
-    const match = orders.find(
-      (o) =>
-        (o.decision_id != null && o.decision_id === row.id) ||
-        (row.engine_order_id != null && o.broker_order_id === row.engine_order_id) ||
-        o.client_order_id === row.id,
-    )
+    const match = orders.find((o) => matchesBrokerOrder(o, row))
     if (!match) {
       // No broker record. Recent orders may still be propagating -- skip them.
       // Old orders with no broker record after the horizon are true orphans:
@@ -155,6 +159,10 @@ export async function reconcileOpenOrders(
           side:          (row.action === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
           fillQty:       filled,
           fillPrice:     match.filled_avg_price ?? 0,
+          // Same slippage baseline as the entry path: the exit decision's
+          // reference price. Without it recordFill records zero slippage.
+          intendedPrice: intendedPriceOf(row),
+          intendedTsMs:  row.decided_at,
           fillTsMs:      match.updated_at,
           feeUsd:        0,
         }, Date.now(), `${match.broker_order_id ?? row.id}:${filled}`)
@@ -182,8 +190,14 @@ export async function reconcileOpenOrders(
       ).run(DECISION_STATUS.EXECUTED, filled, match.filled_avg_price ?? null, row.id)
       // Write an immutable fill row to the audit log. The broker_fill_id is
       // stable across reconcile ticks so INSERT OR IGNORE makes this idempotent.
-      // fees_usd = 0 because the engine does not expose fees yet; the realized
-      // P&L layer notes this in its lot_match_rule column.
+      //
+      // Costs: Alpaca equities are commission-free, so feeUsd 0 is genuinely
+      // correct there and the engine exposes no fee field to read anyway. The
+      // real execution cost is SLIPPAGE, and it was silently zero on all 190
+      // fills recorded to 2026-08-02 for a mechanical reason: recordFill
+      // computes slippage via computeSlippageUsd, but that returns 0 when
+      // intendedPrice is null, and this call site never passed one. Passing the
+      // decision's entry reference price fixes it without touching the engine.
       const brokerFillId = `${match.broker_order_id ?? row.id}:${filled}`
       recordFill(db, {
         decisionId:     row.id,
@@ -193,6 +207,8 @@ export async function reconcileOpenOrders(
         side:           (row.action === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
         fillQty:        filled,
         fillPrice:      match.filled_avg_price ?? 0,
+        intendedPrice:  intendedPriceOf(row),
+        intendedTsMs:   row.decided_at,
         fillTsMs:       match.updated_at,
         feeUsd:         0,
       }, Date.now(), brokerFillId)

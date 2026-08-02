@@ -118,9 +118,37 @@ FROM trader_verdicts v
 JOIN trader_decisions d ON d.id = v.decision_id
 JOIN trader_signals s ON s.id = d.signal_id
 WHERE s.strategy_id = 'your-strategy-id'
+  AND v.excluded_at IS NULL
 ORDER BY v.closed_at DESC
 LIMIT 10;
 ```
+
+`AND v.excluded_at IS NULL` is required, not optional. Dropping it returns the
+quarantined pre-2026-08-02 verdicts and will not match what the ladder reads.
+
+## Quarantined verdicts (schema v6, 2026-08-02)
+
+Until 2026-08-02 the signal dedupe index only covered signals at
+`pending`/`dispatching`, so a dispatched signal freed its slot and the engine's
+next 5-minute re-emission opened another identical lot. One TLT signal opened 14
+lots on 2026-07-31. Close-out then graded every duplicate decision when the
+single aggregate broker position went flat, so the record showed 127 verdicts
+where deduping by asset and day gives 18.
+
+Every verdict that existed at migration time carries a non-null `excluded_at`.
+The rows are kept for forensics but are filtered out of:
+
+- `getVerdictsForStrategy` (`track-record.ts`), so the track record and score
+- `classifyStrategyTier` (`autonomy-ladder.ts`), the recent-grades lookback
+- the cold-start collector's graduation count (`paws/collectors/trader-coldstart.ts`)
+
+The migration also drops `trader_strategy_track_record`, since it is a cache
+rebuilt only on close-out and would otherwise keep serving the old numbers to
+the ladder. Expect every strategy to read `cold-start` at scale 0.25 immediately
+after the migration. That is correct: the trustworthy trade count is 0.
+
+Anything counting trades for the go-live gate MUST respect `excluded_at`. The
+gate's 100-trade threshold was reading a count inflated roughly 7x.
 
 Dashboard: `http://localhost:3000/#trader/strategy/:id` shows the track record
 card including current tier and scale.

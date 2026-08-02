@@ -38,6 +38,11 @@ import { listTrackRecords, listOpenPositions, summarizeOpenPositions, type Strat
 import type { EngineClient } from './engine-client.js'
 import type { NavSnapshot } from './types.js'
 import { sendEmail } from '../google/gmail.js'
+import {
+  guardMatchesBrokerTruth, guardCostsIncluded, guardNoSameBarClose, guardMonotonicCurve,
+} from './eval-guards.js'
+import type { FillRow } from './audit-log.js'
+import type { EquityPoint } from './metrics.js'
 
 const TRADER_REPORT_RECIPIENT = process.env.TRADER_REPORT_TO ?? 'security@example.com'
 
@@ -112,6 +117,13 @@ export interface KillSwitchLogEntry {
   set_by: string | null
 }
 
+/** One evaluation guard's verdict, surfaced in the report so failures are visible. */
+export interface GuardCheck {
+  name: string
+  ok: boolean
+  reason: string
+}
+
 export interface WeeklyReport {
   weekStartMs: number
   weekEndMs: number
@@ -152,6 +164,11 @@ export interface WeeklyReport {
    * at report time.
    */
   killSwitchLog: KillSwitchLogEntry[]
+  /**
+   * Evaluation pitfall guards. A failing guard means the numbers above are not
+   * trustworthy, so the report says so instead of quietly rendering them.
+   */
+  guards: GuardCheck[]
 }
 
 export interface BuildReportOptions {
@@ -475,6 +492,75 @@ export async function buildOpenPositionsSection(
  * produces a report, with the affected section degraded to its "no data"
  * state.
  */
+/**
+ * Run the evaluation pitfall guards and collect their verdicts.
+ *
+ * These guards were written and unit-tested months ago and then never called by
+ * anything. That is why the 2026-08-02 report could show internal realized P&L
+ * of -$680.56 next to broker truth of -$763.27 across 127 versus 5 trades
+ * without complaint, and why every fill carries fee_usd = 0.
+ *
+ * Deliberately non-fatal: a failing guard degrades the report into telling the
+ * truth about itself rather than suppressing it. guardCostsIncluded is expected
+ * to fail today because order-reconciler.ts hardcodes zero fees and slippage on
+ * every fill it writes. Do not soften the guard to make it pass; populate real
+ * costs from broker fill data instead.
+ */
+function runEvalGuards(
+  db: Database.Database,
+  internalRealizedNet: number,
+  brokerTruth: WeeklyReport['brokerTruth'],
+  weekStartMs: number,
+  weekEndMs: number,
+): GuardCheck[] {
+  const checks: GuardCheck[] = []
+
+  if (brokerTruth) {
+    const r = guardMatchesBrokerTruth(internalRealizedNet, brokerTruth.realizedTotal)
+    checks.push({ name: 'reconciles-with-broker', ...r })
+  }
+
+  try {
+    const fills = db.prepare(
+      'SELECT * FROM trader_fills WHERE fill_ts_ms >= ? AND fill_ts_ms <= ? ORDER BY fill_ts_ms ASC',
+    ).all(weekStartMs, weekEndMs) as FillRow[]
+    checks.push({ name: 'costs-included', ...guardCostsIncluded(fills) })
+    checks.push({ name: 'no-same-bar-close', ...guardNoSameBarClose(fills) })
+  } catch (err) {
+    logger.warn({ err }, 'weekly report: fill-based guards could not run')
+  }
+
+  const curve: EquityPoint[] = safeListNavSnapshots(db, weekStartMs, weekEndMs)
+  if (curve.length > 1) {
+    checks.push({ name: 'monotonic-equity-curve', ...guardMonotonicCurve(curve) })
+  }
+
+  const failed = checks.filter((c) => !c.ok)
+  if (failed.length > 0) {
+    logger.warn(
+      { event: 'trader.report.guards_failed', failed: failed.map((f) => ({ name: f.name, reason: f.reason })) },
+      'weekly report: evaluation guards failed, reported numbers are not trustworthy',
+    )
+  }
+  return checks
+}
+
+/** NAV snapshots in the window as an equity curve, for the monotonic guard. */
+function safeListNavSnapshots(db: Database.Database, startMs: number, endMs: number): EquityPoint[] {
+  try {
+    const rows = db.prepare(`
+      SELECT date, account_nav, nav_close
+      FROM trader_pnl_snapshots
+      ORDER BY date ASC
+    `).all() as Array<{ date: string; account_nav: number | null; nav_close: number | null }>
+    return rows
+      .map((r) => ({ ts_ms: Date.parse(`${r.date}T00:00:00Z`), equity: (r.account_nav || r.nav_close) ?? 0 }))
+      .filter((p) => Number.isFinite(p.ts_ms) && p.ts_ms >= startMs && p.ts_ms <= endMs)
+  } catch {
+    return []
+  }
+}
+
 export async function buildReport(
   db: Database.Database,
   engineClient: EngineClient | null,
@@ -523,6 +609,7 @@ export async function buildReport(
     await buildOpenPositionsSection(db, engineClient)
   const killSwitchEvents = buildKillSwitchEvents(opts.killSwitch ?? null, weekStartMs, weekEndMs)
   const killSwitchLog = await safeFetchKillSwitchLog(deps?.fetchKillSwitchLog, weekStartMs, weekEndMs)
+  const guards = runEvalGuards(db, totalPnlNet, brokerTruth, weekStartMs, weekEndMs)
 
   return {
     weekStartMs,
@@ -545,6 +632,7 @@ export async function buildReport(
     openMtmAvailable,
     killSwitchEvents,
     killSwitchLog,
+    guards,
   }
 }
 
@@ -674,6 +762,10 @@ export function renderReportHtml(report: WeeklyReport): string {
   h2 { margin: 24px 0 8px; font-size: 18px; color: #0f172a; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
   .container { max-width: 960px; margin: 0 auto; background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
   .muted { color: #64748b; font-size: 12px; }
+  .guard-warning { border: 2px solid #b91c1c; background: #fef2f2; color: #7f1d1d;
+    padding: 12px 16px; border-radius: 6px; margin: 16px 0; }
+  .guard-warning ul { margin: 8px 0 0 0; padding-left: 20px; }
+  .guard-warning li { margin: 4px 0; font-size: 13px; }
   table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
   th, td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
   th { background: #f1f5f9; font-weight: 600; color: #334155; }
@@ -699,6 +791,8 @@ export function renderReportHtml(report: WeeklyReport): string {
     <div class="kpi"><div class="label">Wins / Losses</div><div class="value">${report.winCount} / ${report.lossCount}</div></div>
     <div class="kpi"><div class="label">Open Positions</div><div class="value">${report.openPositions.openCount}</div></div>
   </div>
+
+  ${renderGuardBanner(report.guards)}
 
   <h2>Money: Realized, Unrealized, Account Equity</h2>
   ${renderMoneySummary(report)}
@@ -794,9 +888,17 @@ function renderOpenPositionsTable(report: WeeklyReport): string {
     <td>${formatUsd(p.cost_basis_usd)}</td>
     <td>${escapeHtml(formatDate(p.decided_at))}</td>
   </tr>`).join('')
+  // Cost basis, market value and unrealized are all matched-asset figures, so
+  // they are comparable. Decisions with no live broker position are reported
+  // on their own line: that notional is intent, not exposure, and folding it
+  // into the cost-basis total is what made the 2026-08-02 report show a $15k
+  // gap against market value while claiming $161.97 unrealized.
+  const unmatchedNote = op.unmatchedCount > 0
+    ? `<div class="muted">Not held at broker: ${formatUsd(op.unmatchedCostBasisUsd)} of intended notional across ${op.unmatchedCount} asset(s) with no live engine position (stale or never filled).</div>`
+    : ''
   const foot = report.openMtmAvailable
-    ? `<div class="muted">Cost basis total: ${formatUsd(op.totalCostBasisUsd)} &middot; Market value: ${formatUsd(op.totalMarketValueUsd)} &middot; Unrealized: ${formatUsd(op.totalUnrealizedPnlUsd)}${op.unmatchedCount > 0 ? ` &middot; ${op.unmatchedCount} with no live engine position` : ''}</div>`
-    : `<div class="muted">Cost basis total: ${formatUsd(op.totalCostBasisUsd)} &middot; MTM unavailable (engine unreachable)</div>`
+    ? `<div class="muted">Cost basis (held): ${formatUsd(op.totalCostBasisUsd)} &middot; Market value: ${formatUsd(op.totalMarketValueUsd)} &middot; Unrealized: ${formatUsd(op.totalUnrealizedPnlUsd)}</div>${unmatchedNote}`
+    : `<div class="muted">Cost basis total: ${formatUsd(op.totalCostBasisUsd + op.unmatchedCostBasisUsd)} &middot; MTM unavailable (engine unreachable), so held vs not-held cannot be split</div>`
   return `<table>
     <tr><th>Asset</th><th>Side</th><th>Strategy</th><th>Cost basis</th><th>Opened</th></tr>
     ${body}
@@ -863,6 +965,23 @@ function renderAttributionTable(tally: AttributionTally): string {
   </table>`
 }
 
+/**
+ * Failing guards go at the TOP of the report, above the money numbers, because
+ * a reader who scrolls to "Net P&L" first has already been misled. Passing
+ * guards render nothing: the absence of a warning is the all-clear.
+ */
+function renderGuardBanner(guards: GuardCheck[]): string {
+  const failed = guards.filter((g) => !g.ok)
+  if (failed.length === 0) return ''
+  const items = failed
+    .map((g) => `<li><strong>${escapeHtml(g.name)}</strong>: ${escapeHtml(g.reason)}</li>`)
+    .join('')
+  return `<div class="guard-warning">
+    <strong>${failed.length} data-integrity check(s) failed. Treat the numbers below as unverified.</strong>
+    <ul>${items}</ul>
+  </div>`
+}
+
 function renderKillSwitchSection(events: KillSwitchEvent[]): string {
   if (events.length === 0) {
     return `<div class="muted">No events in window.</div>`
@@ -915,6 +1034,14 @@ export function renderReportSummary(report: WeeklyReport): string {
   parts.push('Paw Trader weekly report')
   const range = `${formatDate(report.weekStartMs)} to ${formatDate(report.weekEndMs)}`
   parts.push(range)
+
+  // Lead with the warning. If the accounting is broken, every number that
+  // follows is unverified and the reader needs to know before reading them.
+  const failedGuards = report.guards.filter((g) => !g.ok)
+  if (failedGuards.length > 0) {
+    parts.push(`WARNING: ${failedGuards.length} data-integrity check(s) failed, numbers below are unverified`)
+    for (const g of failedGuards) parts.push(`  ${g.name}: ${g.reason}`)
+  }
 
   if (report.nav.available) {
     const delta = formatUsd(report.nav.deltaUsd)

@@ -116,6 +116,7 @@ export function classifyStrategyTier(
     JOIN trader_decisions d ON d.id = v.decision_id
     JOIN trader_signals   s ON s.id = d.signal_id
     WHERE s.strategy_id = ?
+      AND v.excluded_at IS NULL
     ORDER BY v.closed_at DESC
     LIMIT ?
   `).all(strategyId, RECENT_GRADES_LOOKBACK) as Array<{ thesis_grade: string }>

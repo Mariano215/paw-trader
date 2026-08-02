@@ -97,13 +97,14 @@ describe('summarizeOpenPositions', () => {
     expect(s.unmatchedCount).toBe(0)
   })
 
-  it('counts open decisions with no live position as unmatched and contributes 0 MTM', () => {
+  it('keeps unheld notional out of cost basis so it stays comparable to market value', () => {
     const open = [
       { decision_id: 'd1', signal_id: 's1', asset: 'AAPL', side: 'buy', strategy_id: 'm', cost_basis_usd: 100, decided_at: 1 },
     ]
     const s = summarizeOpenPositions(open, [])
     expect(s.openCount).toBe(1)
-    expect(s.totalCostBasisUsd).toBe(100)
+    expect(s.totalCostBasisUsd).toBe(0)          // nothing actually held
+    expect(s.unmatchedCostBasisUsd).toBe(100)    // intent, reported separately
     expect(s.totalUnrealizedPnlUsd).toBe(0)
     expect(s.totalMarketValueUsd).toBe(0)
     expect(s.unmatchedCount).toBe(1)
@@ -116,7 +117,24 @@ describe('summarizeOpenPositions', () => {
     ]
     const s = summarizeOpenPositions(open, [])
     expect(s.openCount).toBe(2)
-    expect(s.totalCostBasisUsd).toBe(200)
+    expect(s.totalCostBasisUsd).toBe(0)
+    expect(s.unmatchedCostBasisUsd).toBe(200)
     expect(s.unmatchedCount).toBe(1)  // one ASSET missing, not two decisions
+  })
+
+  it('splits cost basis when some assets are held and others are not', () => {
+    // The 2026-08-02 shape: held assets should reconcile against market value,
+    // and never-filled notional must not inflate the comparison.
+    const open = [
+      { decision_id: 'd1', signal_id: 's1', asset: 'AAPL', side: 'buy', strategy_id: 'm', cost_basis_usd: 100, decided_at: 1 },
+      { decision_id: 'd2', signal_id: 's2', asset: 'GHOST', side: 'buy', strategy_id: 'm', cost_basis_usd: 900, decided_at: 2 },
+    ]
+    const s = summarizeOpenPositions(open, [pos('AAPL', 1, 110, 10)])
+    expect(s.totalCostBasisUsd).toBe(100)
+    expect(s.unmatchedCostBasisUsd).toBe(900)
+    expect(s.totalMarketValueUsd).toBe(110)
+    expect(s.totalUnrealizedPnlUsd).toBe(10)
+    // Held cost basis + unrealized reconciles to market value.
+    expect(s.totalCostBasisUsd + s.totalUnrealizedPnlUsd).toBe(s.totalMarketValueUsd)
   })
 })

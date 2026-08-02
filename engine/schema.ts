@@ -304,6 +304,25 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
         ON trader_decisions(parent_decision_id, status)`)
     },
   },
+  {
+    version: 6,
+    description:
+      'Quarantine verdicts produced before the duplicate-lot fix. The signal dedupe index only covered pending/dispatching signals, so a re-emitted candidate opened another identical lot every 5-minute tick, and close-out then graded every duplicate decision when the single aggregate position went flat. That inflated the record to 127 verdicts where deduping by asset and day gives 18, and 130 of the decisions were sub-$200 dust. The go-live gate counts trades toward a 100-trade threshold, so the inflated count was actively dangerous. Rows are kept for forensics and excluded from the track record and the gate.',
+    up: (db) => {
+      addColumn(db, 'trader_verdicts', 'excluded_at', 'INTEGER')
+      // Everything that exists at migration time predates the fix.
+      db.prepare('UPDATE trader_verdicts SET excluded_at = ? WHERE excluded_at IS NULL')
+        .run(Date.now())
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_trader_verdicts_excluded
+        ON trader_verdicts(excluded_at)`)
+      // The rollup is a cache over the verdicts we just quarantined, and it is
+      // only rebuilt on close-out. Left in place it would keep serving the old
+      // 127-trade numbers to the dashboard and, worse, to the autonomy ladder,
+      // which sizes positions off it. Dropping it makes every strategy read as
+      // cold-start (0.25 size scale) until real trades rebuild the record.
+      db.exec('DELETE FROM trader_strategy_track_record')
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {
@@ -323,7 +342,7 @@ export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id'],
   trader_committee_transcripts: ['id', 'signal_id', 'transcript_json', 'rounds', 'total_tokens', 'total_cost_usd', 'created_at'],
   trader_approvals: ['id', 'decision_id', 'sent_at', 'responded_at', 'response', 'override_size'],
-  trader_verdicts: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled'],
+  trader_verdicts: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled', 'excluded_at'],
   trader_strategy_track_record: ['strategy_id', 'trade_count', 'win_count', 'rolling_sharpe', 'avg_winner_pct', 'avg_loser_pct', 'max_dd_pct', 'net_pnl_usd', 'computed_at'],
   trader_circuit_breakers: ['id', 'rule', 'tripped_at', 'reason', 'cleared_at', 'cleared_by'],
   trader_pnl_snapshots: ['date', 'nav_open', 'nav_close', 'pnl_day', 'trades_count', 'bench_return', 'cumulative_pnl', 'open_unrealized_pnl', 'account_nav'],

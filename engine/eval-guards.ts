@@ -74,6 +74,40 @@ export function guardCostsIncluded(fills: FillRow[], feeFreeVenue = false): Guar
 }
 
 /**
+ * Reconciliation guard: the brain's realized P&L must agree with the broker's.
+ *
+ * The 2026-08-02 weekly report claimed 127 internal trades and -$680.56 net for
+ * momentum-stocks while broker truth showed 5 closed round-trips and -$763.27
+ * realized. The two numbers are computed by completely separate paths (verdict
+ * rows written per decision at close-out, versus FIFO lot matching over broker
+ * fills), and nothing compared them, so a 25x divergence in trade count went
+ * unnoticed for weeks while the go-live gate counted the inflated number toward
+ * its 100-trade threshold.
+ *
+ * Tolerance is relative because absolute dollar drift is meaningless at
+ * different book sizes. Pass tolFrac = 0.05 for "within 5%".
+ */
+export function guardMatchesBrokerTruth(
+  internalRealizedNet: number,
+  brokerRealizedNet: number,
+  tolFrac = 0.05,
+): GuardResult {
+  const diff = Math.abs(internalRealizedNet - brokerRealizedNet)
+  const scale = Math.max(Math.abs(brokerRealizedNet), Math.abs(internalRealizedNet))
+  // Both effectively zero: nothing to reconcile.
+  if (scale < 0.01) return { ok: true, reason: 'no realized P&L on either side' }
+  if (diff / scale <= tolFrac) {
+    return { ok: true, reason: 'internal realized P&L reconciles with broker truth' }
+  }
+  return {
+    ok: false,
+    reason: `internal realized P&L ${internalRealizedNet.toFixed(2)} diverges from broker truth ` +
+      `${brokerRealizedNet.toFixed(2)} by ${((diff / scale) * 100).toFixed(1)}%; ` +
+      'one of the two accounting paths is wrong',
+  }
+}
+
+/**
  * Monotonic-time guard for an equity curve. Out-of-order timestamps
  * silently corrupt CAGR and drawdown. Fails on the first non-increasing
  * step.

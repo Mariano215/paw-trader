@@ -14,6 +14,7 @@ import type {
   PricePoint,
   SignalTelemetrySummary,
   MarkovRegimePayload,
+  BacktestResult,
 } from "./types.js";
 import { getCredential } from "../credentials.js";
 import { logger } from "../logger.js";
@@ -316,6 +317,24 @@ export class EngineClient {
    * Response shape: PricePoint[]. Confirmed against engine
    * src/trader_engine/api/routes/prices.py.
    */
+  /**
+   * Trade-level backtest of the live momentum rule.
+   *
+   * Slow by design (refetches years of daily bars and walks them), so this is
+   * NOT on the tick path. The go-live gate calls it weekly and caches.
+   *
+   * Response shape: BacktestResult. Confirmed against engine
+   * src/trader_engine/api/routes/backtest.py.
+   */
+  async getMomentumBacktest(days = 1260): Promise<BacktestResult> {
+    // 120s signal: the simulation walks ~5 years x 12 assets bar by bar and
+    // the default 10s client timeout would abort it every time.
+    return this.request<BacktestResult>(
+      `/backtest/momentum?days=${days}`,
+      { signal: AbortSignal.timeout(120_000) },
+    );
+  }
+
   async getPrices(asset: string, fromMs: number, toMs: number): Promise<PricePoint[]> {
     const url = this.baseUrl + `/prices/${encodeURIComponent(asset)}?from_ms=${fromMs}&to_ms=${toMs}`;
     const resp = await fetch(url, {

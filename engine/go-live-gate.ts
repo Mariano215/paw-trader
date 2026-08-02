@@ -139,6 +139,22 @@ async function accumulateRegimes(db: Database.Database, client: EngineClient): P
 }
 
 export interface StoredGateResult {
+  /**
+   * Snapshot of the backtest that produced backtestSharpe, or null when it was
+   * unreachable. Persisted so the weekly report and the pipeline watchdog can
+   * show WHY the degradation criterion passed or blocked without re-running a
+   * two-minute simulation.
+   */
+  backtest?: {
+    sharpe: number | null
+    n_trades: number
+    max_drawdown: number | null
+    win_rate: number | null
+    start: string
+    end: string
+    min_score: number
+    warnings: string[]
+  } | null
   passed: boolean
   criteria: GateResult['criteria']
   warnings: string[]
@@ -191,10 +207,37 @@ export async function runGoLiveGate(
 
   const variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies WHERE status='active'").get() as { c: number }).c
 
-  // backtestSharpe: no walk-forward backtest exists yet (engine walk_forward
-  // stats are null). 0 fails the degradation criterion, which is the honest
-  // outcome: a backtest is a real go-live blocker, not a formality.
-  const backtestSharpe = 0
+  // backtestSharpe from the engine's trade-level simulator, which imports the
+  // production _momentum_score directly so the backtested rule cannot drift
+  // from the traded one.
+  //
+  // This used to be a hardcoded 0. Because evaluateGate ANDs every criterion
+  // and live_vs_backtest_degradation returns false for any non-positive
+  // backtest Sharpe, that single constant made the gate incapable of passing
+  // no matter how the strategy performed. It was described as an honest
+  // blocker, and it was, but it also meant nobody could tell a blocked gate
+  // from a failing strategy.
+  //
+  // On failure we fall back to 0, which restores the old permanent block. That
+  // is the correct direction to fail: an unreachable backtest must never be
+  // read as a passing one.
+  let backtestSharpe = 0
+  let backtest: Awaited<ReturnType<typeof client.getMomentumBacktest>> | null = null
+  try {
+    backtest = await client.getMomentumBacktest()
+    // null sharpe means fewer than two closed trades, i.e. no answer. Leaving
+    // it at 0 keeps the gate blocked rather than inventing a verdict.
+    if (backtest.sharpe != null && Number.isFinite(backtest.sharpe)) {
+      backtestSharpe = backtest.sharpe
+    } else {
+      logger.warn(
+        { nTrades: backtest.n_trades, warnings: backtest.warnings },
+        'Go-live gate: backtest returned no Sharpe (too few trades), degradation criterion stays blocked',
+      )
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Go-live gate: backtest unavailable, degradation criterion stays blocked')
+  }
 
   const result = evaluateGate({
     closedReturns,
@@ -207,6 +250,16 @@ export async function runGoLiveGate(
   })
 
   const stored: StoredGateResult = {
+    backtest: backtest && {
+      sharpe: backtest.sharpe,
+      n_trades: backtest.n_trades,
+      max_drawdown: backtest.max_drawdown,
+      win_rate: backtest.win_rate,
+      start: backtest.start,
+      end: backtest.end,
+      min_score: backtest.min_score,
+      warnings: backtest.warnings,
+    },
     passed: result.passed,
     criteria: result.criteria,
     warnings: result.warnings,

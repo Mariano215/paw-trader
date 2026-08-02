@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
@@ -92,6 +92,51 @@ describe('runGoLiveGate', () => {
     expect(summary).toContain('Go-live gate')
     expect(summary).toContain('Blockers:')
     expect(summary).not.toMatch(/—/)
+  })
+
+  it('keeps the degradation criterion blocked when the backtest is unreachable', async () => {
+    // Fail-closed is the whole safety property here: an unreachable backtest
+    // must never read as a passing one. Before the simulator existed this
+    // criterion was a hardcoded false, so the failure mode is well trodden.
+    const client = mockClient([])
+    ;(client as any).getMomentumBacktest = vi.fn().mockRejectedValue(new Error('engine down'))
+
+    const r = await runGoLiveGate(db, client, 1_000_000)
+    const deg = r.criteria.find(c => c.name === 'live_vs_backtest_degradation')
+    expect(deg?.passed).toBe(false)
+    expect(r.passed).toBe(false)
+    expect(r.backtest ?? null).toBeNull()
+  })
+
+  it('keeps the criterion blocked when the backtest returns a null Sharpe', async () => {
+    // null means "fewer than two trades closed", i.e. no answer. Coercing it
+    // to 0 would be inventing a verdict.
+    const client = mockClient([])
+    ;(client as any).getMomentumBacktest = vi.fn().mockResolvedValue({
+      strategy: 'momentum', n_trades: 1, sharpe: null, max_drawdown: null,
+      win_rate: null, start: '2021-01-01', end: '2026-01-01', min_score: 0.7,
+      warnings: ['thin'], method: 'm', expectancy: null, total_return: 0,
+      slippage_bps: 5, sharpe_convention: 'x', assets: [], computed_at_ms: 1, elapsed_ms: 1,
+    })
+
+    const r = await runGoLiveGate(db, client, 1_000_000)
+    const deg = r.criteria.find(c => c.name === 'live_vs_backtest_degradation')
+    expect(deg?.passed).toBe(false)
+  })
+
+  it('persists the backtest snapshot so the report can explain the criterion', async () => {
+    const client = mockClient([])
+    ;(client as any).getMomentumBacktest = vi.fn().mockResolvedValue({
+      strategy: 'momentum', n_trades: 89, sharpe: 2.71, max_drawdown: 0.298,
+      win_rate: 0.607, start: '2021-05-17', end: '2026-07-31', min_score: 0.7,
+      warnings: [], method: 'm', expectancy: 0.0096, total_return: 1.04,
+      slippage_bps: 5, sharpe_convention: 'x', assets: ['SPY'], computed_at_ms: 1, elapsed_ms: 1,
+    })
+
+    const r = await runGoLiveGate(db, client, 1_000_000)
+    expect(r.backtest?.sharpe).toBe(2.71)
+    expect(r.backtest?.n_trades).toBe(89)
+    expect(readLastGateResult(db)?.backtest?.max_drawdown).toBeCloseTo(0.298)
   })
 
   it('accumulates regimes across runs', async () => {

@@ -188,3 +188,34 @@ export interface SignalTelemetrySummary {
   strategy_stats: StrategyTelemetryStat[];
   near_misses: NearMiss[];
 }
+
+// ---------------------------------------------------------------------------
+// Backtest -- go-live gate degradation criterion
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of the engine's trade-level backtest (GET /backtest/momentum).
+ *
+ * `sharpe` is null when fewer than two trades closed. Callers MUST treat null
+ * as "no answer" and never coerce it to 0: 0 is a verdict that fails the gate,
+ * absence is not.
+ */
+export interface BacktestResult {
+  strategy: string;
+  method: string;
+  start: string;
+  end: string;
+  n_trades: number;
+  sharpe: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
+  expectancy: number | null;
+  total_return: number;
+  slippage_bps: number;
+  min_score: number;
+  sharpe_convention: string;
+  assets: string[];
+  warnings: string[];
+  computed_at_ms: number;
+  elapsed_ms: number;
+}

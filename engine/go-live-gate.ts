@@ -205,7 +205,17 @@ export async function runGoLiveGate(
     logger.warn('Go-live gate: NAV snapshots unavailable, drawdown criterion evaluated on empty curve')
   }
 
-  const variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies WHERE status='active'").get() as { c: number }).c
+  // Every strategy ever tried counts as a trial, not just the ones still
+  // running. deflatedSharpe penalises the observed Sharpe by how many variants
+  // we searched over, so filtering to status='active' hid exactly the variants
+  // that make the penalty necessary: the ones tested and then paused or retired
+  // because they underperformed. Excluding them undercounts trials and inflates
+  // the deflated Sharpe, which biases the gate toward passing.
+  //
+  // Counting all rows still understates the true search: params tuned in place
+  // on one strategy row leave no trace here. Under-counting is the direction we
+  // can live with; under-counting AND discarding the failures is not.
+  const variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies").get() as { c: number }).c
 
   // backtestSharpe from the engine's trade-level simulator, which imports the
   // production _momentum_score directly so the backtested rule cannot drift

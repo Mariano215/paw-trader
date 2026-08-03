@@ -196,6 +196,26 @@ describe("EngineClient", () => {
     await expect(client.getPrices("AAPL", 1, 2)).rejects.toThrow("Engine API error 500");
   });
 
+  it("getPrices drops unusable bars and de-dupes repeated timestamps", async () => {
+    mockFetch.mockReturnValueOnce(
+      mockResp([
+        { date: "2026-03-01", close: 180.5, ts_ms: 1740787200000 },
+        { date: "2026-03-02", close: 0, ts_ms: 1740873600000 },        // zero close
+        { date: "2026-03-03", close: -5, ts_ms: 1740960000000 },       // negative close
+        { date: "2026-03-04", close: null, ts_ms: 1741046400000 },     // null close
+        { date: "2026-03-05", close: 181.0, ts_ms: null },             // null ts
+        { date: "2026-03-01", close: 999.9, ts_ms: 1740787200000 },    // duplicate ts
+        { date: "2026-03-06", close: 182.25, ts_ms: 1741132800000 },
+      ]),
+    );
+    const prices = await client.getPrices("AAPL", 1, 2);
+    expect(prices).toHaveLength(2);
+    expect(prices[0].close).toBe(180.5);
+    // First occurrence of a duplicate timestamp wins, not the later one.
+    expect(prices.find((p) => p.ts_ms === 1740787200000)?.close).toBe(180.5);
+    expect(prices[1].close).toBe(182.25);
+  });
+
   it("getPrices URL-encodes slash-bearing crypto symbols like BTC/USD", async () => {
     mockFetch.mockReturnValueOnce(mockResp([]));
     // Engine 404s for empty windows; with our 404 -> [] coercion this

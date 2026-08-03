@@ -19,6 +19,44 @@ import type {
 import { getCredential } from "../credentials.js";
 import { logger } from "../logger.js";
 
+/**
+ * Drop unusable price bars at the client boundary, before any caller sees them.
+ *
+ * Every price consumer (backtests, exit evaluation, entry reference price,
+ * enrichment) routes through EngineClient.getPrices, so one guard here covers
+ * all of them. A NaN or zero close silently poisons every downstream return
+ * calculation, and a duplicate timestamp double-counts a bar in any series
+ * walked in order.
+ *
+ * Rejects: non-finite or non-positive close, non-finite ts_ms, repeated ts_ms
+ * (first occurrence wins). Input order is preserved -- this filters, it does
+ * not sort, because callers already depend on the engine's ordering.
+ *
+ * ponytail: drops bad bars rather than throwing. A single corrupt bar in a
+ * multi-year window should not fail the whole fetch; the warn log is the
+ * signal that the feed needs looking at.
+ */
+export function sanitizePrices(points: PricePoint[], asset: string): PricePoint[] {
+  if (!Array.isArray(points)) return [];
+  const seen = new Set<number>();
+  const clean = points.filter((p) => {
+    if (p == null) return false;
+    if (!Number.isFinite(p.close) || p.close <= 0) return false;
+    if (!Number.isFinite(p.ts_ms)) return false;
+    if (seen.has(p.ts_ms)) return false;
+    seen.add(p.ts_ms);
+    return true;
+  });
+  const dropped = points.length - clean.length;
+  if (dropped > 0) {
+    logger.warn(
+      { asset, dropped, received: points.length },
+      "Engine price feed returned unusable bars, dropped at client boundary",
+    );
+  }
+  return clean;
+}
+
 export interface EngineClientOptions {
   baseUrl: string;
   token: string;
@@ -353,7 +391,7 @@ export class EngineClient {
         "Engine API error " + resp.status + " on /prices/" + asset,
       );
     }
-    return (await resp.json()) as PricePoint[];
+    return sanitizePrices((await resp.json()) as PricePoint[], asset);
   }
 
   /**

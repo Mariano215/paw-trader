@@ -34,7 +34,7 @@ server/routes/   HTTP routes that back the dashboard + internal APIs
 server/ui/       Dashboard UI code, sliced from the ClaudePaw SPA
 agents/          Committee agent prompt templates (sanitized starter versions)
 paws/            "Paws" (persistent agent loops) specific to the trader
-docs/internal/   Runbooks: autonomy ladder, NAV-drop response, regime handling
+docs/runbooks/   Runbooks: autonomy ladder, NAV-drop response, regime handling
 scripts/         Backfill + maintenance utilities
 ```
 

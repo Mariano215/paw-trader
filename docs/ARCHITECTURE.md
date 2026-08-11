@@ -131,6 +131,6 @@ Paw Trader ships with aggressive safety defaults:
 - **Paper-only by default.** Live-money promotion is a gated, multi-step operator action.
 - **Autonomy ladder.** Each strategy starts at the lowest autonomy tier and earns escalation via track-record gates.
 - **Kill switch.** Both per-strategy circuit breakers and a global halt exist. Tripping either stops new orders and (for global) triggers close-outs.
-- **NAV drop triggers.** Runbook in `docs/internal/runbook-nav-drop.md` documents the escalation.
+- **NAV drop triggers.** Runbook in `docs/runbooks/runbook-nav-drop.md` documents the escalation.
 - **Approval timeouts.** If the operator doesn't respond to an approval card within the configured window, the signal expires rather than auto-executing.
 - **Cost caps.** Above a daily / monthly LLM spend cap, the ClaudePaw cost gate downgrades to a cheaper model then halts entirely.

@@ -40,6 +40,22 @@
 // issued, and the report emits a HIGH severity Telegram so the operator
 // inspects before the next scheduled run.
 
+/**
+ * Approval threshold for the retrain Paw, and the single source of truth for it.
+ *
+ * 4 gates the ACT phase (which SSHes to the engine host, mv-rotates the joblib
+ * and runs `sudo systemctl restart trader-engine`) behind operator approval.
+ * The Phase 5 security audit flagged the fully autonomous setting (6, which is
+ * above max severity 5 and therefore never gates) as a footgun: an LLM
+ * misclassifying a marginal regression as healthy would autonomously restart
+ * the production engine mid-session. OBSERVE + ANALYZE + REPORT still run
+ * ungated at 4, so regression digests keep landing in Telegram automatically.
+ *
+ * The live row had drifted to 6, so `enforceRetrainRegimeApprovalThreshold`
+ * reconciles it at boot rather than trusting a one-time seed.
+ */
+export const TRAIN_REGIME_APPROVAL_THRESHOLD = 4
+
 export interface TrainRegimePawConfig {
   id: string
   name: string

@@ -46,6 +46,14 @@ import type { EquityPoint } from './metrics.js'
 
 const TRADER_REPORT_RECIPIENT = process.env.TRADER_REPORT_TO ?? 'security@example.com'
 
+/**
+ * Whether the execution venue charges commission. Alpaca US equities do not,
+ * which is the whole book today, so the honest cost check is slippage coverage
+ * rather than a fee total that is correctly zero. Set
+ * TRADER_FEE_FREE_VENUE=false the moment anything trades somewhere that bills.
+ */
+const FEE_FREE_VENUE = process.env.TRADER_FEE_FREE_VENUE !== 'false'
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -117,6 +125,19 @@ export interface KillSwitchLogEntry {
   set_by: string | null
 }
 
+/**
+ * Closures that reached a terminal state with no verdict, grouped by reason.
+ * `legacy-backfill` rows are the pre-2026-08-17 backlog stamped at migration
+ * time; they are counted separately so they never look like fresh activity.
+ */
+export interface UngradedSummary {
+  inWindow: number
+  notionalUsd: number
+  byReason: Array<{ reason: string; count: number; notionalUsd: number }>
+  /** Verdict-less closures across all time, including the pre-tracking backlog. */
+  allTime: number
+}
+
 /** One evaluation guard's verdict, surfaced in the report so failures are visible. */
 export interface GuardCheck {
   name: string
@@ -141,12 +162,30 @@ export interface WeeklyReport {
   attribution: AttributionTally
   nav: NavDelta
   /**
-   * All-time realized + open P&L computed from ENGINE filled orders and
-   * positions (broker truth). Null when the engine was unreachable. The
-   * verdict-derived totalPnlNet above can diverge from broker truth
-   * (2026-06-29 adopted-close batch); this is the authoritative number.
+   * Realized + open P&L computed from ENGINE filled orders and positions
+   * (broker truth). Null when the engine was unreachable. The verdict-derived
+   * totalPnlNet above can diverge from broker truth (2026-06-29 adopted-close
+   * batch); this is the authoritative number.
+   *
+   * `realizedTotal` / `roundTrips` are all-time over the engine's /orders
+   * window. `windowRealized` / `windowRoundTrips` cover only lots whose EXIT
+   * landed inside the report window, which is the only figure comparable to
+   * the week's verdicts.
    */
-  brokerTruth: { realizedTotal: number; openUnrealized: number; roundTrips: number } | null
+  brokerTruth: {
+    realizedTotal: number
+    openUnrealized: number
+    roundTrips: number
+    windowRealized: number
+    windowRoundTrips: number
+  } | null
+  /**
+   * Closures the grader could not score, and therefore closures the win rate
+   * above does not include. Never let this render as an absence: a week of
+   * 20 wins out of 20 means something very different when 9 more closed
+   * ungraded in the same window.
+   */
+  ungraded: UngradedSummary
   /**
    * Open-position accounting at report time: count, summed cost basis, and
    * unrealized MTM from the live engine positions. Distinct from `nav`
@@ -482,6 +521,60 @@ export async function buildOpenPositionsSection(
   }
 }
 
+/**
+ * Count the closures that produced no verdict inside the window.
+ *
+ * The win rate is computed over trader_verdicts. Every decision that closed
+ * without one is invisible to it, and the ungraded paths are not a random
+ * sample: a lot whose exit fills never landed cleanly is exactly the lot most
+ * likely to have gone wrong. Reporting the count next to the win rate is what
+ * keeps "100.00%" from being read as a fact about the strategy.
+ *
+ * Degrades to zeros (not an exception) on a DB missing the migration-7
+ * columns, so an un-migrated read replica still renders a report.
+ */
+export function summarizeUngraded(
+  db: Database.Database,
+  weekStartMs: number,
+  weekEndMs: number,
+): UngradedSummary {
+  const empty: UngradedSummary = { inWindow: 0, notionalUsd: 0, byReason: [], allTime: 0 }
+  try {
+    const rows = db.prepare(`
+      SELECT COALESCE(ungraded_reason, 'unrecorded') AS reason,
+             COUNT(*)                                AS count,
+             COALESCE(SUM(size_usd), 0)              AS notional
+      FROM trader_decisions
+      WHERE ungraded_at >= ? AND ungraded_at <= ?
+        -- Migration 7 stamped the pre-tracking backlog with decided_at, so
+        -- some of those rows fall inside a report window by accident. They
+        -- are old closures discovered late, not activity from this week, and
+        -- counting them as in-window would overstate the current failure rate.
+        -- They stay visible in the all-time line below.
+        AND COALESCE(ungraded_reason, '') <> 'legacy-backfill'
+      GROUP BY reason
+      ORDER BY count DESC
+    `).all(weekStartMs, weekEndMs) as Array<{ reason: string; count: number; notional: number }>
+
+    const allTime = (db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM trader_decisions
+      WHERE status = 'closed'
+        AND id NOT IN (SELECT decision_id FROM trader_verdicts)
+    `).get() as { c: number }).c
+
+    return {
+      inWindow: rows.reduce((s, r) => s + r.count, 0),
+      notionalUsd: rows.reduce((s, r) => s + r.notional, 0),
+      byReason: rows.map((r) => ({ reason: r.reason, count: r.count, notionalUsd: r.notional })),
+      allTime,
+    }
+  } catch (err) {
+    logger.warn({ err }, 'weekly report: ungraded-closure summary unavailable')
+    return empty
+  }
+}
+
 // ---------------------------------------------------------------------------
 // buildReport -- the main aggregator
 // ---------------------------------------------------------------------------
@@ -501,10 +594,8 @@ export async function buildOpenPositionsSection(
  * without complaint, and why every fill carries fee_usd = 0.
  *
  * Deliberately non-fatal: a failing guard degrades the report into telling the
- * truth about itself rather than suppressing it. guardCostsIncluded is expected
- * to fail today because order-reconciler.ts hardcodes zero fees and slippage on
- * every fill it writes. Do not soften the guard to make it pass; populate real
- * costs from broker fill data instead.
+ * truth about itself rather than suppressing it. Do not soften a guard to make
+ * it pass; fix the data path it is pointing at.
  */
 function runEvalGuards(
   db: Database.Database,
@@ -516,7 +607,12 @@ function runEvalGuards(
   const checks: GuardCheck[] = []
 
   if (brokerTruth) {
-    const r = guardMatchesBrokerTruth(internalRealizedNet, brokerTruth.realizedTotal)
+    // Window against window. This used to compare the week's verdict total
+    // against broker truth for ALL TIME, so the 2026-08-16 report reconciled
+    // 20 weekly verdicts against 7 lifetime round-trips and reported a 199.6%
+    // divergence. The comparison was incapable of passing, which meant a
+    // genuinely reconciled week would have looked identical to a broken one.
+    const r = guardMatchesBrokerTruth(internalRealizedNet, brokerTruth.windowRealized)
     checks.push({ name: 'reconciles-with-broker', ...r })
   }
 
@@ -524,7 +620,7 @@ function runEvalGuards(
     const fills = db.prepare(
       'SELECT * FROM trader_fills WHERE fill_ts_ms >= ? AND fill_ts_ms <= ? ORDER BY fill_ts_ms ASC',
     ).all(weekStartMs, weekEndMs) as FillRow[]
-    checks.push({ name: 'costs-included', ...guardCostsIncluded(fills) })
+    checks.push({ name: 'costs-included', ...guardCostsIncluded(fills, FEE_FREE_VENUE) })
     checks.push({ name: 'no-same-bar-close', ...guardNoSameBarClose(fills) })
   } catch (err) {
     logger.warn({ err }, 'weekly report: fill-based guards could not run')
@@ -600,7 +696,20 @@ export async function buildReport(
     try {
       const { computeBrokerTruth } = await import('./go-live-gate.js')
       const t = await computeBrokerTruth(engineClient)
-      brokerTruth = { realizedTotal: t.realizedTotal, openUnrealized: t.openUnrealized, roundTrips: t.roundTrips }
+      // A lot belongs to the window when the SELL that closed it landed there.
+      // Entry date is irrelevant: a position opened in June and closed this
+      // week is this week's realized P&L, which is exactly what the verdicts
+      // in this window represent.
+      const inWindow = t.realizedLots.filter(
+        (l) => l.exitTsMs >= weekStartMs && l.exitTsMs <= weekEndMs,
+      )
+      brokerTruth = {
+        realizedTotal: t.realizedTotal,
+        openUnrealized: t.openUnrealized,
+        roundTrips: t.roundTrips,
+        windowRealized: inWindow.reduce((s, l) => s + l.pnlNet, 0),
+        windowRoundTrips: inWindow.length,
+      }
     } catch {
       // Engine unreachable: renderer shows "unavailable" instead of a fake $0.
     }
@@ -609,6 +718,7 @@ export async function buildReport(
     await buildOpenPositionsSection(db, engineClient)
   const killSwitchEvents = buildKillSwitchEvents(opts.killSwitch ?? null, weekStartMs, weekEndMs)
   const killSwitchLog = await safeFetchKillSwitchLog(deps?.fetchKillSwitchLog, weekStartMs, weekEndMs)
+  const ungraded = summarizeUngraded(db, weekStartMs, weekEndMs)
   const guards = runEvalGuards(db, totalPnlNet, brokerTruth, weekStartMs, weekEndMs)
 
   return {
@@ -628,6 +738,7 @@ export async function buildReport(
     attribution,
     nav,
     brokerTruth,
+    ungraded,
     openPositions,
     openMtmAvailable,
     killSwitchEvents,
@@ -786,7 +897,8 @@ export function renderReportHtml(report: WeeklyReport): string {
 
   <div class="kpi-row">
     <div class="kpi"><div class="label">Verdicts</div><div class="value">${report.verdictCount}</div></div>
-    <div class="kpi"><div class="label">Win rate</div><div class="value">${formatPct(report.winRate)}</div></div>
+    <div class="kpi"><div class="label">Win rate${report.ungraded.inWindow > 0 ? ' (graded only)' : ''}</div><div class="value">${formatPct(report.winRate)}</div></div>
+    <div class="kpi"><div class="label">Ungraded closures</div><div class="value">${report.ungraded.inWindow}</div></div>
     <div class="kpi"><div class="label">Net P&amp;L</div><div class="value ${pnlClass(report.totalPnlNet)}">${formatUsd(report.totalPnlNet)}</div></div>
     <div class="kpi"><div class="label">Wins / Losses</div><div class="value">${report.winCount} / ${report.lossCount}</div></div>
     <div class="kpi"><div class="label">Open Positions</div><div class="value">${report.openPositions.openCount}</div></div>
@@ -802,6 +914,9 @@ export function renderReportHtml(report: WeeklyReport): string {
 
   <h2>Open Positions</h2>
   ${renderOpenPositionsTable(report)}
+
+  <h2>Ungraded Closures</h2>
+  ${renderUngradedSection(report.ungraded)}
 
   <h2>Per-Strategy Summary</h2>
   ${renderStrategyTable(report.strategyRollups)}
@@ -863,11 +978,39 @@ function renderMoneySummary(report: WeeklyReport): string {
   const navDelta = report.nav.available
     ? `<tr><th>Account equity change (NAV delta, includes cash/interest)</th><td class="${pnlClass(report.nav.deltaUsd ?? 0)}">${formatUsd(report.nav.deltaUsd)}</td></tr>`
     : `<tr><th>Account equity change (NAV delta)</th><td>unavailable</td></tr>`
+  // Two broker-truth rows. The in-window one is the only figure comparable to
+  // the realized P&L row above; the all-time one is the account's standing.
+  // Showing only the second is what let a weekly number sit next to a lifetime
+  // number under one heading and read as a contradiction.
   const brokerTruth = report.brokerTruth
-    ? `<tr><th>Broker truth, all time (realized on ${report.brokerTruth.roundTrips} closed round-trips + open MTM)</th><td class="${pnlClass(report.brokerTruth.realizedTotal + report.brokerTruth.openUnrealized)}">${formatUsd(report.brokerTruth.realizedTotal)} realized, ${formatUsd(report.brokerTruth.openUnrealized)} open</td></tr>`
-    : `<tr><th>Broker truth, all time</th><td>unavailable (engine unreachable)</td></tr>`
+    ? `<tr><th>Broker truth, this window (${report.brokerTruth.windowRoundTrips} round-trips closed in-window)</th><td class="${pnlClass(report.brokerTruth.windowRealized)}">${formatUsd(report.brokerTruth.windowRealized)} realized</td></tr>` +
+      `<tr><th>Broker truth, all time (realized on ${report.brokerTruth.roundTrips} closed round-trips + open MTM)</th><td class="${pnlClass(report.brokerTruth.realizedTotal + report.brokerTruth.openUnrealized)}">${formatUsd(report.brokerTruth.realizedTotal)} realized, ${formatUsd(report.brokerTruth.openUnrealized)} open</td></tr>`
+    : `<tr><th>Broker truth</th><td>unavailable (engine unreachable)</td></tr>`
   return `<table>${realized}${unrealized}${navDelta}${brokerTruth}</table>
-    <div class="muted">Realized = closed trades only; net of fees when fill data is available. Unrealized = open-position mark-to-market. NAV delta is account drift (cash + interest + MTM), not strategy performance.</div>`
+    <div class="muted">Realized = closed trades only; net of fees when fill data is available. Unrealized = open-position mark-to-market. NAV delta is account drift (cash + interest + MTM), not strategy performance. Compare the realized line against broker truth for THIS WINDOW, not against the all-time line.</div>`
+}
+
+/**
+ * Closures the grader could not score. Rendered even when the count is zero,
+ * because the value of this section is that a reader learns to look for it.
+ *
+ * Reason legend, kept next to the numbers so the section is self-explaining:
+ *   no-fill-data      -- legacy row with no cached per-decision fill
+ *   position-drift    -- broker flat, entry older than the /orders window
+ *   no-realized-lots  -- broker flat, no FIFO lot matched this decision
+ *   partial-stale     -- exit fills never covered the entry, past terminal age
+ *   legacy-backfill   -- pre-2026-08-17 backlog, stamped at migration time
+ */
+function renderUngradedSection(u: UngradedSummary): string {
+  const backlog = `<div class="muted">${u.allTime} verdict-less closures across all time, including the pre-tracking backlog.</div>`
+  if (u.inWindow === 0) {
+    return `<div class="muted">Every closure this window produced a verdict.</div>${backlog}`
+  }
+  const rows = u.byReason.map((r) =>
+    `<tr><td>${escapeHtml(r.reason)}</td><td>${r.count}</td><td>${formatUsd(r.notionalUsd)}</td></tr>`,
+  ).join('')
+  return `<div class="unavailable">${u.inWindow} closure(s) this window produced no verdict, carrying ${formatUsd(u.notionalUsd)} of notional. The win rate and net P&amp;L above cover only the graded remainder.</div>
+    <table><tr><th>Reason</th><th>Count</th><th>Notional</th></tr>${rows}</table>${backlog}`
 }
 
 /**
@@ -1052,9 +1195,16 @@ export function renderReportSummary(report: WeeklyReport): string {
   }
 
   parts.push(
-    `Win rate: ${formatPct(report.winRate)} (${report.winCount}W / ${report.lossCount}L)`,
+    `Win rate: ${formatPct(report.winRate)} (${report.winCount}W / ${report.lossCount}L)` +
+      (report.ungraded.inWindow > 0 ? ` [graded only; ${report.ungraded.inWindow} closed ungraded]` : ''),
   )
   parts.push(`Realized PnL (closed, net of fees when available): ${formatUsd(report.totalPnlNet)}`)
+  if (report.brokerTruth) {
+    parts.push(
+      `Broker truth this window: ${formatUsd(report.brokerTruth.windowRealized)} ` +
+        `(${report.brokerTruth.windowRoundTrips} round-trips)`,
+    )
+  }
   if (report.openMtmAvailable) {
     parts.push(`Unrealized MTM (open): ${formatUsd(report.openPositions.totalUnrealizedPnlUsd)}`)
   } else {

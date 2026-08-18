@@ -98,8 +98,10 @@ router.get('/api/v1/trader/bypass-progress', async (_req: Request, res: Response
       flipped: bypassCount >= BYPASS_TRADE_TARGET,
     })
   } catch (err) {
+    // Raw error stays in the log, never on the wire -- it can carry the
+    // engine URL or SQL fragments.
     logger.warn({ err }, 'trader: bypass-progress query failed')
-    res.status(500).json({ error: String(err) })
+    res.status(500).json({ error: 'bypass progress unavailable' })
   }
 })
 
@@ -131,7 +133,7 @@ router.get('/api/v1/trader/gate-progress', async (_req: Request, res: Response) 
       return
     }
     logger.warn({ err }, 'trader: gate-progress query failed')
-    res.status(500).json({ error: String(err) })
+    res.status(500).json({ error: 'gate progress unavailable' })
   }
 })
 

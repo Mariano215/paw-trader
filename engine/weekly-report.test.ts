@@ -39,6 +39,7 @@ import {
   maybeFireWeeklyReport,
   formatDate,
   WEEKLY_REPORT_KV_KEY,
+  summarizeUngraded,
   type VerdictRow,
   type WeeklyReport,
   type KillSwitchLogEntry,
@@ -563,6 +564,7 @@ describe('renderReportHtml', () => {
       weekStartMs: 0, weekEndMs: 1, generatedAtMs: 2,
       verdictCount: 0, winCount: 0, lossCount: 0, breakEvenCount: 0,
       winRate: 0, totalPnlNet: 0, brokerTruth: null,
+      ungraded: { inWindow: 0, notionalUsd: 0, byReason: [], allTime: 0 },
       bestTrades: [], worstTrades: [],
       strategyRollups: [{
         strategy_id: '<script>alert(1)</script>', trade_count: 1, win_count: 1,
@@ -964,6 +966,7 @@ describe('evaluation guards in the weekly report', () => {
       gradeBreakdown: { A: 1, B: 0, C: 0, D: 0 }, attribution: {},
       nav: { weekOpen: null, weekClose: null, deltaUsd: null, deltaPct: null, snapshotCount: 0, available: false, unavailableReason: 'test' },
       brokerTruth: null,
+      ungraded: { inWindow: 0, notionalUsd: 0, byReason: [], allTime: 0 },
       openPositions: { openCount: 0, totalCostBasisUsd: 0, unmatchedCostBasisUsd: 0, totalUnrealizedPnlUsd: 0, totalMarketValueUsd: 0, unmatchedCount: 0, positions: [] },
       openMtmAvailable: false, killSwitchEvents: [], killSwitchLog: [],
       guards,
@@ -999,25 +1002,195 @@ describe('evaluation guards in the weekly report', () => {
     expect(text.indexOf('WARNING')).toBeLessThan(text.indexOf('Account equity'))
   })
 
-  it('buildReport flags zero-fee fills, which is the live state today', async () => {
+  it('buildReport flags a fill whose slippage was never measured', async () => {
     const db = makeDb()
     const closedAt = SUN_APR_19_9AM_UTC - 2 * 86_400_000
     seedClosedTrade(db, {
       signalId: 'sig-g', decisionId: 'dec-g', strategyId: 'momentum-stocks',
       asset: 'AAPL', side: 'buy', sizeUsd: 100, pnlGross: 10, grade: 'A', closedAt,
     })
-    // The reconciler hardcodes fee_usd 0 and slippage_usd 0 on every fill it
-    // writes, so the costs guard must fail rather than quietly pass.
+    // Alpaca equities are commission-free, so fee_usd 0 is correct and the
+    // guard cannot key on it. What it CAN key on is intended_price: without
+    // one, computeSlippageUsd returns 0, and the fill records a zero cost it
+    // never actually measured. 194 of 198 live fills looked like this.
     db.prepare(`INSERT INTO trader_fills
       (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price,
        intended_price, intended_ts_ms, fill_ts_ms, fee_usd, slippage_usd, entry_thesis, exit_reason, recorded_at)
-      VALUES ('f1','dec-g','c1','b1','AAPL','buy',1,100,100,?,?,0,0,'t',NULL,?)`)
-      .run(closedAt, closedAt, closedAt)
+      VALUES ('f1','dec-g','c1','b1','AAPL','buy',1,100,NULL,NULL,?,0,0,'t',NULL,?)`)
+      .run(closedAt, closedAt)
 
     const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
     const report = await buildReport(db, null, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
     const costs = report.guards.find(g => g.name === 'costs-included')
     expect(costs?.ok).toBe(false)
+    expect(costs?.reason).toContain('intended_price')
     expect(renderReportHtml(report)).toContain('<div class="guard-warning">')
+  })
+
+  it('passes the costs guard once every fill carries an intended price', async () => {
+    const db = makeDb()
+    const closedAt = SUN_APR_19_9AM_UTC - 2 * 86_400_000
+    seedClosedTrade(db, {
+      signalId: 'sig-h', decisionId: 'dec-h', strategyId: 'momentum-stocks',
+      asset: 'AAPL', side: 'buy', sizeUsd: 100, pnlGross: 10, grade: 'A', closedAt,
+    })
+    db.prepare(`INSERT INTO trader_fills
+      (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price,
+       intended_price, intended_ts_ms, fill_ts_ms, fee_usd, slippage_usd, entry_thesis, exit_reason, recorded_at)
+      VALUES ('f2','dec-h','c2','b2','AAPL','buy',1,100.05,100,?,?,0,0.05,'t',NULL,?)`)
+      .run(closedAt, closedAt, closedAt)
+
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const report = await buildReport(db, null, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+    expect(report.guards.find(g => g.name === 'costs-included')?.ok).toBe(true)
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// Ungraded closures + windowed broker truth
+// ---------------------------------------------------------------------------
+
+describe('ungraded closures', () => {
+  function stampUngraded(
+    db: Database.Database,
+    decisionId: string,
+    reason: string,
+    at: number,
+    sizeUsd = 1000,
+  ) {
+    insertSignal(db, `sig-${decisionId}`, 'momentum-stocks', 'AAPL', 'buy')
+    insertDecision(db, decisionId, `sig-${decisionId}`, 'AAPL', sizeUsd, at - 60_000)
+    db.prepare("UPDATE trader_decisions SET status='closed', ungraded_at=?, ungraded_reason=? WHERE id=?")
+      .run(at, reason, decisionId)
+  }
+
+  it('counts in-window ungraded closures with their notional', () => {
+    const db = makeDb()
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const inside = weekStartMs + 86_400_000
+    stampUngraded(db, 'dec-a', 'no-realized-lots', inside, 1500)
+    stampUngraded(db, 'dec-b', 'partial-stale', inside, 500)
+
+    const u = summarizeUngraded(db, weekStartMs, weekEndMs)
+    expect(u.inWindow).toBe(2)
+    expect(u.notionalUsd).toBe(2000)
+    expect(u.byReason.map(r => r.reason).sort()).toEqual(['no-realized-lots', 'partial-stale'])
+    expect(u.allTime).toBe(2)
+  })
+
+  it('keeps the migration backlog out of the in-window count', () => {
+    // Migration 7 stamped legacy rows with decided_at, so some land inside a
+    // window by accident. Counting them as this week's failures would make an
+    // old backlog look like a fresh outbreak.
+    const db = makeDb()
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const inside = weekStartMs + 86_400_000
+    stampUngraded(db, 'dec-old', 'legacy-backfill', inside, 900)
+    stampUngraded(db, 'dec-new', 'no-fill-data', inside, 100)
+
+    const u = summarizeUngraded(db, weekStartMs, weekEndMs)
+    expect(u.inWindow).toBe(1)
+    expect(u.notionalUsd).toBe(100)
+    // Still visible in the lifetime figure -- hidden from the week, not erased.
+    expect(u.allTime).toBe(2)
+  })
+
+  it('excludes ungraded closures from outside the window', () => {
+    const db = makeDb()
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    stampUngraded(db, 'dec-before', 'position-drift', weekStartMs - 86_400_000)
+    const u = summarizeUngraded(db, weekStartMs, weekEndMs)
+    expect(u.inWindow).toBe(0)
+    expect(u.allTime).toBe(1)
+  })
+
+  it('surfaces the count in the HTML and the Telegram summary', async () => {
+    const db = makeDb()
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    stampUngraded(db, 'dec-u', 'no-realized-lots', weekStartMs + 86_400_000, 2500)
+    const report = await buildReport(db, null, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+
+    expect(report.ungraded.inWindow).toBe(1)
+    const html = renderReportHtml(report)
+    expect(html).toContain('Ungraded Closures')
+    expect(html).toContain('no-realized-lots')
+    expect(html).toContain('$2500.00')
+    expect(renderReportSummary(report)).toContain('1 closed ungraded')
+  })
+
+  it('says so plainly when every closure was graded', async () => {
+    const db = makeDb()
+    const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+    const report = await buildReport(db, null, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+    expect(renderReportHtml(report)).toContain('Every closure this window produced a verdict')
+    expect(renderReportSummary(report)).not.toContain('closed ungraded')
+  })
+})
+
+describe('broker truth is compared window against window', () => {
+  const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
+
+  function engineWithLots(exitTimes: number[]): EngineClient {
+    // computeBrokerTruth FIFO-matches these into one realized lot per pair.
+    const orders = exitTimes.flatMap((t, i) => ([
+      { client_order_id: `b${i}`, broker_order_id: `bb${i}`, asset: 'AAPL', side: 'buy' as const,
+        qty: 1, order_type: 'limit' as const, limit_price: null, status: 'filled',
+        filled_qty: 1, filled_avg_price: 100, source: 't', created_at: t - 1000, updated_at: t - 1000 },
+      { client_order_id: `s${i}`, broker_order_id: `ss${i}`, asset: 'AAPL', side: 'sell' as const,
+        qty: 1, order_type: 'limit' as const, limit_price: null, status: 'filled',
+        filled_qty: 1, filled_avg_price: 90, source: 't', created_at: t, updated_at: t },
+    ]))
+    return {
+      getOrders: vi.fn().mockResolvedValue(orders),
+      getPositions: vi.fn().mockResolvedValue([]),
+      getNavSnapshots: vi.fn().mockResolvedValue([]),
+    } as unknown as EngineClient
+  }
+
+  it('reports in-window realized separately from all-time realized', async () => {
+    const db = makeDb()
+    // Three losing round-trips: one inside the window, two well before it.
+    const engine = engineWithLots([
+      weekStartMs + 86_400_000,
+      weekStartMs - 30 * 86_400_000,
+      weekStartMs - 60 * 86_400_000,
+    ])
+    const report = await buildReport(db, engine, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+
+    expect(report.brokerTruth!.roundTrips).toBe(3)
+    expect(report.brokerTruth!.realizedTotal).toBeCloseTo(-30, 6)
+    expect(report.brokerTruth!.windowRoundTrips).toBe(1)
+    expect(report.brokerTruth!.windowRealized).toBeCloseTo(-10, 6)
+  })
+
+  it('reconciles when the week verdicts match the week broker lots', async () => {
+    const db = makeDb()
+    const closedAt = weekStartMs + 86_400_000
+    // One verdict, -10 net, matching the single in-window broker lot.
+    seedClosedTrade(db, {
+      signalId: 'sig-r', decisionId: 'dec-r', strategyId: 'momentum-stocks',
+      asset: 'AAPL', side: 'buy', sizeUsd: 100, pnlGross: -10, grade: 'D', closedAt,
+    })
+    const engine = engineWithLots([closedAt, weekStartMs - 30 * 86_400_000])
+    const report = await buildReport(db, engine, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+
+    // Against all-time (-20) this would read as a 50% divergence and fail.
+    expect(report.brokerTruth!.realizedTotal).toBeCloseTo(-20, 6)
+    expect(report.guards.find(g => g.name === 'reconciles-with-broker')?.ok).toBe(true)
+  })
+
+  it('still fails the guard when the week itself does not reconcile', async () => {
+    const db = makeDb()
+    const closedAt = weekStartMs + 86_400_000
+    seedClosedTrade(db, {
+      signalId: 'sig-b', decisionId: 'dec-b', strategyId: 'momentum-stocks',
+      asset: 'AAPL', side: 'buy', sizeUsd: 100, pnlGross: 749, grade: 'A', closedAt,
+    })
+    const engine = engineWithLots([closedAt])
+    const report = await buildReport(db, engine, { weekStartMs, weekEndMs, nowMs: SUN_APR_19_9AM_UTC })
+    const guard = report.guards.find(g => g.name === 'reconciles-with-broker')
+    expect(guard?.ok).toBe(false)
+    expect(guard?.reason).toContain('one of the two accounting paths is wrong')
   })
 })

@@ -56,15 +56,34 @@ export function guardNoSameBarClose(fills: FillRow[]): GuardResult {
 }
 
 /**
- * Costs-present guard: a closed round trip must carry non-zero costs
- * unless the venue is explicitly fee-free. Real fills with exactly zero
- * fees AND zero slippage on every leg usually means costs were dropped.
- * Fails when every fill has fee_usd == 0 and slippage_usd == 0 and
- * `feeFreeVenue` is false.
+ * Costs-present guard: a closed round trip must carry a real execution cost.
+ *
+ * `feeFreeVenue` is not a way to switch the guard off. Alpaca equities really
+ * are commission-free, so demanding fee_usd != 0 there fails forever on a
+ * condition nobody can fix, and a guard that can only fail is one people learn
+ * to scroll past. On a fee-free venue the execution cost IS the slippage, so
+ * the guard moves to slippage coverage instead: the fills must record what
+ * price we meant to get, not just the one we got.
+ *
+ * Slippage is only computed when a fill carries an intended_price
+ * (computeSlippageUsd returns 0 without one), so a fill missing that field is
+ * not a zero-cost fill, it is an unmeasured one.
  */
 export function guardCostsIncluded(fills: FillRow[], feeFreeVenue = false): GuardResult {
-  if (feeFreeVenue) return { ok: true, reason: 'venue is fee-free by configuration' }
   if (fills.length === 0) return { ok: true, reason: 'no fills to check' }
+
+  if (feeFreeVenue) {
+    const measured = fills.filter((f) => f.intended_price != null).length
+    if (measured === fills.length) {
+      return { ok: true, reason: 'fee-free venue; slippage measured on every fill' }
+    }
+    return {
+      ok: false,
+      reason: `fee-free venue, but ${fills.length - measured} of ${fills.length} fills carry no ` +
+        'intended_price, so their slippage is recorded as 0 without being measured',
+    }
+  }
+
   const anyCost = fills.some((f) => f.fee_usd !== 0 || f.slippage_usd !== 0)
   if (anyCost) return { ok: true, reason: 'fees or slippage present' }
   return {

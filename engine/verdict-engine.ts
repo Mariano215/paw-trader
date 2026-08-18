@@ -22,6 +22,7 @@
  */
 import type { EngineOrder, PricePoint } from './types.js'
 import type { CommitteeTranscript } from './committee.js'
+import type { RealizedLot } from './audit-log.js'
 
 const CRYPTO_BENCH = 'BTC/USD'
 const STOCK_BENCH = 'SPY'
@@ -53,6 +54,11 @@ export interface VerdictOutcome {
   thesisGrade: ThesisGrade
   closedAtMs: number
   fullyClosed: boolean
+  /**
+   * Quantity actually matched by the realized layer. Only set on the
+   * verdictFromRealizedLots path; the pooled-fill path leaves it undefined.
+   */
+  closedQty?: number
 }
 
 export interface AgentAttribution {
@@ -88,6 +94,59 @@ export function rollUpFills(
     fees: 0,
     firstFillMs,
     lastFillMs,
+  }
+}
+
+/**
+ * Compute a verdict from this decision's own FIFO-matched realized lots.
+ *
+ * This is the grading path. computeVerdict below grades a lot against the
+ * POOLED average sell price for the asset since the decision was made, which
+ * is only correct when the asset had exactly one entry and one exit. With
+ * several lots open at once, every lot that entered below the pooled average
+ * scores a win by construction, and the ones that entered above it never got
+ * graded at all because their own exit fills were never isolated. The week of
+ * 2026-08-09 closed 20 verdicts, all winners, +$749.18, while broker truth for
+ * the whole account was -$746.25.
+ *
+ * trader_realized_pnl already matches buy lots to the sells that actually
+ * closed them (FIFO, per asset, across decision boundaries). Grading off those
+ * rows makes the verdict agree with the realized layer by construction, so the
+ * two accounting paths can no longer drift apart silently.
+ *
+ * Returns null when the decision has no matched lots. That is not a failure:
+ * it means no sell fill has closed this lot yet, and the honest answer is no
+ * verdict rather than one built from another lot's exit.
+ */
+export function verdictFromRealizedLots(lots: RealizedLot[]): VerdictOutcome | null {
+  if (lots.length === 0) return null
+
+  let qty = 0
+  let cost = 0
+  let pnlGross = 0
+  let pnlNet = 0
+  let closedAtMs = 0
+  for (const lot of lots) {
+    qty += lot.qty
+    cost += lot.entryPrice * lot.qty
+    pnlGross += lot.pnlGross
+    pnlNet += lot.pnlNet
+    if (lot.exitTsMs > closedAtMs) closedAtMs = lot.exitTsMs
+  }
+
+  const pnlPct = cost > 0 ? pnlGross / cost : 0
+  const benchReturn = 0
+  return {
+    pnlGross,
+    pnlNet,
+    pnlPct,
+    benchReturn,
+    holdDrawdown: 0,
+    thesisGrade: gradeThesis(pnlPct, benchReturn),
+    closedAtMs,
+    fullyClosed: true,
+    /** Matched quantity, so the caller can compare it against filled_qty. */
+    closedQty: qty,
   }
 }
 

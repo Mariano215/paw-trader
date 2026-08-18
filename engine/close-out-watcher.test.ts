@@ -123,6 +123,39 @@ function fillOrder(overrides: Partial<EngineOrder> = {}): EngineOrder {
   }
 }
 
+/**
+ * Mirror the engine orders a fixture hands to processClosure into trader_fills.
+ *
+ * Grading reads this decision's own FIFO-matched realized lots, which are
+ * derived from trader_fills. A fixture that only mocks /orders describes a
+ * broker that filled and a fill log that never recorded it, which is exactly
+ * the state that now closes ungraded rather than being graded against pooled
+ * prices. In production the order reconciler writes these rows on the same
+ * event that produces the order snapshot.
+ *
+ * Sell fills are keyed to a separate exit decision id, matching production
+ * where an exit is always its own decision.
+ */
+function mirrorOrdersToFills(
+  db: Database.Database,
+  decisionId: string,
+  orders: EngineOrder[],
+  asset = 'AAPL',
+): void {
+  for (const o of orders) {
+    if (o.asset !== asset || o.filled_qty <= 0) continue
+    recordFill(db, {
+      decisionId: o.side === 'buy' ? decisionId : `exit-${decisionId}`,
+      clientOrderId: o.client_order_id,
+      asset: o.asset,
+      side: o.side,
+      fillQty: o.filled_qty,
+      fillPrice: o.filled_avg_price ?? 0,
+      fillTsMs: o.updated_at,
+    })
+  }
+}
+
 describe('findOpenDecisions', () => {
   let db: ReturnType<typeof makeDb>
   beforeEach(() => { db = makeDb() })
@@ -198,6 +231,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  asset: 'AAPL', filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', asset: 'AAPL', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const result = processClosure(db, getOpen('dec-1'), [], orders)
 
     expect(result.reason).toBe('closed')
@@ -230,6 +264,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  filled_qty: 5, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 5, filled_avg_price: 90,  created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const result = processClosure(db, getOpen('dec-1'), [], orders)
 
     expect(result.outcome!.pnlGross).toBe(-50)
@@ -246,6 +281,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 1, filled_avg_price: 105, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const result = processClosure(db, getOpen('dec-1'), [], orders)
 
     expect(result.reason).toBe('closed')
@@ -308,6 +344,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 5,  filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const result = processClosure(db, getOpen('dec-1'), [], orders)
     expect(result.reason).toBe('partial')
     const count = db.prepare('SELECT COUNT(*) as n FROM trader_verdicts').get() as { n: number }
@@ -322,6 +359,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-tr', orders)
     const result = processClosure(db, getOpen('dec-tr'), [], orders)
     expect(result.reason).toBe('closed')
 
@@ -343,6 +381,7 @@ describe('processClosure', () => {
       fillOrder({ side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 1, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-orphan', orders)
     const result = processClosure(db, getOpen('dec-orphan'), [], orders)
     expect(result.reason).toBe('closed')
     const verdict = db.prepare('SELECT * FROM trader_verdicts WHERE decision_id=?').get('dec-orphan') as any
@@ -377,7 +416,7 @@ describe('runCloseOutSweep', () => {
 
   it('returns zeros when no decisions are open', async () => {
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 0, driftClosed: 0 })
+    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 0, driftClosed: 0, ungraded: 0 })
     // getPositions is called by writeDailySnapshot (open MTM); getOrders is
     // NOT called when open.length === 0 (no close-out processing needed).
     expect(getOrders).not.toHaveBeenCalled()
@@ -389,7 +428,7 @@ describe('runCloseOutSweep', () => {
     getPositions.mockRejectedValue(new Error('engine 503'))
 
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 1, driftClosed: 0 })
+    expect(result).toEqual({ processed: 0, stillOpen: 0, errors: 1, driftClosed: 0, ungraded: 0 })
     const count = db.prepare('SELECT COUNT(*) as n FROM trader_verdicts').get() as { n: number }
     expect(count.n).toBe(0)
   })
@@ -405,13 +444,15 @@ describe('runCloseOutSweep', () => {
     getPositions.mockResolvedValue([
       { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 100, unrealized_pnl: 0, source: 'paper', updated_at: Date.now() },
     ])
-    getOrders.mockResolvedValue([
+    const nvdaOrders = [
       fillOrder({ asset: 'NVDA', side: 'buy',  filled_qty: 5, filled_avg_price: 200, created_at: 1100, updated_at: 1100 }),
       fillOrder({ asset: 'NVDA', side: 'sell', filled_qty: 5, filled_avg_price: 220, created_at: 5000, updated_at: 5000 }),
-    ])
+    ]
+    getOrders.mockResolvedValue(nvdaOrders)
+    mirrorOrdersToFills(db, 'dec-nvda', nvdaOrders, 'NVDA')
 
     const result = await runCloseOutSweep(db, engine)
-    expect(result).toEqual({ processed: 1, stillOpen: 1, errors: 0, driftClosed: 0 })
+    expect(result).toEqual({ processed: 1, stillOpen: 1, errors: 0, driftClosed: 0, ungraded: 0 })
 
     const verdicts = db.prepare('SELECT decision_id, pnl_gross FROM trader_verdicts ORDER BY decision_id').all() as any[]
     expect(verdicts).toHaveLength(1)
@@ -428,11 +469,13 @@ describe('runCloseOutSweep', () => {
     insertExecutedDecision(db, 'dec-bad',  'sig-bad',  { asset: 'BAD',  decidedAt: Date.now() - 1000 })
 
     getPositions.mockResolvedValue([])
-    getOrders.mockResolvedValue([
+    const goodOrders = [
       fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 1, filled_avg_price: 105, created_at: 5000, updated_at: 5000 }),
       // BAD asset has no fills -> 'no-fills' branch (counted as error per design)
-    ])
+    ]
+    getOrders.mockResolvedValue(goodOrders)
+    mirrorOrdersToFills(db, 'dec-good', goodOrders)
 
     const result = await runCloseOutSweep(db, engine)
     expect(result.processed).toBe(1)
@@ -593,6 +636,19 @@ describe('per-decision lot attribution (Jun 11 2026 multi-count regression)', ()
       fillOrder({ asset: 'QQQ', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ asset: 'QQQ', side: 'sell', filled_qty: 10, filled_avg_price: 90,  created_at: 5000, updated_at: 5000 }),
     ]
+    // One buy fill per decision (that is what the reconciler writes), and one
+    // pooled sell that closes all three. FIFO keys each realized lot back to
+    // the decision that opened it, which is the whole point of the fix.
+    for (const [i, qty] of [['1', 2], ['2', 3], ['3', 5]] as const) {
+      recordFill(db, {
+        decisionId: `dec-${i}`, clientOrderId: `co-${i}`, asset: 'QQQ', side: 'buy',
+        fillQty: qty as number, fillPrice: 100, fillTsMs: 1100 + Number(i),
+      })
+    }
+    recordFill(db, {
+      decisionId: 'dec-exit', clientOrderId: 'co-exit', asset: 'QQQ', side: 'sell',
+      fillQty: 10, fillPrice: 90, fillTsMs: 5000,
+    })
     for (const id of ['dec-1', 'dec-2', 'dec-3']) {
       const row = findOpenDecisions(db).find(d => d.id === id)!
       const r = processClosure(db, row, [], orders)
@@ -641,6 +697,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
       benchReturn: 0.03,
       holdDrawdown: -0.08,
     }
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const result = processClosure(db, getOpen('dec-1'), [], orders, priceFetch)
     expect(result.reason).toBe('closed')
 
@@ -667,6 +724,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
       benchReturn: 0.12,   // bench beat us
       holdDrawdown: -0.01,
     }
+    mirrorOrdersToFills(db, 'dec-rg', orders)
     const result = processClosure(db, getOpen('dec-rg'), [], orders, priceFetch)
     expect(result.reason).toBe('closed')
 
@@ -693,6 +751,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
       benchReturn: 0,
       holdDrawdown: 0,
     }
+    mirrorOrdersToFills(db, 'dec-pg', orders)
     const result = processClosure(db, getOpen('dec-pg'), [], orders, priceFetch)
     const verdict = db.prepare('SELECT * FROM trader_verdicts WHERE decision_id = ?').get('dec-pg') as any
     expect(verdict.bench_return).toBe(0)
@@ -713,6 +772,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
       benchReturn: 0,
       holdDrawdown: 0,
     }
+    mirrorOrdersToFills(db, 'dec-2', orders)
     const result = processClosure(db, getOpen('dec-2'), [], orders, priceFetch)
     expect(result.reason).toBe('closed')
 
@@ -730,6 +790,7 @@ describe('processClosure with priceFetchResult (Phase 4 Task B)', () => {
       fillOrder({ side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
       fillOrder({ side: 'sell', filled_qty: 1, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
     ]
+    mirrorOrdersToFills(db, 'dec-3', orders)
     processClosure(db, getOpen('dec-3'), [], orders)
 
     const verdict = db.prepare('SELECT * FROM trader_verdicts WHERE decision_id = ?').get('dec-3') as any
@@ -818,12 +879,14 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
     insertSignal(db, 'sig-1', { asset: 'AAPL', strategy: 'momentum-stocks' })
     insertExecutedDecision(db, 'dec-1', 'sig-1', { asset: 'AAPL', decidedAt: 1000 })
 
+    const orders = [
+      fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
+    ]
+    mirrorOrdersToFills(db, 'dec-1', orders)
     const engine = {
       getPositions: vi.fn().mockResolvedValue([]),  // asset closed
-      getOrders: vi.fn().mockResolvedValue([
-        fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
-        fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
-      ]),
+      getOrders: vi.fn().mockResolvedValue(orders),
       getPrices: vi.fn()
         .mockResolvedValueOnce([pricePoint(1000, 100), pricePoint(3000, 90), pricePoint(5000, 110)])  // asset
         .mockResolvedValueOnce([pricePoint(1000, 400), pricePoint(5000, 420)]),                        // bench SPY
@@ -862,12 +925,14 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
     insertSignal(db, 'sig-fail', { asset: 'AAPL', strategy: 'momentum-stocks' })
     insertExecutedDecision(db, 'dec-fail', 'sig-fail', { asset: 'AAPL', decidedAt: 1000, filledQty: 1, filledAvgPrice: 100 })
 
+    const orders = [
+      fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 1, filled_avg_price: 105, created_at: 5000, updated_at: 5000 }),
+    ]
+    mirrorOrdersToFills(db, 'dec-fail', orders)
     const engine = {
       getPositions: vi.fn().mockResolvedValue([]),
-      getOrders: vi.fn().mockResolvedValue([
-        fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 1, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
-        fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 1, filled_avg_price: 105, created_at: 5000, updated_at: 5000 }),
-      ]),
+      getOrders: vi.fn().mockResolvedValue(orders),
       getPrices: vi.fn().mockRejectedValue(new Error('engine /prices 503')),
     } as unknown as EngineClient
 
@@ -888,12 +953,14 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
     db.prepare(`INSERT INTO trader_decisions
       (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, filled_qty, filled_avg_price)
       VALUES ('d-rec','s-rec','buy','AAPL',150,'market','t',0.8,1000,'executed',10,100)`).run()
+    const orders = [
+      fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
+      fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
+    ]
+    mirrorOrdersToFills(db, 'd-rec', orders)
     const client = {
       getPositions: vi.fn().mockResolvedValue([]), // closed
-      getOrders: vi.fn().mockResolvedValue([
-        fillOrder({ asset: 'AAPL', side: 'buy',  filled_qty: 10, filled_avg_price: 100, created_at: 1100, updated_at: 1100 }),
-        fillOrder({ asset: 'AAPL', side: 'sell', filled_qty: 10, filled_avg_price: 110, created_at: 5000, updated_at: 5000 }),
-      ]),
+      getOrders: vi.fn().mockResolvedValue(orders),
       getPrices: vi.fn().mockResolvedValue([]),
     }
     const sweep = await runCloseOutSweep(db, client as unknown as EngineClient)
@@ -936,5 +1003,97 @@ describe('I1: processClosure populates trader_realized_pnl via recomputeRealized
     expect(rows).toHaveLength(1)
     expect(rows[0].pnl_gross).toBeCloseTo(150, 10)   // (115-100)*10
     expect(rows[0].lot_match_rule).toBe('FIFO')
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// The 2026-08-09 week: 20 verdicts, 20 wins, broker truth negative.
+// ---------------------------------------------------------------------------
+
+describe('grading uses this decision own exit fills, not the pooled average', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it('grades a lot that entered above the pooled average as the loss it was', () => {
+    // Two lots on one asset, one cheap and one expensive, closed by two sells
+    // at different prices. Pooled grading scored BOTH against the average sell
+    // price, which made the expensive lot look like a winner. FIFO matches the
+    // cheap lot to the first sell and the expensive one to the second.
+    insertSignal(db, 'sig-cheap', { asset: 'TLT' })
+    insertSignal(db, 'sig-rich',  { asset: 'TLT' })
+    insertExecutedDecision(db, 'dec-cheap', 'sig-cheap', { asset: 'TLT', decidedAt: 1000, filledQty: 10, filledAvgPrice: 80 })
+    insertExecutedDecision(db, 'dec-rich',  'sig-rich',  { asset: 'TLT', decidedAt: 1000, filledQty: 10, filledAvgPrice: 100 })
+
+    recordFill(db, { decisionId: 'dec-cheap', clientOrderId: 'c1', asset: 'TLT', side: 'buy',  fillQty: 10, fillPrice: 80,  fillTsMs: 1100 })
+    recordFill(db, { decisionId: 'dec-rich',  clientOrderId: 'c2', asset: 'TLT', side: 'buy',  fillQty: 10, fillPrice: 100, fillTsMs: 1200 })
+    recordFill(db, { decisionId: 'x1', clientOrderId: 'c3', asset: 'TLT', side: 'sell', fillQty: 10, fillPrice: 95, fillTsMs: 5000 })
+    recordFill(db, { decisionId: 'x2', clientOrderId: 'c4', asset: 'TLT', side: 'sell', fillQty: 10, fillPrice: 90, fillTsMs: 6000 })
+
+    for (const id of ['dec-cheap', 'dec-rich']) {
+      const row = findOpenDecisions(db).find(d => d.id === id)!
+      expect(processClosure(db, row, [], []).reason).toBe('closed')
+    }
+
+    const cheap = db.prepare("SELECT pnl_gross FROM trader_verdicts WHERE decision_id='dec-cheap'").get() as any
+    const rich  = db.prepare("SELECT pnl_gross FROM trader_verdicts WHERE decision_id='dec-rich'").get() as any
+    expect(cheap.pnl_gross).toBe(150)    // (95 - 80) * 10
+    expect(rich.pnl_gross).toBe(-100)    // (90 - 100) * 10, NOT a win
+    // The two verdicts must sum to the round-trip's real P&L, not exceed it.
+    const total = db.prepare('SELECT SUM(pnl_gross) t FROM trader_verdicts').get() as any
+    expect(total.t).toBe(50)
+  })
+
+  it('closes ungraded when the broker is flat but no sell fill matched the lot', () => {
+    // The live TLT stack: 180 shares bought 2026-07-31, one 0.634-share sell,
+    // engine reporting no position. Under pooled grading five of those lots
+    // scored as small winners off that single sell. There is no honest number
+    // here, so there must be no verdict.
+    insertSignal(db, 'sig-ghost', { asset: 'TLT' })
+    insertExecutedDecision(db, 'dec-ghost', 'sig-ghost', { asset: 'TLT', decidedAt: 1000, filledQty: 24, filledAvgPrice: 82 })
+    recordFill(db, { decisionId: 'dec-ghost', clientOrderId: 'c1', asset: 'TLT', side: 'buy', fillQty: 24, fillPrice: 82, fillTsMs: 1100 })
+
+    // The entry order is still inside the engine's window, so this is not
+    // drift: the buy is right there, it simply never met a sell.
+    const orders = [fillOrder({ asset: 'TLT', side: 'buy', filled_qty: 24, filled_avg_price: 82, created_at: 1100, updated_at: 1100 })]
+    const row = findOpenDecisions(db).find(d => d.id === 'dec-ghost')!
+    const r = processClosure(db, row, [], orders)
+    expect(r.reason).toBe('no-realized-lots')
+    expect(db.prepare('SELECT COUNT(*) n FROM trader_verdicts').get()).toEqual({ n: 0 })
+  })
+
+  it('defers a genuinely partial close, then terminates it past the drift age', () => {
+    insertSignal(db, 'sig-part', { asset: 'IWM' })
+    const decidedAt = 1_000_000
+    insertExecutedDecision(db, 'dec-part', 'sig-part', { asset: 'IWM', decidedAt, filledQty: 10, filledAvgPrice: 100 })
+    recordFill(db, { decisionId: 'dec-part', clientOrderId: 'c1', asset: 'IWM', side: 'buy',  fillQty: 10, fillPrice: 100, fillTsMs: decidedAt })
+    recordFill(db, { decisionId: 'x1',       clientOrderId: 'c2', asset: 'IWM', side: 'sell', fillQty: 4,  fillPrice: 110, fillTsMs: decidedAt + 1000 })
+
+    const row = findOpenDecisions(db).find(d => d.id === 'dec-part')!
+    expect(processClosure(db, row, [], [], undefined, decidedAt + 60_000).reason).toBe('partial')
+    expect(db.prepare('SELECT COUNT(*) n FROM trader_verdicts').get()).toEqual({ n: 0 })
+  })
+
+  it('sweep terminates a stale partial instead of deferring it forever', async () => {
+    const decidedAt = Date.now() - (DRIFT_TERMINAL_AGE_MS + 86_400_000)
+    insertSignal(db, 'sig-stale', { asset: 'IWM' })
+    insertExecutedDecision(db, 'dec-stale', 'sig-stale', { asset: 'IWM', decidedAt, filledQty: 10, filledAvgPrice: 100 })
+    recordFill(db, { decisionId: 'dec-stale', clientOrderId: 'c1', asset: 'IWM', side: 'buy',  fillQty: 10, fillPrice: 100, fillTsMs: decidedAt })
+    recordFill(db, { decisionId: 'x1',        clientOrderId: 'c2', asset: 'IWM', side: 'sell', fillQty: 4,  fillPrice: 110, fillTsMs: decidedAt + 1000 })
+
+    const engine = {
+      getPositions: vi.fn().mockResolvedValue([]),
+      getOrders: vi.fn().mockResolvedValue([]),
+      getPrices: vi.fn().mockResolvedValue([]),
+      getNavLatest: vi.fn().mockResolvedValue(null),
+    } as unknown as EngineClient
+
+    const r = await runCloseOutSweep(db, engine)
+    expect(r.ungraded).toBe(1)
+    const row = db.prepare("SELECT status, ungraded_reason FROM trader_decisions WHERE id='dec-stale'").get() as any
+    expect(row.status).toBe('closed')
+    expect(row.ungraded_reason).toBe('partial-stale')
+    // And it never comes back.
+    expect((await runCloseOutSweep(db, engine)).ungraded).toBe(0)
   })
 })

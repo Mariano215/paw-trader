@@ -323,6 +323,27 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
       db.exec('DELETE FROM trader_strategy_track_record')
     },
   },
+  {
+    version: 7,
+    description:
+      'Ungraded-closure bookkeeping. A decision can reach a terminal state without a verdict (no per-decision fill data, position drift, exit fills that never covered the entry). Those paths flipped status to closed and logged a line, so the closure vanished from every rollup: 129 of them by 2026-08-16, all of them silently absent from the weekly win rate while the graded remainder read 20 wins and 0 losses. Recording when and why a closure went ungraded makes the omission countable, and therefore reportable.',
+    up: (db) => {
+      addColumn(db, 'trader_decisions', 'ungraded_at', 'INTEGER')
+      addColumn(db, 'trader_decisions', 'ungraded_reason', 'TEXT')
+      // Existing verdict-less closures predate the bookkeeping. Stamp them so
+      // they are counted somewhere rather than inferred from an absence, and
+      // tag them apart so they never masquerade as a fresh in-window closure.
+      db.prepare(`
+        UPDATE trader_decisions
+        SET ungraded_at = decided_at, ungraded_reason = 'legacy-backfill'
+        WHERE status = 'closed'
+          AND ungraded_at IS NULL
+          AND id NOT IN (SELECT decision_id FROM trader_verdicts)
+      `).run()
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_trader_decisions_ungraded
+        ON trader_decisions(ungraded_at)`)
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {
@@ -339,7 +360,7 @@ export const TRADER_SCHEMA_VERSION = Math.max(...TRADER_MIGRATIONS.map((m) => m.
 export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_strategies: ['id', 'name', 'asset_class', 'tier', 'status', 'params_json', 'created_at', 'updated_at', 'max_size_usd'],
   trader_signals: ['id', 'strategy_id', 'asset', 'side', 'raw_score', 'horizon_days', 'enrichment_json', 'generated_at', 'status'],
-  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id'],
+  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id', 'ungraded_at', 'ungraded_reason'],
   trader_committee_transcripts: ['id', 'signal_id', 'transcript_json', 'rounds', 'total_tokens', 'total_cost_usd', 'created_at'],
   trader_approvals: ['id', 'decision_id', 'sent_at', 'responded_at', 'response', 'override_size'],
   trader_verdicts: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled', 'excluded_at'],

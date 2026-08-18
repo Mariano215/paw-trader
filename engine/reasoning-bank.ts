@@ -41,6 +41,21 @@ export interface PastCaseQuery {
   side?: string
   /** Maximum number of cases to return. Defaults to 3. */
   k?: number
+  /**
+   * Outcome embargo. Only cases written at or before this timestamp (ms) are
+   * retrievable. Defaults to now, which makes it a no-op in live trading.
+   *
+   * This exists for evaluation, not for live. Rows land here at close time
+   * carrying a realized outcome, so replaying a historical signal without an
+   * embargo hands the committee the graded results of trades that had not
+   * happened yet at the moment being simulated. That is textbook lookahead
+   * and it inflates any backtest or post-cutoff replay that touches the bank.
+   * The 2026 agentic-trading survey flags episodic memory retrieval as a
+   * leading leakage vector for exactly this reason.
+   *
+   * Any replay harness MUST pass the simulated decision time here.
+   */
+  asOf?: number
 }
 
 /**
@@ -58,17 +73,18 @@ export function getPastCases(
   query: PastCaseQuery,
 ): ReasoningBankCase[] {
   const k = Math.max(1, Math.min(query.k ?? 3, 10))
+  const asOf = query.asOf ?? Date.now()
   try {
     const primary = db
       .prepare(
         `SELECT id, decision_id, signal_id, asset, side, strategy, summary,
                 thesis_grade, outcome, pnl_net, embedding_id, created_at
          FROM trader_reasoning_bank
-         WHERE asset = ? AND strategy = ?
+         WHERE asset = ? AND strategy = ? AND created_at <= ?
          ORDER BY created_at DESC
          LIMIT ?`,
       )
-      .all(query.asset, query.strategy, k) as ReasoningBankCase[]
+      .all(query.asset, query.strategy, asOf, k) as ReasoningBankCase[]
 
     if (primary.length >= k) return primary
 
@@ -82,13 +98,13 @@ export function getPastCases(
       `SELECT id, decision_id, signal_id, asset, side, strategy, summary,
               thesis_grade, outcome, pnl_net, embedding_id, created_at
        FROM trader_reasoning_bank
-       WHERE strategy = ?` +
+       WHERE strategy = ? AND created_at <= ?` +
       (excludeIds.length ? ` AND id NOT IN (${placeholders})` : ``) +
       ` ORDER BY created_at DESC
         LIMIT ?`
     const fallback = db
       .prepare(fallbackSql)
-      .all(query.strategy, ...excludeIds, remaining) as ReasoningBankCase[]
+      .all(query.strategy, asOf, ...excludeIds, remaining) as ReasoningBankCase[]
     return [...primary, ...fallback]
   } catch {
     return []
@@ -151,15 +167,17 @@ export function rollupRecentOutcomes(
   db: Database.Database,
   assetClass: AssetClass,
   limit = 20,
+  /** Outcome embargo; see PastCaseQuery.asOf. Defaults to now (no-op live). */
+  asOf: number = Date.now(),
 ): RollupResult {
   const rows = db.prepare(`
     SELECT rb.asset, rb.side, rb.pnl_net, rb.outcome, rb.created_at
     FROM trader_reasoning_bank rb
     INNER JOIN trader_strategies s ON s.id = rb.strategy
-    WHERE s.asset_class = ?
+    WHERE s.asset_class = ? AND rb.created_at <= ?
     ORDER BY rb.created_at DESC
     LIMIT ?
-  `).all(assetClass, limit) as Array<{
+  `).all(assetClass, asOf, limit) as Array<{
     asset: string; side: string; pnl_net: number | null; outcome: string | null; created_at: number
   }>
 

@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest'
 import {
   rollUpFills,
   computeVerdict,
+  verdictFromRealizedLots,
   gradeThesis,
   attributeAgents,
   summarizeForReasoningBank,
@@ -17,6 +18,7 @@ import {
   priceWindows,
 } from './verdict-engine.js'
 import type { EngineOrder, PricePoint } from './types.js'
+import type { RealizedLot } from './audit-log.js'
 import type { CommitteeTranscript } from './committee.js'
 
 function order(overrides: Partial<EngineOrder> = {}): EngineOrder {
@@ -415,5 +417,68 @@ describe('priceWindows', () => {
     expect(w.benchToMs).toBe(2000)
     expect(w.assetFromMs).toBe(1000)
     expect(w.assetToMs).toBe(2000)
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// verdictFromRealizedLots -- the grading path
+// ---------------------------------------------------------------------------
+
+function lot(over: Partial<RealizedLot> = {}): RealizedLot {
+  const qty = over.qty ?? 10
+  const entryPrice = over.entryPrice ?? 100
+  const exitPrice = over.exitPrice ?? 110
+  const pnlGross = over.pnlGross ?? (exitPrice - entryPrice) * qty
+  return {
+    qty, entryPrice, exitPrice,
+    entryTsMs: over.entryTsMs ?? 1000,
+    exitTsMs: over.exitTsMs ?? 5000,
+    feesUsd: over.feesUsd ?? 0,
+    pnlGross,
+    pnlNet: over.pnlNet ?? pnlGross,
+    entryDecisionId: over.entryDecisionId ?? 'dec-1',
+    exitDecisionId: over.exitDecisionId ?? 'exit-1',
+  }
+}
+
+describe('verdictFromRealizedLots', () => {
+  it('returns null with no matched lots, so no verdict is fabricated', () => {
+    expect(verdictFromRealizedLots([])).toBeNull()
+  })
+
+  it('sums P&L across the lots that closed this decision', () => {
+    const v = verdictFromRealizedLots([
+      lot({ qty: 4, entryPrice: 100, exitPrice: 110 }),   // +40
+      lot({ qty: 6, entryPrice: 100, exitPrice: 105 }),   // +30
+    ])!
+    expect(v.pnlGross).toBe(70)
+    expect(v.closedQty).toBe(10)
+    // pnlPct is on cost basis (10 shares at 100), not on the pooled notional.
+    expect(v.pnlPct).toBeCloseTo(0.07, 10)
+    expect(v.thesisGrade).toBe('A')
+  })
+
+  it('nets fees out of pnlNet while pnlPct stays on gross', () => {
+    const v = verdictFromRealizedLots([
+      lot({ qty: 10, entryPrice: 100, exitPrice: 110, feesUsd: 2, pnlNet: 98 }),
+    ])!
+    expect(v.pnlGross).toBe(100)
+    expect(v.pnlNet).toBe(98)
+  })
+
+  it('closes at the LAST exit, so a lot closed in pieces dates from the final one', () => {
+    const v = verdictFromRealizedLots([
+      lot({ exitTsMs: 5000 }),
+      lot({ exitTsMs: 9000 }),
+      lot({ exitTsMs: 7000 }),
+    ])!
+    expect(v.closedAtMs).toBe(9000)
+  })
+
+  it('grades a loss as D rather than borrowing another lot exit price', () => {
+    const v = verdictFromRealizedLots([lot({ qty: 5, entryPrice: 100, exitPrice: 90 })])!
+    expect(v.pnlGross).toBe(-50)
+    expect(v.thesisGrade).toBe('D')
   })
 })

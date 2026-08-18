@@ -40,6 +40,7 @@ vi.mock('./decision-dispatcher.js', () => ({
 }))
 
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+import { recordFill } from './audit-log.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -81,6 +82,16 @@ function insertExecutedDecision(
        committee_transcript_id, decided_at, status, filled_qty, filled_avg_price)
     VALUES (?, ?, 'buy', 'AAPL', 1000, 'limit', 't', 0.7, NULL, 1000, 'executed', 10, 100)
   `).run(decisionId, signalId)
+  // Verdicts are graded off this decision's FIFO-matched realized lots, which
+  // are derived from trader_fills, so the fixture must record both legs.
+  recordFill(db, {
+    decisionId, clientOrderId: decisionId, asset: 'AAPL', side: 'buy',
+    fillQty: 10, fillPrice: 100, fillTsMs: 1100,
+  })
+  recordFill(db, {
+    decisionId: `exit-${decisionId}`, clientOrderId: `exit-${decisionId}`, asset: 'AAPL',
+    side: 'sell', fillQty: 10, fillPrice: 110, fillTsMs: 5000,
+  })
 }
 
 function fillOrder(overrides: Partial<EngineOrder> = {}): EngineOrder {

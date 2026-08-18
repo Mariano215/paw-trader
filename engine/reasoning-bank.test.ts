@@ -238,3 +238,73 @@ describe('rollupRecentOutcomes', () => {
     expect(result.formatted.toLowerCase()).toContain('warning')
   })
 })
+
+// ---------------------------------------------------------------------------
+// Outcome embargo.
+//
+// Cases land in the bank at close time carrying a realized outcome. Replaying
+// a historical signal without an embargo hands the committee graded results
+// for trades that had not happened yet at the simulated moment, which is
+// lookahead bias and inflates any backtest or post-cutoff replay.
+// ---------------------------------------------------------------------------
+
+describe('outcome embargo (asOf)', () => {
+  const T0 = Date.UTC(2026, 0, 1)
+  const DAY = 24 * 60 * 60 * 1000
+
+  function seedTimeline(db: ReturnType<typeof makeDb>) {
+    insertCase(db, sampleCase({ id: 'past', asset: 'AAPL', created_at: T0 }))
+    insertCase(db, sampleCase({ id: 'future', asset: 'AAPL', created_at: T0 + 10 * DAY }))
+  }
+
+  it('hides cases written after asOf', () => {
+    const db = makeDb()
+    seedTimeline(db)
+    const cases = getPastCases(db, {
+      asset: 'AAPL',
+      strategy: 'momentum-stocks',
+      asOf: T0 + DAY,
+    })
+    expect(cases.map(c => c.id)).toEqual(['past'])
+  })
+
+  it('includes a case written exactly at asOf', () => {
+    const db = makeDb()
+    seedTimeline(db)
+    const cases = getPastCases(db, { asset: 'AAPL', strategy: 'momentum-stocks', asOf: T0 })
+    expect(cases.map(c => c.id)).toEqual(['past'])
+  })
+
+  it('returns everything when asOf is omitted, so live is unaffected', () => {
+    const db = makeDb()
+    seedTimeline(db)
+    const cases = getPastCases(db, { asset: 'AAPL', strategy: 'momentum-stocks' })
+    expect(cases.map(c => c.id).sort()).toEqual(['future', 'past'])
+  })
+
+  it('applies the embargo to the strategy-wide fallback too', () => {
+    const db = makeDb()
+    // No AAPL history at all, so retrieval falls back to strategy-wide.
+    insertCase(db, sampleCase({ id: 'other-past', asset: 'MSFT', created_at: T0 }))
+    insertCase(db, sampleCase({ id: 'other-future', asset: 'MSFT', created_at: T0 + 10 * DAY }))
+    const cases = getPastCases(db, {
+      asset: 'AAPL',
+      strategy: 'momentum-stocks',
+      asOf: T0 + DAY,
+    })
+    expect(cases.map(c => c.id)).toEqual(['other-past'])
+  })
+
+  it('embargoes the rollup as well', () => {
+    const db = makeDb()
+    db.prepare(
+      `INSERT INTO trader_strategies (id, name, asset_class, params_json, created_at, updated_at)
+       VALUES ('momentum-stocks', 'Momentum', 'equity', '{}', 0, 0)`,
+    ).run()
+    insertCase(db, sampleCase({ id: 'r-past', outcome: 'win', pnl_net: 100, created_at: T0 }))
+    insertCase(db, sampleCase({ id: 'r-future', outcome: 'win', pnl_net: 999, created_at: T0 + 10 * DAY }))
+    const result = rollupRecentOutcomes(db, 'equity', 20, T0 + DAY)
+    expect(result.total).toBe(1)
+    expect(result.bestTradeUsd).toBe(100)
+  })
+})

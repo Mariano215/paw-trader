@@ -10,6 +10,7 @@
 
 import { Router, type Request, type Response } from 'express'
 import { requireAdmin } from '../auth.js'
+import { logger } from '../logger.js'
 import {
   engineFetch,
   getEngineConfig,
@@ -58,7 +59,12 @@ router.get('/api/v1/trader/status', async (_req: Request, res: Response) => {
       last_reconcile: reconcile,
     })
   } catch (err) {
-    res.json({ engine_connected: false, error: String(err) })
+    // Never echo the raw error to the client: engineFetch folds the engine
+    // URL into its messages, so String(err) leaks internal topology. Same
+    // treatment as broker-pnl below. The detail still reaches the operator
+    // through the server log.
+    logger.warn({ err }, 'trader: status query failed')
+    res.json({ engine_connected: false, error: 'engine unreachable' })
   }
 })
 
@@ -140,6 +146,11 @@ router.post('/api/v1/trader/halt', requireAdmin, async (req: Request, res: Respo
     })
     res.json(data)
   } catch (err) {
+    // Deliberately echoes the raw error, unlike the read endpoints above.
+    // This is requireAdmin and it is the kill switch: an operator who just
+    // failed to halt trading needs to know WHY, immediately, on screen.
+    // Leaking the engine URL to an admin over Tailscale is the lesser harm.
+    logger.error({ err }, 'trader: halt failed')
     res.status(502).json({ error: String(err) })
   }
 })
@@ -340,6 +351,9 @@ router.post('/api/v1/trader/clear-breaker', requireAdmin, async (req: Request, r
     })
     res.json(data)
   } catch (err) {
+    // Same reasoning as /risk/halt above: admin-only, safety-critical, the
+    // operator needs the real failure reason on screen.
+    logger.error({ err }, 'trader: clear-breaker failed')
     res.status(502).json({ error: String(err) })
   }
 })

@@ -20,10 +20,10 @@ import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
 import { recomputeTrackRecord, listOpenPositions, summarizeOpenPositions } from './track-record.js'
-import { recomputeRealizedPnlForAsset } from './audit-log.js'
+import { recomputeRealizedPnlForAsset, type RealizedLot } from './audit-log.js'
 import { insertPnlSnapshot, getLastCumulativePnl } from './db.js'
 import {
-  computeVerdict,
+  verdictFromRealizedLots,
   rollUpFills,
   attributeAgents,
   summarizeForReasoningBank,
@@ -72,7 +72,15 @@ export interface ClosureResult {
   fullyClosed: boolean
   outcome: VerdictOutcome | null
   attribution: AgentAttribution[]
-  reason: 'closed' | 'still-open' | 'no-fills' | 'partial' | 'closed-no-fill-data' | 'closed-drift'
+  reason:
+    | 'closed'
+    | 'still-open'
+    | 'no-fills'
+    | 'partial'
+    | 'closed-no-fill-data'
+    | 'closed-drift'
+    /** Broker flat, but no FIFO-matched lot keys back to this decision. */
+    | 'no-realized-lots'
 }
 
 /**
@@ -173,11 +181,81 @@ export function processClosure(
     }
   }
 
-  const relevant = relevantOrders(decision.asset, decision.decided_at, orders)
-  let buys = rollUpFills(relevant, 'buy')
-  let sells = rollUpFills(relevant, 'sell')
+  const side: 'buy' | 'sell' = decision.action === 'sell' ? 'sell' : 'buy'
 
-  if (buys.qty <= 0 && sells.qty <= 0) {
+  // Per-decision lot attribution (2026-06-11): grading a decision against the
+  // asset's POOLED orders stamps the full aggregate-close PnL on EVERY open
+  // decision for that asset -- 68 verdicts each claiming the whole position's
+  // loss in one sweep. A verdict is only honest when this decision's own
+  // confirmed fill is known. Decisions without cached fill data (legacy,
+  // pre-fill-tracking) get NO verdict; the caller closes them via
+  // 'closed-no-fill-data'.
+  if (decision.filled_qty == null || decision.filled_qty <= 0 || decision.filled_avg_price == null) {
+    return {
+      decisionId: decision.id,
+      fullyClosed: true,
+      outcome: null,
+      attribution: [],
+      reason: 'closed-no-fill-data',
+    }
+  }
+
+  // Grade against the lots that actually closed THIS decision, not against the
+  // asset's pooled sell price since decided_at. Pooled grading scores every lot
+  // that entered below the pooled average as a winner and leaves the ones that
+  // entered above it ungraded, which is how the week of 2026-08-09 reported 20
+  // wins and 0 losses against broker truth of -$746.25.
+  //
+  // This runs BEFORE the engine-order checks below on purpose. trader_fills is
+  // append-only and permanent; the engine's /orders response is a moving
+  // window. A decision whose orders have scrolled out of that window is still
+  // perfectly gradable from its fills, and deciding it had "drifted" would
+  // throw away a real, recoverable P&L number.
+  //
+  // Recompute first, then read: the fills that close this lot may have landed
+  // since the last recompute. This replaces the post-verdict recompute that
+  // used to run below, so grading and the realized layer read the same rows.
+  let assetLots: RealizedLot[] = []
+  try {
+    assetLots = recomputeRealizedPnlForAsset(db, decision.asset)
+  } catch (err) {
+    // The realized layer is the only grading input now, so a failure here
+    // cannot fall through to a verdict. Leave the decision open and retry.
+    logger.warn(
+      { err, decisionId: decision.id, asset: decision.asset },
+      'Close-out sweep: recomputeRealizedPnlForAsset failed; cannot grade, deferring',
+    )
+    return {
+      decisionId: decision.id,
+      fullyClosed: false,
+      outcome: null,
+      attribution: [],
+      reason: 'no-fills',
+    }
+  }
+
+  const ownLots = assetLots.filter((l) => l.entryDecisionId === decision.id)
+  const outcome = verdictFromRealizedLots(ownLots)
+
+  if (outcome && (outcome.closedQty ?? 0) + 1e-9 < decision.filled_qty) {
+    logger.info(
+      { decisionId: decision.id, matchedQty: outcome.closedQty, filledQty: decision.filled_qty },
+      'Close-out sweep: position partially closed, deferring verdict',
+    )
+    return {
+      decisionId: decision.id,
+      fullyClosed: false,
+      outcome,
+      attribution: [],
+      reason: 'partial',
+    }
+  }
+
+  const relevant = relevantOrders(decision.asset, decision.decided_at, orders)
+  const buys = rollUpFills(relevant, 'buy')
+  const sells = rollUpFills(relevant, 'sell')
+
+  if (!outcome && buys.qty <= 0 && sells.qty <= 0) {
     // The broker holds nothing for this asset and no order in the engine's
     // window matches the decision. Two different situations look identical
     // here, and they need opposite handling:
@@ -220,55 +298,23 @@ export function processClosure(
     }
   }
 
-  const side: 'buy' | 'sell' = decision.action === 'sell' ? 'sell' : 'buy'
-
-  // Per-decision lot attribution (2026-06-11): grading a decision against the
-  // asset's POOLED orders stamps the full aggregate-close PnL on EVERY open
-  // decision for that asset -- 68 verdicts each claiming the whole position's
-  // loss in one sweep. A verdict is only honest when this decision's own
-  // confirmed fill is known: grade that lot against the pooled close price.
-  // Decisions without cached fill data (legacy, pre-fill-tracking) get NO
-  // verdict; the caller closes them out via 'closed-no-fill-data'.
-  if (decision.filled_qty == null || decision.filled_qty <= 0 || decision.filled_avg_price == null) {
+  if (!outcome) {
+    // Broker flat for the asset, this decision's own lot never matched a sell.
+    // Two ways to get here: fills are missing on one leg (trader_fills is fed
+    // by the reconciler and can lag or gap), or the entry was a short, which
+    // FIFO long-matching never keys to an entry decision. Either way there is
+    // no honest per-decision number, so it becomes a counted ungraded closure
+    // rather than a fabricated verdict.
+    logger.warn(
+      { decisionId: decision.id, asset: decision.asset, filledQty: decision.filled_qty, side },
+      'Close-out sweep: no realized lots matched this decision, closing ungraded',
+    )
     return {
       decisionId: decision.id,
       fullyClosed: true,
       outcome: null,
       attribution: [],
-      reason: 'closed-no-fill-data',
-    }
-  }
-  const lot = {
-    qty: decision.filled_qty,
-    weightedPrice: decision.filled_avg_price,
-    fees: 0,
-    firstFillMs: decision.decided_at,
-    lastFillMs: decision.decided_at,
-  }
-  if (side === 'buy') {
-    buys = lot
-  } else {
-    sells = lot
-  }
-
-  const outcome = computeVerdict({
-    decisionId: decision.id,
-    side,
-    buys,
-    sells,
-  })
-
-  if (!outcome.fullyClosed) {
-    logger.info(
-      { decisionId: decision.id, buyQty: buys.qty, sellQty: sells.qty },
-      'Close-out sweep: position partially closed, deferring verdict',
-    )
-    return {
-      decisionId: decision.id,
-      fullyClosed: false,
-      outcome,
-      attribution: [],
-      reason: 'partial',
+      reason: 'no-realized-lots',
     }
   }
 
@@ -298,7 +344,7 @@ export function processClosure(
   // tests or fetch failed upstream).
   //
   // When bench_return is promoted from 0, the thesis_grade computed
-  // inside computeVerdict (which used the 0 placeholder) is stale.
+  // inside verdictFromRealizedLots (which used the 0 placeholder) is stale.
   // Regrade with the real benchmark so the stored grade is internally
   // consistent with the stored bench_return. Downstream consumers
   // (ReasoningBank summary, dashboard report card) read the grade
@@ -347,22 +393,6 @@ export function processClosure(
   )
 
   db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
-
-  // Populate the derived realized-P&L layer from the immutable fills written
-  // by the order-reconciler. Matched PER ASSET, not per decision: an exit is a
-  // SEPARATE decision from its entry, so the sell fill lives under a different
-  // decision id than the buy. Per-decision matching never sees both legs and
-  // yields zero realized rows -- the months-long "P&L always empty" bug. FIFO
-  // across the asset closes oldest buy lots first. Errors must not roll back
-  // the verdict -- the verdict is the source of truth; P&L recomputes later.
-  try {
-    recomputeRealizedPnlForAsset(db, decision.asset)
-  } catch (err) {
-    logger.warn(
-      { err, decisionId: decision.id, asset: decision.asset },
-      'Close-out sweep: recomputeRealizedPnlForAsset failed; verdict already persisted',
-    )
-  }
 
   // ReasoningBank insert + track-record recompute. Both must NOT roll
   // back the verdict on failure -- the verdict is the source of truth
@@ -482,6 +512,53 @@ export async function fetchReturnsForDecision(
   return { success: true, benchReturn, holdDrawdown }
 }
 
+/** Reason a decision reached a terminal state without a verdict. */
+export type UngradedReason =
+  | 'no-fill-data'
+  | 'position-drift'
+  | 'no-realized-lots'
+  | 'partial-stale'
+
+/**
+ * Terminate a decision that can never be graded, recording WHY.
+ *
+ * Before this existed, all three ungraded paths did a bare
+ * `SET status = 'closed'` and logged a line. The closure then existed nowhere
+ * a rollup could see it: not in trader_verdicts, not in the open-position
+ * list, not in the win rate. 129 closures had accumulated that way by
+ * 2026-08-16, and because the ones that DID grade were disproportionately the
+ * ones whose exits filled cleanly, what survived read as 20 wins and 0 losses.
+ * Stamping ungraded_at makes the omission a number the weekly report can show.
+ *
+ * Still recomputes the asset's realized P&L: even without a per-decision
+ * verdict, the pooled fills may now form a complete round-trip, and that money
+ * belongs in the realized layer.
+ */
+function closeUngraded(
+  db: Database.Database,
+  decision: OpenDecisionRow,
+  reason: UngradedReason,
+  nowMs: number,
+): void {
+  db.prepare(`
+    UPDATE trader_decisions
+    SET status = 'closed', ungraded_at = ?, ungraded_reason = ?
+    WHERE id = ?
+  `).run(nowMs, reason, decision.id)
+  try {
+    recomputeRealizedPnlForAsset(db, decision.asset)
+  } catch (err) {
+    logger.warn(
+      { err, decisionId: decision.id, asset: decision.asset, reason },
+      'Close-out sweep: recomputeRealizedPnlForAsset failed on ungraded close',
+    )
+  }
+  logger.warn(
+    { decisionId: decision.id, asset: decision.asset, reason, sizeUsd: decision.size_usd },
+    'Close-out sweep: closed without a verdict',
+  )
+}
+
 /**
  * Walk all open decisions, process any that are closed on the engine
  * side. One positions+orders round-trip per sweep; prices are fetched
@@ -492,7 +569,14 @@ export async function runCloseOutSweep(
   db: Database.Database,
   engineClient: EngineClient,
   opts: { nowMs?: number } = {},
-): Promise<{ processed: number; stillOpen: number; errors: number; driftClosed: number }> {
+): Promise<{
+  processed: number
+  stillOpen: number
+  errors: number
+  driftClosed: number
+  /** Closed with no verdict possible. Non-zero here means the win rate is a subset. */
+  ungraded: number
+}> {
   const open = findOpenDecisions(db)
   const nowMs = opts.nowMs ?? Date.now()
 
@@ -500,6 +584,7 @@ export async function runCloseOutSweep(
   let stillOpen = 0
   let errors = 0
   let driftClosed = 0
+  let ungraded = 0
 
   if (open.length > 0) {
     let positions: EnginePosition[]
@@ -513,7 +598,7 @@ export async function runCloseOutSweep(
       logger.warn({ err, openDecisions: open.length }, 'Close-out sweep: engine fetch failed')
       // Still write snapshot even when close-out fetch fails.
       await writeDailySnapshot(db, engineClient, nowMs)
-      return { processed: 0, stillOpen: 0, errors: 1, driftClosed: 0 }
+      return { processed: 0, stillOpen: 0, errors: 1, driftClosed: 0, ungraded: 0 }
     }
 
     for (const decision of open) {
@@ -549,16 +634,9 @@ export async function runCloseOutSweep(
           // ever be possible. Terminate the row so it stops being re-processed
           // every tick, stops counting as an open position, and stops blocking
           // the re-entry guard on this asset.
-          db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
-          try {
-            recomputeRealizedPnlForAsset(db, decision.asset)
-          } catch (err) {
-            logger.warn(
-              { err, decisionId: decision.id, asset: decision.asset },
-              'Close-out sweep: recomputeRealizedPnlForAsset failed on drift close',
-            )
-          }
+          closeUngraded(db, decision, 'position-drift', nowMs)
           driftClosed += 1
+          ungraded += 1
           processed += 1
         }
         else if (result.reason === 'closed-no-fill-data') {
@@ -566,23 +644,30 @@ export async function runCloseOutSweep(
           // (legacy pre-fill-tracking row). No honest verdict is possible --
           // flip to 'closed' so it leaves the candidate set instead of being
           // re-graded with pooled aggregate PnL every sweep.
-          db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
-          // Even without a per-decision verdict, the asset's pooled fills may
-          // now form a complete round-trip -- recompute realized P&L per asset
-          // so a legacy close still books money instead of vanishing.
-          try {
-            recomputeRealizedPnlForAsset(db, decision.asset)
-          } catch (err) {
-            logger.warn(
-              { err, decisionId: decision.id, asset: decision.asset },
-              'Close-out sweep: recomputeRealizedPnlForAsset failed on no-fill-data close',
-            )
-          }
-          logger.info(
-            { decisionId: decision.id, asset: decision.asset },
-            'Close-out sweep: closed without verdict (no per-decision fill data)',
-          )
+          closeUngraded(db, decision, 'no-fill-data', nowMs)
+          ungraded += 1
           processed += 1
+        }
+        else if (result.reason === 'no-realized-lots') {
+          // Broker flat but no FIFO lot keys back to this decision, so the
+          // fills that would prove a round-trip are missing on one leg.
+          closeUngraded(db, decision, 'no-realized-lots', nowMs)
+          ungraded += 1
+          processed += 1
+        }
+        else if (result.reason === 'partial') {
+          // A partial close is normally transient -- the rest of the exit fills
+          // land on a later tick. Past the terminal age it is not transient, it
+          // is an exit that never completed, and re-deferring it forever is how
+          // eight TLT lots from 2026-07-31 were still counted as open positions
+          // (and still holding $14,820 of phantom notional) two weeks later.
+          if (nowMs - decision.decided_at > DRIFT_TERMINAL_AGE_MS) {
+            closeUngraded(db, decision, 'partial-stale', nowMs)
+            ungraded += 1
+            processed += 1
+          } else {
+            stillOpen += 1
+          }
         }
         else if (result.reason === 'still-open') stillOpen += 1
         else errors += 1
@@ -620,7 +705,14 @@ export async function runCloseOutSweep(
     )
   }
 
-  return { processed, stillOpen, errors, driftClosed }
+  if (ungraded > 0) {
+    logger.warn(
+      { ungraded, graded: processed - ungraded },
+      'Close-out sweep: closures with no verdict this pass -- the win rate covers only the graded subset',
+    )
+  }
+
+  return { processed, stillOpen, errors, driftClosed, ungraded }
 }
 
 /**

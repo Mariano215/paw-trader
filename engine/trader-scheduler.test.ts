@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
+import { recordFill } from './audit-log.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import {
   initTraderScheduler,
@@ -374,6 +375,16 @@ describe('trader-scheduler', () => {
            committee_transcript_id, decided_at, status, filled_qty, filled_avg_price)
         VALUES ('dec-c', 'sig-c', 'buy', 'AAPL', 100, 'limit', 't', 0.7, NULL, 1000, 'executed', 1, 100)
       `).run()
+      // The verdict is graded off this decision's FIFO-matched realized lots,
+      // which are derived from trader_fills, not from the order snapshot.
+      recordFill(db, {
+        decisionId: 'dec-c', clientOrderId: 'b', asset: 'AAPL', side: 'buy',
+        fillQty: 1, fillPrice: 100, fillTsMs: 1100,
+      })
+      recordFill(db, {
+        decisionId: 'dec-c-exit', clientOrderId: 's', asset: 'AAPL', side: 'sell',
+        fillQty: 1, fillPrice: 110, fillTsMs: 5000,
+      })
       vi.mocked(engineClient.getPositions!).mockResolvedValue([])
       vi.mocked(engineClient.getOrders!).mockResolvedValue([
         { client_order_id: 'b', broker_order_id: null, asset: 'AAPL', side: 'buy',

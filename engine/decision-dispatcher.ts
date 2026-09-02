@@ -23,6 +23,9 @@ import {
   TRADER_DAILY_TRADE_CAP,
   TRADER_STRATEGY_GATE_ENABLED,
 } from '../config.js'
+import { traderKnob } from './knobs.js'
+
+const dailyTradeCap = (): number => traderKnob('daily_trade_cap', TRADER_DAILY_TRADE_CAP)
 import { decideGatedTrade } from './strategy/gate-decision.js'
 import {
   countBypassTrades,
@@ -222,9 +225,9 @@ export async function dispatchApproval(
 
   // Gate 1: daily cap (applies regardless of bypass mode)
   const dailyCount = countTradesToday(db)
-  if (dailyCount >= TRADER_DAILY_TRADE_CAP) {
+  if (dailyCount >= dailyTradeCap()) {
     logger.warn(
-      { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: TRADER_DAILY_TRADE_CAP },
+      { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: dailyTradeCap() },
       'daily cap reached, suppressing',
     )
     db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
@@ -420,13 +423,14 @@ export async function dispatchApproval(
       // Per-symbol re-entry gate -- see the auto-dispatch path for the
       // full rationale. Same rules apply to an operator-approved signal.
       {
-        const { evaluateSymbolCooldown } = await import('./symbol-cooldown.js')
+        const { evaluateSymbolCooldown, SYMBOL_COOLDOWN_DAYS } = await import('./symbol-cooldown.js')
         const cooldown = evaluateSymbolCooldown({
           db,
           asset: signal.asset,
           side: signal.side,
           positions: manualSizePositions,
           nowMs: now,
+          cooldownDays: traderKnob('symbol_cooldown_days', SYMBOL_COOLDOWN_DAYS),
         })
         if (!cooldown.allowed) {
           db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cooldown' WHERE id = ?").run(signal.id)
@@ -660,9 +664,9 @@ export async function autoDispatchPendingSignals(
 
       // Gate 1: daily cap (applies regardless of bypass mode)
       const dailyCount = countTradesToday(db)
-      if (dailyCount >= TRADER_DAILY_TRADE_CAP) {
+      if (dailyCount >= dailyTradeCap()) {
         logger.warn(
-          { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: TRADER_DAILY_TRADE_CAP },
+          { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: dailyTradeCap() },
           'daily cap reached, suppressing',
         )
         db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
@@ -856,13 +860,14 @@ export async function autoDispatchPendingSignals(
         // straight losers). Runs before the exposure gates: if the symbol is
         // benched there is nothing to size.
         {
-          const { evaluateSymbolCooldown } = await import('./symbol-cooldown.js')
+          const { evaluateSymbolCooldown, SYMBOL_COOLDOWN_DAYS } = await import('./symbol-cooldown.js')
           const cooldown = evaluateSymbolCooldown({
             db,
             asset: signal.asset,
             side: signal.side,
             positions: autoSizePositions,
             nowMs: Date.now(),
+            cooldownDays: traderKnob('symbol_cooldown_days', SYMBOL_COOLDOWN_DAYS),
           })
           if (!cooldown.allowed) {
             logger.warn(

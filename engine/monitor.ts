@@ -48,6 +48,7 @@
  * Timestamps are always milliseconds (the ClaudePaw-wide convention).
  */
 import type Database from 'better-sqlite3'
+import { traderKnob } from './knobs.js'
 import { isEquityMarketHours } from './signal-poller.js'
 import { renderAlert, explainServiceDown } from './plain-english.js'
 
@@ -618,7 +619,7 @@ export async function evaluateAndRecordNavDrop(
   // malformed strings; we fall back to default in that case.
   const envRaw = process.env.TRADER_NAV_DROP_PCT
   const envParsed = envRaw === undefined ? NaN : Number.parseFloat(envRaw)
-  const threshold = Number.isFinite(envParsed) ? envParsed : NAV_DROP_DEFAULT_THRESHOLD
+  const threshold = traderKnob('nav_drop_pct', Number.isFinite(envParsed) ? envParsed : NAV_DROP_DEFAULT_THRESHOLD)
 
   let snapshots: Array<{ date: string; period: string; nav: number; recorded_at: number }>
   try {

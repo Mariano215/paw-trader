@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { traderKnob } from './knobs.js'
 import type { EngineClient } from './engine-client.js'
 import { pollAndStoreSignals, isEquityMarketHours } from './signal-poller.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
@@ -612,7 +613,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     try {
       const dispatched = await autoDispatchPendingSignals(deps.db, {
         send: deps.send,
-        alertOnReject: process.env.TRADER_ALERT_ON_REJECT === 'true',
+        alertOnReject: traderKnob('alert_on_reject', process.env.TRADER_ALERT_ON_REJECT === 'true'),
       })
       sent = dispatched.length
     } catch (err) {

@@ -903,6 +903,30 @@ describe('autoDispatchPendingSignals', () => {
     expect(decisions.n).toBe(1)
   })
 
+  it('skips a signal when an order for the asset is still submitted or waiting for a fill', async () => {
+    seedMomentumStrategy(testDb)
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-open','sig-open','buy','BTC/USD',200,'market','t',0.7,NULL,?,'pending_fill')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-again','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(200))
+
+    await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-again'").get() as any
+    expect(sig.status).toBe('suppressed_pending_order')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    expect(testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='BTC/USD'").get()).toEqual({ n: 1 })
+  })
+
   it('does NOT block re-entry when the broker is flat but stale rows say we hold it', async () => {
     // The 2026-08-02 regression: six QQQ decisions sat at status='executed'
     // with the broker flat since June, because the close-out watcher could

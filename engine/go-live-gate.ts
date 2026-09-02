@@ -41,7 +41,7 @@ export interface BrokerTruth {
  * engine positions. Read-only; throws when the engine is unreachable so
  * callers never mistake "engine down" for "zero P&L".
  */
-export async function computeBrokerTruth(client: EngineClient): Promise<BrokerTruth> {
+export async function computeBrokerTruth(client: EngineClient, db?: Database.Database): Promise<BrokerTruth> {
   const [orders, positions] = await Promise.all([client.getOrders(), client.getPositions()])
 
   // Dedup by order id: a partially_filled snapshot plus the final filled row
@@ -78,6 +78,27 @@ export async function computeBrokerTruth(client: EngineClient): Promise<BrokerTr
       recorded_at: o.updated_at,
     })
     byAsset.set(o.asset, rows)
+  }
+
+  // The engine's /orders is a rolling window (100 rows, about two weeks), so
+  // on its own it can never show 100 closed trades. trader_fills is the bot's
+  // append-only copy of every engine fill since June; add the fills the
+  // window no longer carries. Found 2026-09-02: the gate read 0 round trips
+  // while 207 fills sat in this table.
+  if (db) {
+    const seen = new Set<string>()
+    for (const rows of byAsset.values()) for (const r of rows) if (r.client_order_id) seen.add(r.client_order_id)
+    let fills: FillRow[] = []
+    try {
+      fills = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms ASC, recorded_at ASC').all() as FillRow[]
+    } catch { /* fresh DB without the table: engine window only */ }
+    for (const f of fills) {
+      if (f.client_order_id && seen.has(f.client_order_id)) continue
+      if (!(f.fill_qty > 0)) continue
+      const rows = byAsset.get(f.asset) ?? []
+      rows.push(f)
+      byAsset.set(f.asset, rows)
+    }
   }
 
   const realizedLots: RealizedLot[] = []
@@ -184,7 +205,7 @@ export async function runGoLiveGate(
   client: EngineClient,
   nowMs: number = Date.now(),
 ): Promise<StoredGateResult> {
-  const truth = await computeBrokerTruth(client)
+  const truth = await computeBrokerTruth(client, db)
   const regimes = await accumulateRegimes(db, client)
 
   // Per-trade fractional net returns on cost basis.

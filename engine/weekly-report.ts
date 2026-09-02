@@ -695,7 +695,7 @@ export async function buildReport(
   if (engineClient) {
     try {
       const { computeBrokerTruth } = await import('./go-live-gate.js')
-      const t = await computeBrokerTruth(engineClient)
+      const t = await computeBrokerTruth(engineClient, db)
       // A lot belongs to the window when the SELL that closed it landed there.
       // Entry date is irrelevant: a position opened in June and closed this
       // week is this week's realized P&L, which is exactly what the verdicts

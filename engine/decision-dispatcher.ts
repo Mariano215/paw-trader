@@ -598,6 +598,19 @@ export async function autoDispatchPendingSignals(
         continue
       }
 
+      // Gate -2: one open order per asset. A decision that is submitted or
+      // waiting for a fill already owns this asset; a second one is how the
+      // 2026-08-25 BTC runaway made 83 pending_fill rows in one night.
+      const openOrder = db
+        .prepare("SELECT id FROM trader_decisions WHERE asset = ? AND status IN ('submitted', 'pending_fill') LIMIT 1")
+        .get(signal.asset) as { id: string } | undefined
+      if (openOrder) {
+        logger.info({ event: 'trader.gate.pending_order', signalId: signal.id, asset: signal.asset, decisionId: openOrder.id }, 'Signal skipped: an order for this asset is still open')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_pending_order' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'pending_order')
+        continue
+      }
+
       // Gate -1: re-entry guard. Runs before every other gate because it is
       // both the cheapest and the one that was missing: the signal dedupe index
       // only covers pending/dispatching signals, so a re-emitted candidate

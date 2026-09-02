@@ -67,6 +67,25 @@ describe('computeBrokerTruth', () => {
     expect(t.roundTrips).toBe(0)
     expect(t.realizedTotal).toBe(0)
   })
+
+  it('adds fills from trader_fills that the engine order window no longer carries, without double counting', async () => {
+    const db = makeDb()
+    const ins = db.prepare(`INSERT INTO trader_fills
+      (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price, intended_price, intended_ts_ms, fill_ts_ms, fee_usd, slippage_usd, entry_thesis, exit_reason, recorded_at)
+      VALUES (?, ?, ?, ?, 'SPY', ?, ?, ?, NULL, NULL, ?, 0, 0, NULL, NULL, ?)`)
+    // Old buy + sell, only in the local record (engine window rolled past them).
+    ins.run('f1', 'd1', 'old-buy', 'b-old-buy', 'buy', 10, 100, 1, 1)
+    ins.run('f2', 'd2', 'old-sell', 'b-old-sell', 'sell', 10, 120, 2, 2)
+    // Recent buy present in BOTH the engine window and the local record.
+    ins.run('f3', 'd3', 'c1', 'b1', 'buy', 10, 100, 3, 3)
+    const client = mockClient([
+      order({ client_order_id: 'c1', broker_order_id: 'b1', side: 'buy', filled_qty: 10, filled_avg_price: 100, updated_at: 3 }),
+      order({ client_order_id: 'c2', broker_order_id: 'b2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 4 }),
+    ])
+    const t = await computeBrokerTruth(client, db)
+    expect(t.roundTrips).toBe(2)
+    expect(t.realizedTotal).toBeCloseTo(200 + 100)
+  })
 })
 
 describe('runGoLiveGate', () => {

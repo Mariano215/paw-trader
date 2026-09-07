@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { evaluateExit, runExitSweep, type OpenExitRow } from './exit-evaluator.js'
+import { evaluateExit, runExitSweep, currentMomentum, type OpenExitRow } from './exit-evaluator.js'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
 
@@ -23,6 +23,23 @@ function row(over: Partial<OpenExitRow> = {}): OpenExitRow {
 const MARKET_OPEN_MS = new Date('2026-04-21T14:00:00Z').getTime()
 
 describe('evaluateExit', () => {
+  it('ignores historical entry enrichment without current momentum', () => {
+    expect(evaluateExit(row({enrichment_json: JSON.stringify({price_change_20d_pct: -30})}),
+      {lastPrice: 100, nowMs: Date.now()}).exit).toBe(false)
+  })
+
+  it('time exits still work without a usable mark', () => {
+    expect(evaluateExit(row({decided_at: Date.now() - 30 * DAY}),
+      {lastPrice: null, nowMs: Date.now()}).reason).toBe('time')
+  })
+
+  it('calculates momentum from current distinct bars, rejecting stale history', () => {
+    const now = Date.now()
+    const bars = Array.from({length: 21}, (_, i) => ({ts_ms: now - (20 - i) * DAY, close: 100 - i}))
+    expect(currentMomentum(bars, now, false)).toBeCloseTo(-20)
+    expect(currentMomentum(bars, now + 5 * DAY, false)).toBeNull()
+    expect(currentMomentum([bars[20]], now, false)).toBeNull()
+  })
   it('exits a long when the last price is at/below the stop', () => {
     const r = evaluateExit(row(), { lastPrice: 91, nowMs: Date.now() })
     expect(r.exit).toBe(true)
@@ -46,7 +63,7 @@ describe('evaluateExit', () => {
 
   it('exits on momentum decay when 20d change exceeds the deadband for a long', () => {
     const enrich = JSON.stringify({ price_change_20d_pct: -5.01 })
-    const r = evaluateExit(row({ enrichment_json: enrich }), { lastPrice: 105, nowMs: Date.now() })
+    const r = evaluateExit(row({ enrichment_json: enrich }), { lastPrice: 105, nowMs: Date.now(), momentumPct: -5.01 })
     expect(r.exit).toBe(true)
     expect(r.reason).toBe('momentum')
   })
@@ -100,7 +117,7 @@ describe('runExitSweep', () => {
 
   it('submits a sell with size_usd=0 (full-close sentinel) and writes a closing decision row on stop breach', async () => {
     const db = makeDb()
-    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
     const submitDecision = vi.fn().mockResolvedValue({ client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 0 })
     const client = {
       getPositions: vi.fn().mockResolvedValue(pos),
@@ -142,6 +159,15 @@ describe('runExitSweep', () => {
     expect(client.submitDecision).not.toHaveBeenCalled()
   })
 
+  it('does not trigger a stop from stale position marks or old daily closes', async () => {
+    const db = makeDb()
+    const client = {getPositions: vi.fn().mockResolvedValue([{asset: 'AAPL', qty: 1,
+      market_value: 80, updated_at: MARKET_OPEN_MS - 3600000}]),
+      getPrices: vi.fn().mockResolvedValue([{close: 80, ts_ms: 1}]), submitDecision: vi.fn()} as unknown as EngineClient
+    await runExitSweep(db, client, vi.fn(), {nowMs: MARKET_OPEN_MS})
+    expect(client.submitDecision).not.toHaveBeenCalled()
+  })
+
   it('does not double-submit when a prior exit row exists for the same DECISION (I3: guard on parent_decision_id)', async () => {
     const db = makeDb()
     // Exit row: signal_id stays the real signal ('s1', FK-valid); the entry
@@ -149,7 +175,7 @@ describe('runExitSweep', () => {
     db.prepare(`INSERT INTO trader_decisions
       (id,signal_id,parent_decision_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
       VALUES ('d1-exit','s1','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
-    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
     const client = {
       getPositions: vi.fn().mockResolvedValue(pos),
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
@@ -171,7 +197,7 @@ describe('runExitSweep', () => {
     db.prepare(`INSERT INTO trader_decisions
       (id,signal_id,parent_decision_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
       VALUES ('d1-exit','s1','d1','sell','AAPL',0,'market','exit',1,?,'exit_submitted')`).run(Date.now())
-    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 2.5, avg_entry_price: 100, market_value: 227.5, unrealized_pnl: -22.5, source: 'broker', updated_at: Date.now() }]
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 2.5, avg_entry_price: 100, market_value: 227.5, unrealized_pnl: -22.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
     const submitDecision = vi.fn().mockResolvedValue({ client_order_id: 'x2', broker_order_id: 'y2', status: 'placed', approved_size_usd: 0 })
     const client = {
       getPositions: vi.fn().mockResolvedValue(pos),
@@ -186,7 +212,7 @@ describe('runExitSweep', () => {
 
   it('C1/C2: a 422 no_position error cleans up the orphaned exit_submitted row and does not block future exits', async () => {
     const db = makeDb()
-    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
     const submitDecision = vi.fn().mockRejectedValue(
       new Error('Engine API error 422 on /decisions/submit :: no_position'),
     )
@@ -215,12 +241,12 @@ describe('runExitSweep', () => {
     expect(submitDecision2).toHaveBeenCalledTimes(1)
   })
 
-  it('a transient submit failure (503 broker_unavailable) removes the intent row so the next sweep retries', async () => {
+  it('a transient submit failure preserves the same intent ID for recovery', async () => {
     // Live regression 2026-06-11 09:02 ET: pre-market exit submit got
     // "Engine API error 503 :: broker_unavailable"; the orphaned
     // exit_submitted row then blocked the exit forever via the guard.
     const db = makeDb()
-    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() }]
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
     const failing = {
       getPositions: vi.fn().mockResolvedValue(pos),
       getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
@@ -230,8 +256,8 @@ describe('runExitSweep', () => {
     const out = await runExitSweep(db, failing, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out.errors).toBe(1)
     expect(out.exited).toBe(0)
-    // Intent row removed -- not left to block the guard.
-    expect(db.prepare("SELECT id FROM trader_decisions WHERE status='exit_submitted'").get()).toBeUndefined()
+    const intent = db.prepare("SELECT id FROM trader_decisions WHERE status='exit_unknown'").get() as {id: string}
+    expect(intent.id).toBeTruthy()
 
     // Next sweep retries and succeeds.
     const ok = {
@@ -241,6 +267,7 @@ describe('runExitSweep', () => {
     } as unknown as EngineClient
     const out2 = await runExitSweep(db, ok, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out2.exited).toBe(1)
+    expect(ok.submitDecision).toHaveBeenCalledWith(expect.objectContaining({decision_id: intent.id}))
   })
 })
 
@@ -272,7 +299,7 @@ describe('runExitSweep market-hours gate', () => {
   }
 
   const posFor = (asset: string): EnginePosition =>
-    ({ asset, qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: Date.now() })
+    ({ asset, qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_CLOSED_MS })
 
   it('does not touch equities while NYSE is shut, and writes no intent row', async () => {
     // Before this gate the sweep ran every 5 minutes around the clock: insert

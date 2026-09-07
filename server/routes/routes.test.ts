@@ -446,64 +446,36 @@ describe('GET /api/v1/trader/status (Phase 5 Task 2c coinbase pass-through)', ()
   })
 })
 
-describe('GET /api/v1/trader/broker-pnl (FIFO realized from engine orders)', () => {
-  const ORIGINAL_FETCH = globalThis.fetch
-  const ORIGINAL_URL = process.env.TRADER_ENGINE_URL
-  const ORIGINAL_TOKEN = process.env.TRADER_ENGINE_TOKEN
-
-  beforeAll(() => {
-    process.env.TRADER_ENGINE_URL = 'http://127.0.0.1:9999'
-    process.env.TRADER_ENGINE_TOKEN = 'fake-engine-token'
+describe('GET /api/v1/trader/broker-pnl (canonical accounting snapshot)', () => {
+  beforeEach(() => {
+    testDb.exec('CREATE TABLE IF NOT EXISTS kv_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    testDb.prepare("DELETE FROM kv_settings WHERE key='trader.accounting.last'").run()
   })
-
-  afterAll(() => {
-    globalThis.fetch = ORIGINAL_FETCH
-    if (ORIGINAL_URL === undefined) delete process.env.TRADER_ENGINE_URL
-    else process.env.TRADER_ENGINE_URL = ORIGINAL_URL
-    if (ORIGINAL_TOKEN === undefined) delete process.env.TRADER_ENGINE_TOKEN
-    else process.env.TRADER_ENGINE_TOKEN = ORIGINAL_TOKEN
-  })
-
-  it('FIFO-matches, dedups partial+full snapshots, sums open unrealized', async () => {
-    globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
-      const href = typeof url === 'string' ? url : url instanceof URL ? url.href : String(url)
-      if (href.endsWith('/orders')) {
-        return {
-          ok: true, status: 200,
-          json: async () => ([
-            { client_order_id: 'c1', asset: 'SPY', side: 'buy', status: 'filled', filled_qty: 10, filled_avg_price: 100, updated_at: 1 },
-            // partial snapshot of the same order: must not double-count
-            { client_order_id: 'c1', asset: 'SPY', side: 'buy', status: 'partially_filled', filled_qty: 5, filled_avg_price: 100, updated_at: 1 },
-            { client_order_id: 'c2', asset: 'SPY', side: 'sell', status: 'filled', filled_qty: 10, filled_avg_price: 110, updated_at: 2 },
-            { client_order_id: 'c3', asset: 'SPY', side: 'buy', status: 'placed', filled_qty: 0, filled_avg_price: null, updated_at: 3 },
-          ]),
-        } as unknown as Response
-      }
-      if (href.endsWith('/positions')) {
-        return {
-          ok: true, status: 200,
-          json: async () => ([{ asset: 'QQQ', qty: 2, unrealized_pnl: -7.5 }]),
-        } as unknown as Response
-      }
-      return { ok: false, status: 404, json: async () => ({}) } as unknown as Response
-    }) as typeof fetch
-
+  function snapshot(evaluatedAt: number) {
+    testDb.prepare('INSERT INTO kv_settings (key,value) VALUES (?,?)').run('trader.accounting.last', JSON.stringify({
+      available: true, evaluated_at: evaluatedAt, realized_total: 98, round_trips: 1,
+      open_unrealized: -7.5, net: 90.5, costs_complete: false,
+    }))
+  }
+  it('serves the archived calculation with freshness and cost limitations', async () => {
+    snapshot(Date.now())
     const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
     expect(res.status).toBe(200)
-    const body = res.body as { available: boolean; realized_total: number; round_trips: number; open_unrealized: number }
-    expect(body.available).toBe(true)
-    expect(body.realized_total).toBeCloseTo(100) // (110-100)*10, dedup holds
-    expect(body.round_trips).toBe(1)
-    expect(body.open_unrealized).toBeCloseTo(-7.5)
+    expect(res.body).toMatchObject({available: true, realized_total: 98, round_trips: 1, open_unrealized: -7.5, stale: false, costs_complete: false})
   })
-
-  it('returns available:false with a generic error when the engine is down', async () => {
-    globalThis.fetch = vi.fn(async () => { throw new Error('boom http://secret-engine:9999') }) as typeof fetch
+  it('retains old values but flags stale snapshots', async () => {
+    snapshot(Date.now() - 16 * 60 * 1000)
     const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
-    expect(res.status).toBe(200)
-    const body = res.body as { available: boolean; error?: string }
-    expect(body.available).toBe(false)
-    expect(body.error).toBe('engine unreachable') // raw error never echoed
+    expect(res.body).toMatchObject({available: true, realized_total: 98, stale: true})
+  })
+  it('returns unavailable, not zero, before the first snapshot', async () => {
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
+    expect(res.body).toEqual({available: false})
+  })
+  it('rejects corrupt snapshots without leaking database errors', async () => {
+    testDb.prepare('INSERT INTO kv_settings (key,value) VALUES (?,?)').run('trader.accounting.last', '{bad')
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/broker-pnl', { headers: tok(adminToken) })
+    expect(res.body).toEqual({available: false, error: 'accounting snapshot unavailable'})
   })
 })
 

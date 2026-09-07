@@ -14,16 +14,14 @@
  *   - momentum: 20d momentum flipped against a long / short
  *
  * Hot-path rules (mirrors close-out-watcher):
- *   - One positions round-trip per sweep; one /prices fetch per exiting
- *     asset only.
+ *   - One positions round-trip per sweep; historical data only when a
+ *     fresh stop/target or time exit has not already fired.
  *   - Each decision wrapped in try/catch so one failure never stops the
  *     sweep.
  *   - A duplicate guard prevents re-submitting an exit already in flight.
  *
- * ENGINE DEPENDENCY: the Python engine is buy-side only today and
- * ignores stop_loss/take_profit. This module submits side:'sell' via
- * /decisions/submit; the engine must honor a sell as a position close
- * for the live exit to actually fire. See plan engineDependencies.
+ * Engine migration 0007 and idempotent submission are required for safe
+ * recovery of ambiguous submission results. Live protection is separate.
  */
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
@@ -34,13 +32,12 @@ import { DECISION_STATUS } from './order-lifecycle.js'
 import { isEquityMarketHours } from './signal-poller.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
+export const EXIT_MARK_MAX_AGE_MS = 5 * 60 * 1000
 
 /**
  * Momentum-decay deadband for longs (pct, negative).
- * Enrichment is captured at signal time -- not live -- so a bare
- * negative 20d change whipsaws on routine dips in a trend. Only exit
- * when momentum has deteriorated beyond this threshold. Revisit with a
- * live GET /prices momentum refresh once the engine exposes it.
+ * Evaluated from current 20-session bars, not entry-time enrichment.
+ * The deadband avoids treating every small negative move as a reversal.
  */
 export const MOMENTUM_EXIT_DEADBAND_PCT = -5.0
 
@@ -95,27 +92,27 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
       AND NOT EXISTS (
         SELECT 1 FROM trader_decisions e
         WHERE e.parent_decision_id = d.id
-          AND e.status = ?
+          AND e.status IN (?, ?)
       )
-  `).all(DECISION_STATUS.EXIT_SUBMITTED) as OpenExitRow[]
+  `).all(DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN) as OpenExitRow[]
 }
 
 /** Pure exit decision for one open position given the latest price. */
 export function evaluateExit(
   row: OpenExitRow,
-  ctx: { lastPrice: number; nowMs: number },
+  ctx: { lastPrice: number | null; nowMs: number; momentumPct?: number | null },
 ): ExitDecision {
   const isLong = row.action !== 'sell'
   const exitSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'
 
   // 1. Stop breach (only when a stop is stored).
-  if (row.stop_loss != null) {
+  if (row.stop_loss != null && ctx.lastPrice != null && Number.isFinite(ctx.lastPrice) && ctx.lastPrice > 0) {
     const hit = isLong ? ctx.lastPrice <= row.stop_loss : ctx.lastPrice >= row.stop_loss
     if (hit) return { exit: true, reason: 'stop', side: exitSide }
   }
 
   // 2. Target breach (only when a target is stored).
-  if (row.take_profit != null) {
+  if (row.take_profit != null && ctx.lastPrice != null && Number.isFinite(ctx.lastPrice) && ctx.lastPrice > 0) {
     const hit = isLong ? ctx.lastPrice >= row.take_profit : ctx.lastPrice <= row.take_profit
     if (hit) return { exit: true, reason: 'target', side: exitSide }
   }
@@ -126,34 +123,24 @@ export function evaluateExit(
     return { exit: true, reason: 'time', side: exitSide }
   }
 
-  // 4. Momentum decay: 20d % change exceeded the deadband against the position.
-  //    Enrichment is captured at signal time, not live, so a bare negative
-  //    reading whipsaws on routine dips. Only fire when momentum has
-  //    deteriorated beyond MOMENTUM_EXIT_DEADBAND_PCT (default -5%). For
-  //    shorts the mirror applies: exit only when m > +5%.
-  //    TODO: replace with a live GET /prices momentum refresh once the engine
-  //    exposes it, so the enrichment-staleness limitation is removed.
-  if (row.enrichment_json) {
-    try {
-      const e = JSON.parse(row.enrichment_json) as { price_change_20d_pct?: number | null }
-      const m = e.price_change_20d_pct
-      if (typeof m === 'number') {
-        const decayed = isLong
-          ? m < MOMENTUM_EXIT_DEADBAND_PCT
-          : m > -MOMENTUM_EXIT_DEADBAND_PCT
-        if (decayed) return { exit: true, reason: 'momentum', side: exitSide }
-      }
-    } catch { /* malformed -> no momentum opinion */ }
+  // Entry-time enrichment is historical context, not a current exit signal.
+  const m = ctx.momentumPct
+  if (m != null && Number.isFinite(m)) {
+    const decayed = isLong ? m < MOMENTUM_EXIT_DEADBAND_PCT : m > -MOMENTUM_EXIT_DEADBAND_PCT
+    if (decayed) return { exit: true, reason: 'momentum', side: exitSide }
   }
 
   return { exit: false, reason: 'hold', side: exitSide }
 }
 
-/** Latest close from a /prices series, or null when empty. */
-function lastClose(bars: { close: number }[]): number | null {
-  if (bars.length === 0) return null
-  const c = bars[bars.length - 1].close
-  return typeof c === 'number' && isFinite(c) ? c : null
+/** Current 20-session return, or null for incomplete/stale market data. */
+export function currentMomentum(bars: {close: number; ts_ms: number}[], nowMs: number, crypto: boolean): number | null {
+  const sorted = [...new Map(bars.filter(b => Number.isFinite(b.close) && b.close > 0 &&
+    Number.isFinite(b.ts_ms) && b.ts_ms <= nowMs).map(b => [b.ts_ms, b])).values()].sort((a, b) => a.ts_ms - b.ts_ms)
+  if (sorted.length < 21) return null
+  const last = sorted[sorted.length - 1]
+  if (nowMs - last.ts_ms > (crypto ? 2 : 4) * DAY_MS) return null
+  return (last.close / sorted[sorted.length - 21].close - 1) * 100
 }
 
 /**
@@ -173,15 +160,36 @@ export async function runExitSweep(
    */
   opts?: { nowMs?: number; isMarketOpen?: () => boolean },
 ): Promise<{ checked: number; exited: number; errors: number; drifted: number; skippedClosed: number }> {
+  // Preserve the decision ID across ambiguous transport failure. The engine's
+  // durable idempotency contract either returns that order or creates it once.
+  const uncertain = db.prepare("SELECT id, asset, action FROM trader_decisions WHERE status=?")
+    .all(DECISION_STATUS.EXIT_UNKNOWN) as Array<{id: string; asset: string; action: 'buy' | 'sell'}>
+  let recovered = 0
+  let recoveryErrors = 0
+  for (const intent of uncertain) {
+    if (!intent.asset.includes('/') && !(opts?.isMarketOpen ?? (() => isEquityMarketHours(opts?.nowMs ?? Date.now())))()) continue
+    try {
+      const response = await engineClient.submitDecision({decision_id: intent.id, asset: intent.asset,
+        side: intent.action, size_usd: 0, entry_type: 'market', entry_price: 0, strategy: 'exit', confidence: 1})
+      if (response.status !== 'unknown') {
+        db.prepare('UPDATE trader_decisions SET status=?, engine_order_id=? WHERE id=?')
+          .run(DECISION_STATUS.EXIT_SUBMITTED, response.broker_order_id ?? response.client_order_id, intent.id)
+        recovered++
+      }
+    } catch (err) {
+      recoveryErrors++
+      logger.warn({decisionId: intent.id, err}, 'Exit acceptance remains unknown; original intent retained')
+    }
+  }
   const candidates = findOpenExitCandidates(db)
-  if (candidates.length === 0) return { checked: 0, exited: 0, errors: 0, drifted: 0, skippedClosed: 0 }
+  if (candidates.length === 0) return { checked: 0, exited: recovered, errors: recoveryErrors, drifted: 0, skippedClosed: 0 }
 
   let positions: EnginePosition[]
   try {
     positions = await engineClient.getPositions()
   } catch (err) {
     logger.warn({ err, candidates: candidates.length }, 'Exit sweep: getPositions failed')
-    return { checked: 0, exited: 0, errors: 1, drifted: 0, skippedClosed: 0 }
+    return { checked: 0, exited: recovered, errors: 1 + recoveryErrors, drifted: 0, skippedClosed: 0 }
   }
   const hasPosition = (asset: string): EnginePosition | undefined =>
     positions.find(p => p.asset === asset && Math.abs(p.qty) > 1e-9)
@@ -189,8 +197,8 @@ export async function runExitSweep(
   const nowMs = opts?.nowMs ?? Date.now()
   const equitiesOpen = opts?.isMarketOpen ?? (() => isEquityMarketHours(nowMs))
   let checked = 0
-  let exited = 0
-  let errors = 0
+  let exited = recovered
+  let errors = recoveryErrors
   let drifted = 0
   let skippedClosed = 0
 
@@ -226,14 +234,19 @@ export async function runExitSweep(
       }
       checked += 1
 
-      const bars = await engineClient.getPrices(row.asset, nowMs - 7 * DAY_MS, nowMs)
-      const last = lastClose(bars)
-      if (last == null) {
-        logger.info({ asset: row.asset, decisionId: row.id }, 'Exit sweep: no price bar, skipping')
-        continue
+      const mark = Math.abs(pos.market_value / pos.qty)
+      const last = Number.isFinite(mark) && mark > 0 && Number.isFinite(pos.updated_at) &&
+        nowMs >= pos.updated_at && nowMs - pos.updated_at <= EXIT_MARK_MAX_AGE_MS ? mark : null
+      let verdict = evaluateExit(row, {lastPrice: last, nowMs})
+      // Stops and time exits do not wait on historical market-data requests.
+      if (!verdict.exit) {
+        try {
+          const bars = await engineClient.getPrices(row.asset, nowMs - 45 * DAY_MS, nowMs)
+          verdict = evaluateExit(row, {lastPrice: last, nowMs, momentumPct: currentMomentum(bars, nowMs, isCrypto)})
+        } catch (err) {
+          logger.warn({asset: row.asset, err}, 'Exit momentum unavailable; no momentum-based action')
+        }
       }
-
-      const verdict = evaluateExit(row, { lastPrice: last, nowMs })
       if (!verdict.exit) continue
 
       const exitDecisionId = randomUUID()
@@ -286,17 +299,11 @@ export async function runExitSweep(
           )
           continue
         }
-        // Any other submit failure (503 broker_unavailable pre-market, network,
-        // timeout): the broker never confirmed the order, so the freshly
-        // inserted exit_submitted row would permanently block this decision's
-        // exit via the duplicate guard while no closing order exists. Delete
-        // the intent row so the NEXT sweep retries cleanly. Double-submit risk
-        // on an ambiguous timeout is bounded by the engine's clip_close_qty
-        // (a close can never sell more than the held position).
-        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(exitDecisionId)
+        db.prepare('UPDATE trader_decisions SET status=? WHERE id=?')
+          .run(DECISION_STATUS.EXIT_UNKNOWN, exitDecisionId)
         logger.warn(
           { asset: row.asset, decisionId: row.id, err: msg },
-          'Exit sweep: exit submit failed, intent row removed so next sweep retries',
+          'Exit sweep: acceptance uncertain; next sweep will recover the same intent ID',
         )
         throw submitErr
       }

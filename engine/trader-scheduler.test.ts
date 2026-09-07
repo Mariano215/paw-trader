@@ -13,6 +13,7 @@ import {
 } from './trader-scheduler.js'
 import * as loggerModule from '../logger.js'
 import type { EngineClient } from './engine-client.js'
+import { GATE_VERSION, gateConfigFingerprint } from './go-live-gate.js'
 
 vi.mock('./decision-dispatcher.js', () => ({
   autoDispatchPendingSignals: vi.fn().mockResolvedValue([]),
@@ -40,6 +41,8 @@ function makeDb() {
   // Same for the weekly go-live gate run, exercised in its own test file.
   db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
     .run('trader.gate.last_run_ms', String(Date.now()))
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last', JSON.stringify({version: GATE_VERSION, configFingerprint: gateConfigFingerprint(db), passed: false, criteria: [], evaluatedAt: Date.now()}))
   return db
 }
 
@@ -75,6 +78,14 @@ describe('trader-scheduler', () => {
     (getEngineClientMock as unknown as () => EngineClient)()
 
   beforeEach(() => {
+    // Pin the clock: the daily readiness digest (progress-monitor) fires on any
+    // tick at or after 17:00 ET, so on a real clock these tests pass in the
+    // morning and fail in the evening. Fake Date only, never the timer queue,
+    // so async code that awaits real timeouts still runs. Tests that need a
+    // different moment call vi.setSystemTime themselves.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-22T15:00:00Z')) // 11:00 ET
+    vi.mocked(autoDispatchPendingSignals).mockReset().mockResolvedValue([])
     db = makeDb()
     sendMock = vi.fn().mockResolvedValue(undefined)
     engineClient = {
@@ -172,6 +183,23 @@ describe('trader-scheduler', () => {
       expect(sendMock).not.toHaveBeenCalled()
     })
 
+    it('blocks live entries locally even when requesting a halt fails', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({...healthOk, alpaca_mode: 'live'})
+      engineClient.haltTrading = vi.fn().mockRejectedValue(new Error('halt unavailable'))
+      insertSignal(db, 'unsafe-live')
+      await runTraderTick({isMarketOpen: () => true, db, getEngineClient, send})
+      expect(engineClient.haltTrading).toHaveBeenCalled()
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+      expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('New entries blocked locally'))
+    })
+
+    it('blocks new entries when mode is unknown', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue(null)
+      insertSignal(db, 'unknown-mode')
+      await runTraderTick({isMarketOpen: () => true, db, getEngineClient, send})
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
     it('polls engine and calls autoDispatchPendingSignals for new signals', async () => {
       vi.mocked(engineClient.getSignals!).mockResolvedValue([
         {
@@ -213,7 +241,8 @@ describe('trader-scheduler', () => {
 
       const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
       expect(result.polled).toBe(false)
-      expect(result.sent).toBe(1)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
     })
 
     it('continues when autoDispatchPendingSignals throws', async () => {
@@ -362,7 +391,8 @@ describe('trader-scheduler', () => {
 
       const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
       expect(result.polled).toBe(true)
-      expect(result.sent).toBe(1)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
     })
 
     it('runs close-out sweep and reports processed count when a position closed', async () => {
@@ -817,26 +847,19 @@ describe('trader-scheduler', () => {
   describe('initTraderScheduler', () => {
     it('runs an immediate tick on start', async () => {
       insertSignal(db, 'sig-1')
-      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000, isMarketOpen: () => true })
       await new Promise((resolve) => setTimeout(resolve, 10))
       expect(autoDispatchPendingSignals).toHaveBeenCalled()
     })
 
     it('does not start twice', async () => {
       initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
-      const firstCount = getEngineClientMock.mock.calls.length
 
       initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
       await new Promise((resolve) => setTimeout(resolve, 10))
 
-      // Each tick makes up to 9 getEngineClient() calls across its phases
-      // (health check, signal poll, order reconcile, retry sweep, close-out
-      // sweep, exit sweep, weekly-report gate, monitor coinbase check, monitor
-      // NAV drop check).  The second init should be a no-op; we tolerate a
-      // small slack in case the first tick's async chain finishes after
-      // firstCount is captured.  If a second init did leak through we would
-      // see another full tick's worth of calls (+9 or more).
-      expect(getEngineClientMock.mock.calls.length).toBeLessThanOrEqual(firstCount + 8)
+      // Assert one tick, independent of how many phases obtain the client.
+      expect(engineClient.getSignals).toHaveBeenCalledTimes(1)
     })
 
     it('stopTraderScheduler halts future ticks', async () => {

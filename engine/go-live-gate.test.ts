@@ -3,7 +3,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import type { EngineClient } from './engine-client.js'
-import { computeBrokerTruth, runGoLiveGate, readLastGateResult, gateRunDue, renderGateSummary } from './go-live-gate.js'
+import { computeBrokerTruth, runGoLiveGate, readLastGateResult, gateRunDue, renderGateSummary, gateAuthorizesLive, gateConfigFingerprint, GATE_VERSION, GATE_RUN_INTERVAL_MS, refreshAccountingSnapshot, REQUIRED_GATE_CRITERIA } from './go-live-gate.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -44,6 +44,40 @@ function mockClient(orders: unknown[], positions: unknown[] = []): EngineClient 
 }
 
 describe('computeBrokerTruth', () => {
+  it('counts split exits once and includes canceled partial fills', async () => {
+    const truth = await computeBrokerTruth(mockClient([
+      order({broker_order_id: 'buy', client_order_id: 'buy', filled_qty: 10}),
+      order({broker_order_id: 'sell1', client_order_id: 'sell1', side: 'sell', filled_qty: 4, filled_avg_price: 110, status: 'canceled', updated_at: 2}),
+      order({broker_order_id: 'sell2', client_order_id: 'sell2', side: 'sell', filled_qty: 6, filled_avg_price: 120, updated_at: 3}),
+    ]))
+    expect(truth.realizedLots).toHaveLength(2)
+    expect(truth.roundTrips).toBe(1)
+    expect(truth.closedReturns).toEqual([0.16])
+  })
+
+  it('bridges decision/client ID mismatch using broker ID and preserves recorded fees', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_fills
+      (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price, fill_ts_ms, fee_usd, slippage_usd, recorded_at)
+      VALUES ('f', 'decision', 'decision', 'b1', 'SPY', 'buy', 10, 100, 1, 2, 0, 1)`).run()
+    const truth = await computeBrokerTruth(mockClient([
+      order({updated_at: 10}),
+      order({broker_order_id: 'b2', client_order_id: 'c2', side: 'sell', filled_qty: 10, filled_avg_price: 110, updated_at: 2}),
+    ]), db)
+    expect(truth.realizedTotal).toBe(98)
+    expect(truth.roundTrips).toBe(1)
+    expect(truth.closedReturns[0]).toBeCloseTo(0.098)
+  })
+
+  it('keeps the last snapshot timestamp when a refresh fails', async () => {
+    const db = makeDb()
+    const client = mockClient([])
+    await refreshAccountingSnapshot(db, client, 1000)
+    client.getOrders = vi.fn().mockRejectedValue(new Error('offline'))
+    await expect(refreshAccountingSnapshot(db, client, 2000)).rejects.toThrow('offline')
+    const row = db.prepare("SELECT value FROM kv_settings WHERE key='trader.accounting.last'").get() as {value: string}
+    expect(JSON.parse(row.value)).toMatchObject({evaluated_at: 1000, costs_complete: false})
+  })
   it('FIFO-matches engine filled orders into realized round-trips', async () => {
     const client = mockClient(
       [
@@ -91,6 +125,23 @@ describe('computeBrokerTruth', () => {
 describe('runGoLiveGate', () => {
   let db: ReturnType<typeof makeDb>
   beforeEach(() => { db = makeDb() })
+
+  it('invalidates legacy, expired and changed-config approval', () => {
+    const now = 1000000000
+    const gate = {passed: true, version: GATE_VERSION, configFingerprint: gateConfigFingerprint(db), evaluatedAt: now, criteria: REQUIRED_GATE_CRITERIA.map(name => ({name, passed: true}))}
+    db.exec('CREATE TABLE IF NOT EXISTS kv_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    const save = (value: unknown) => db.prepare('INSERT OR REPLACE INTO kv_settings VALUES (?,?)').run('trader.gate.last', JSON.stringify(value))
+    save(gate)
+    expect(gateAuthorizesLive(db, now)).toBe(true)
+    expect(gateAuthorizesLive(db, now + GATE_RUN_INTERVAL_MS)).toBe(false)
+    expect(gateAuthorizesLive(db, now - 1)).toBe(false)
+    save({...gate, version: 1})
+    expect(gateAuthorizesLive(db, now)).toBe(false)
+    save(gate)
+    db.prepare("UPDATE trader_strategies SET status='paused'").run()
+    expect(gateAuthorizesLive(db, now)).toBe(false)
+    expect(gateRunDue(db, now)).toBe(true)
+  })
 
   it('fails the gate on a thin record and persists the result', async () => {
     const client = mockClient([

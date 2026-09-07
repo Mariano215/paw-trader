@@ -43,6 +43,11 @@ function baseInput(over: Partial<GateInput> = {}): GateInput {
 }
 
 describe('evaluateGate', () => {
+  it.each([{equityCurve: []}, {equityCurve: [{ts_ms: 1, equity: 100}]}, {equityCurve: [{ts_ms: 1, equity: 100}, {ts_ms: 2, equity: NaN}]}])('blocks missing or invalid equity history', ({equityCurve}) => {
+    const res = evaluateGate(baseInput({equityCurve}))
+    expect(res.passed).toBe(false)
+    expect(res.criteria.find(c => c.name === 'max_drawdown_kill')?.passed).toBe(false)
+  })
   it('passes when every criterion is met', () => {
     const res = evaluateGate(baseInput())
     expect(res.passed).toBe(true)

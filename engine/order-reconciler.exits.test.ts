@@ -11,8 +11,8 @@ import type { EngineClient } from './engine-client.js'
  * duplicate guard blocked any retry forever while no closing order existed
  * at the broker. The reconciler now owns exit rows:
  *   filled        -> 'closed'
- *   canceled/...  -> row DELETED (guard freed; sweep retries)
- *   orphaned      -> row DELETED after EXIT_ORPHAN_HORIZON_MS
+ *   canceled/...  -> failed, retained for audit (guard freed)
+ *   orphaned      -> exit_unknown; recover same ID
  *   live unfilled -> untouched
  */
 
@@ -60,7 +60,7 @@ describe('reconcileOpenOrders: exit_submitted rows', () => {
     expect(fill.side).toBe('sell')
   })
 
-  it('DELETES a canceled exit row so the sweep can retry (not marked failed)', async () => {
+  it('retains a canceled exit for audit and frees the duplicate guard', async () => {
     const db = makeDb()
     seedExit(db, 'd-exit', NOW)
     const client = clientWith([{
@@ -70,15 +70,30 @@ describe('reconcileOpenOrders: exit_submitted rows', () => {
     }])
     const sum = await reconcileOpenOrders(db, client)
     expect(sum.canceledOrRejected).toBe(1)
-    expect(db.prepare("SELECT id FROM trader_decisions WHERE id='d-exit'").get()).toBeUndefined()
+    expect(db.prepare("SELECT status FROM trader_decisions WHERE id='d-exit'").get()).toEqual({status: 'failed'})
   })
 
-  it('DELETES an orphaned exit row after the exit horizon (engine-restart loss)', async () => {
+  it.each(['partially_filled', 'canceled'])('records a %s exit without losing its history', async (status) => {
+    const db = makeDb()
+    seedExit(db, 'd-exit', NOW)
+    const order = {
+      client_order_id: 'd-exit', broker_order_id: 'b1', asset: 'SPY', side: 'sell',
+      qty: 1, order_type: 'market', limit_price: null, status,
+      filled_qty: 0.5, filled_avg_price: 100, source: 'alpaca', created_at: NOW, updated_at: NOW,
+    }
+    const sum = await reconcileOpenOrders(db, clientWith([order]))
+    expect(sum.promotedToFilled).toBe(0)
+    expect(db.prepare("SELECT status,filled_qty FROM trader_decisions WHERE id='d-exit'").get())
+      .toEqual({status: status === 'canceled' ? 'failed' : 'exit_submitted', filled_qty: 0.5})
+    expect(db.prepare("SELECT count(*) AS n FROM trader_fills WHERE decision_id='d-exit'").get()).toEqual({n: 1})
+  })
+
+  it('retains an orphaned exit ID for idempotent recovery after the horizon', async () => {
     const db = makeDb()
     seedExit(db, 'd-exit', NOW - EXIT_ORPHAN_HORIZON_MS - 1000)
     const sum = await reconcileOpenOrders(db, clientWith([]))
     expect(sum.expiredOrphans).toBe(1)
-    expect(db.prepare("SELECT id FROM trader_decisions WHERE id='d-exit'").get()).toBeUndefined()
+    expect(db.prepare("SELECT status FROM trader_decisions WHERE id='d-exit'").get()).toEqual({status: 'exit_unknown'})
   })
 
   it('leaves a recent unmatched exit alone (propagation lag)', async () => {

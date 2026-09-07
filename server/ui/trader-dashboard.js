@@ -218,7 +218,8 @@ function ensureTraderPageDOM() {
   var gateCard = document.createElement('div');
   gateCard.id = 'trader-gate-card';
   gateCard.className = 'stat-card';
-  footer.appendChild(gateCard);
+  page.insertBefore(gateCard, grid);
+  gateCard.style.marginBottom = '16px';
 
   // Halt button
   var haltWrap = document.createElement('div');
@@ -232,34 +233,33 @@ function ensureTraderPageDOM() {
   footer.appendChild(haltWrap);
 }
 
+var _traderRefreshPending = new Set();
+async function runTraderRefresh(fn) {
+  if (_traderRefreshPending.has(fn)) return;
+  _traderRefreshPending.add(fn);
+  try { await fn(); }
+  finally { _traderRefreshPending.delete(fn); }
+}
+
 function initTraderPage() {
   ensureTraderPageDOM();
   closeStrategyDetail();
   closeKillSwitchLogPage();
 
   // Initial renders
-  refreshTraderKPI_nav();
-  refreshTraderKPI_engine();
-  refreshTraderKPI_brokerPnl();
-  refreshTraderCol1();
-  refreshTraderCol2();
-  refreshTraderCol3();
-  refreshTraderBypassProgress();
-  refreshTraderGateProgress();
+  var refreshers = [refreshTraderKPI_nav, refreshTraderKPI_engine, refreshTraderKPI_brokerPnl,
+    refreshTraderCol1, refreshTraderCol2, refreshTraderCol3, refreshTraderBypassProgress, refreshTraderGateProgress];
+  refreshers.forEach(function (fn) { runTraderRefresh(fn); });
   _renderTraderTicker();
   _renderBottomRow();
 
   // Polling (match existing intervals from spec)
   if (!_traderPollStarted) {
     _traderPollStarted = true;
-    addPollingInterval(refreshTraderKPI_nav,    60000);  // NAV + committee
-    addPollingInterval(refreshTraderKPI_engine,  5000);  // engine status
-  addPollingInterval(refreshTraderKPI_brokerPnl, 60000); // broker-truth realized
-    addPollingInterval(refreshTraderCol1,        5000);  // positions
-    addPollingInterval(refreshTraderCol2,        5000);  // signals + decisions
-    addPollingInterval(refreshTraderCol3,        5000);  // risk/circuit breakers
-    addPollingInterval(refreshTraderBypassProgress, 60000);
-  addPollingInterval(refreshTraderGateProgress, 60000);
+    var periods = [60000, 5000, 60000, 5000, 5000, 5000, 60000, 60000];
+    refreshers.forEach(function (fn, i) {
+      addPollingInterval(function () { return runTraderRefresh(fn); }, periods[i]);
+    });
   }
 }
 
@@ -336,16 +336,18 @@ async function refreshTraderKPI_nav() {
 async function refreshTraderKPI_brokerPnl() {
   try {
     var data = await fetchFromAPI('/api/v1/trader/broker-pnl');
-    if (!data || !data.available) return;
+    if (!data || !data.available) throw new Error('Accounting unavailable');
     var v = Number(data.realized_total) || 0;
     var colorAttr = v >= 0 ? 'style="color:var(--green,#3ddc84)"' : 'style="color:#ff5c5c"';
     var fmtd = (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
     _renderKpiCell('kpi-realized', 'REALIZED P&L',
       '<span ' + colorAttr + '>' + fmtd + '</span>',
-      (data.round_trips || 0) + ' round-trips',
-      'Realized P&L (broker truth)',
-      'Locked-in profit from closed round-trips, computed from the broker\'s actual filled orders. This is the number that matters.', null);
-  } catch (_) { /* non-fatal */ }
+      (data.stale ? 'STALE · ' : '') + (data.round_trips || 0) + ' completed entries · ' + new Date(data.evaluated_at).toLocaleString(),
+      'Realized P&L — recorded fees only',
+      'FIFO profit from archived and recent fills. Complete fees and paper execution costs are not yet verified. Paper profit does not establish live profitability.', null);
+  } catch (_) {
+    _renderKpiCell('kpi-realized', 'REALIZED P&L', '--', 'Accounting unavailable', null, null, null);
+  }
 }
 
 async function refreshTraderKPI_engine() {
@@ -362,7 +364,7 @@ function _renderKpiNavCells(data) {
   var nav = data.current_nav != null ? data.current_nav : (data.nav != null ? data.nav : null);
   var todayPnl  = data.today_pnl  != null ? data.today_pnl  : (data.pnl_today != null  ? data.pnl_today  : null);
   var weekPnl   = data.week_pnl   != null ? data.week_pnl   : (data.pnl_week != null   ? data.pnl_week   : null);
-  var unrealPnl = TRADER_STATE.positions
+  var unrealPnl = TRADER_STATE.positionsUpdatedAt && !TRADER_STATE.positionsStale
     ? TRADER_STATE.positions.reduce(function(s, p) { return s + (p.unrealized_pnl || 0); }, 0)
     : null;
   var signalCount = (TRADER_STATE.signals ? TRADER_STATE.signals.length : 0)
@@ -392,9 +394,9 @@ function _renderKpiNavCells(data) {
     'Unrealized P&L', 'Profit on positions you still hold — not locked in until sold.', null);
 
   _renderKpiCell('kpi-signals', 'SIGNALS',
-    signalCount + ' pending',
+    (TRADER_STATE.signals || []).length + ' ideas · ' + (TRADER_STATE.decisions || []).length + ' orders',
     null,
-    'Signals', 'Trade ideas the strategies just generated, waiting for committee approval.', null);
+    'Ideas and orders', 'Ideas await strategy and risk checks. Orders are already in the execution pipeline. Committee review runs when required by the configured strategy.', null);
 }
 
 function _renderKpiEngineCell(st) {
@@ -402,7 +404,9 @@ function _renderKpiEngineCell(st) {
   var live   = mode === 'live';
   var halted = !!(st && st.reconciler_halted);
   var pill;
-  if (halted) {
+  if (!st || !st.engine_connected || (mode !== 'paper' && mode !== 'live')) {
+    pill = '<span class="status-pill">Status unknown / offline</span>';
+  } else if (halted) {
     pill = '<span class="status-pill" style="background:rgba(255,60,60,0.18);color:#ff5c5c;border:1px solid #ff5c5c;">■ HALTED</span>';
   } else {
     pill = '<span class="status-pill ' + (live ? 'pill-live' : 'pill-paper') + '">' + (live ? '● Live' : '○ Paper') + '</span>';
@@ -497,7 +501,11 @@ function _buildTickerItems(target) {
     })(positions[i]);
   }
   if (positions.length === 0) {
-    addItem('trader-ticker-disclaimer', function (item) { item.textContent = 'No open positions'; });
+    addItem('trader-ticker-disclaimer', function (item) {
+      item.textContent = st.positionsStale || !st.positionsUpdatedAt ? 'Holdings unknown — awaiting broker snapshot' : 'No open positions';
+    });
+  } else if (st.positionsStale) {
+    addItem('trader-ticker-disclaimer', function (item) { item.textContent = 'Holdings snapshot stale'; });
   }
 
   addItem('trader-ticker-disclaimer', function (item) {
@@ -546,12 +554,16 @@ function _renderTraderTicker() {
 async function refreshTraderCol1() {
   try {
     var posData = await fetchFromAPI('/api/v1/trader/positions');
-    TRADER_STATE.positions = (posData && posData.positions) ? posData.positions : (Array.isArray(posData) ? posData : []);
+    if (!Array.isArray(posData) && !(posData && Array.isArray(posData.positions))) throw new Error('Positions unavailable');
+    TRADER_STATE.positions = Array.isArray(posData) ? posData : posData.positions;
+    TRADER_STATE.positionsUpdatedAt = Date.now();
+    TRADER_STATE.positionsStale = false;
   } catch (_) {
-    TRADER_STATE.positions = [];
+    TRADER_STATE.positionsStale = true;
   }
   // update unrealized KPI cell
-  var unrealPnl = TRADER_STATE.positions.reduce(function(s, p) { return s + (p.unrealized_pnl || 0); }, 0);
+  var unrealPnl = !TRADER_STATE.positionsStale && TRADER_STATE.positionsUpdatedAt
+    ? TRADER_STATE.positions.reduce(function(s, p) { return s + (p.unrealized_pnl || 0); }, 0) : null;
   function fmt(v) { return v == null ? '--' : (v >= 0 ? '+$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)); }
   function color(v) { return v == null ? '' : (v >= 0 ? 'style="color:var(--color-success)"' : 'style="color:var(--color-danger)"'); }
   var cell = document.getElementById('kpi-unrealized');
@@ -595,10 +607,18 @@ function _renderCol1() {
   col.appendChild(posHeader);
 
   var positions = TRADER_STATE.positions || [];
+  if (TRADER_STATE.positionsStale) {
+    var warning = document.createElement('div');
+    warning.className = 'trader-empty';
+    warning.textContent = TRADER_STATE.positionsUpdatedAt
+      ? 'Positions unavailable. Last known holdings from ' + new Date(TRADER_STATE.positionsUpdatedAt).toLocaleString()
+      : 'Positions unavailable. Holdings are unknown.';
+    col.appendChild(warning);
+  }
   if (positions.length === 0) {
     var empty1 = document.createElement('div');
     empty1.className = 'trader-empty';
-    empty1.textContent = 'No open positions';
+    empty1.textContent = TRADER_STATE.positionsStale ? 'Waiting for broker connection' : 'No open positions';
     col.appendChild(empty1);
   } else {
     var table1 = document.createElement('div');
@@ -730,7 +750,7 @@ async function refreshTraderCol2() {
   var kpiSig = document.getElementById('kpi-signals');
   if (kpiSig) {
     var valEl = kpiSig.querySelector('.trader-kpi-value');
-    if (valEl) valEl.textContent = signalCount + ' pending';
+    if (valEl) valEl.textContent = (TRADER_STATE.signals || []).length + ' ideas · ' + (TRADER_STATE.decisions || []).length + ' orders';
   }
 
   _renderCol2();
@@ -2490,6 +2510,16 @@ async function refreshTraderGateProgress() {
     heading.textContent = 'Go-Live Gate (paper to real money)';
     container.appendChild(heading);
 
+    var progress = data.progress;
+    var monitoring = document.createElement('p');
+    monitoring.style.cssText = 'font-size:0.8rem;line-height:1.5;';
+    var progressFresh = progress && Number.isFinite(progress.checked_at) &&
+      progress.checked_at <= Date.now() && Date.now() - progress.checked_at <= 15 * 60000;
+    monitoring.textContent = progressFresh
+      ? 'Automatic progress checks active. Daily update: 5 p.m. Eastern; weekly review: Sunday 9 a.m. Eastern. Last checked ' + new Date(progress.checked_at).toLocaleString() + '. No automatic live switch.'
+      : 'Progress monitoring not yet confirmed or stale. Check that the PawTrader bot is running.';
+    container.appendChild(monitoring);
+
     if (!data.available || !data.gate) {
       var none = document.createElement('div');
       none.style.cssText = 'opacity:0.7;font-size:0.85rem;';
@@ -2499,29 +2529,40 @@ async function refreshTraderGateProgress() {
     }
 
     var g = data.gate;
+    var stale = g.version !== 2 || !Number.isFinite(g.evaluatedAt) || Date.now() < g.evaluatedAt || Date.now() - g.evaluatedAt >= 7 * 86400000 || (progressFresh && progress.gate_current === false);
     var passedCount = 0;
     (g.criteria || []).forEach(function (c) { if (c.passed) passedCount++; });
 
     var statusRow = document.createElement('div');
     statusRow.style.cssText = 'font-size:1.6rem;font-weight:700;margin-bottom:4px;' +
-      (g.passed ? 'color:var(--positive, #3ddc84);' : '');
-    statusRow.textContent = g.passed
-      ? 'PASSED'
+      (g.passed && !stale ? 'color:var(--positive, #3ddc84);' : '');
+    statusRow.textContent = stale ? 'Re-evaluation required' : g.passed
+      ? 'Evidence passed — not permission to trade live'
       : passedCount + ' / ' + (g.criteria || []).length + ' criteria';
     container.appendChild(statusRow);
 
     var pnlRow = document.createElement('div');
     pnlRow.style.cssText = 'opacity:0.7;font-size:0.85rem;margin-bottom:8px;';
     var net = (g.realizedTotal || 0) + (g.openUnrealized || 0);
-    pnlRow.textContent = (g.roundTrips || 0) + ' round-trips, broker-truth net $' + net.toFixed(2);
+    pnlRow.textContent = (g.roundTrips || 0) + ' completed entries; recorded-fee P&L $' + net.toFixed(2) + '. Keep paper mode while blockers remain.';
     container.appendChild(pnlRow);
 
     (g.criteria || []).forEach(function (c) {
       var row = document.createElement('div');
       row.style.cssText = 'font-size:0.8rem;margin-bottom:2px;' + (c.passed ? 'opacity:0.75;' : '');
       row.textContent = (c.passed ? 'PASS  ' : 'BLOCK ') + c.name.replace(/_/g, ' ');
-      row.title = c.detail || '';
+      var detail = document.createElement('div');
+      detail.style.cssText = 'font-size:0.8rem;line-height:1.5;margin:2px 0 10px;overflow-wrap:anywhere;';
+      detail.textContent = c.detail || '';
+      row.appendChild(detail);
       container.appendChild(row);
+    });
+
+    (g.warnings || []).forEach(function (message) {
+      var warning = document.createElement('p');
+      warning.style.cssText = 'font-size:0.8rem;line-height:1.5;';
+      warning.textContent = message;
+      container.appendChild(warning);
     });
 
     if (g.evaluatedAt) {

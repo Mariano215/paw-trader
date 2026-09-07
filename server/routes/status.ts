@@ -11,6 +11,7 @@
 import { Router, type Request, type Response } from 'express'
 import { requireAdmin } from '../auth.js'
 import { logger } from '../logger.js'
+import { getBotDb } from '../db.js'
 import {
   engineFetch,
   getEngineConfig,
@@ -70,21 +71,21 @@ router.get('/api/v1/trader/status', async (_req: Request, res: Response) => {
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/trader/positions
-// Phase 0 stub - returns [] when engine is not reachable. Phase 1 will wire
-// actual positions through to the dashboard grid.
+// Failed reads are unavailable, never a confirmed empty portfolio.
 // ---------------------------------------------------------------------------
 
 router.get('/api/v1/trader/positions', async (_req: Request, res: Response) => {
   const cfg = getEngineConfig()
   if (!cfg) {
-    res.json([])
+    res.status(503).json({ error: 'positions unavailable' })
     return
   }
   try {
     const positions = await engineFetch<unknown[]>(cfg, '/positions')
+    if (!Array.isArray(positions)) throw new Error('invalid positions response')
     res.json(positions)
   } catch {
-    res.json([])
+    res.status(503).json({ error: 'positions unavailable' })
   }
 })
 
@@ -237,99 +238,20 @@ router.get('/api/v1/trader/overview', async (_req: Request, res: Response) => {
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/trader/broker-pnl
-// Realized P&L from ENGINE filled orders (FIFO per asset) + open unrealized
-// from engine positions. Broker truth: matches scripts/verify-trader-pnl.mjs
-// and src/trader/go-live-gate.ts computeBrokerTruth. FIFO is inlined here
-// because the server compiles independently of bot source.
-// ---------------------------------------------------------------------------
-
-interface EngineOrderLite {
-  asset: string
-  side: 'buy' | 'sell'
-  status: string
-  filled_qty: number
-  filled_avg_price: number | null
-  updated_at: number
-}
-
-interface EnginePositionLite {
-  asset: string
-  qty: number
-  unrealized_pnl?: number
-}
-
-function fifoRealized(fills: Array<{ side: string; qty: number; price: number }>): { roundTrips: number; realized: number } {
-  const open: Array<{ qty: number; price: number }> = []
-  let roundTrips = 0
-  let realized = 0
-  for (const f of fills) {
-    if (f.side === 'buy') { open.push({ qty: f.qty, price: f.price }); continue }
-    let rem = f.qty
-    while (rem > 1e-12 && open.length > 0) {
-      const lot = open[0]
-      const m = Math.min(rem, lot.qty)
-      realized += (f.price - lot.price) * m
-      roundTrips++
-      lot.qty -= m; rem -= m
-      if (lot.qty <= 1e-12) open.shift()
-    }
-  }
-  return { roundTrips, realized }
-}
-
-router.get('/api/v1/trader/broker-pnl', async (_req: Request, res: Response) => {
-  const cfg = getEngineConfig()
-  if (!cfg) {
-    res.json({ available: false })
-    return
-  }
+// Serve the bot's durable archive-aware calculation, not a rolling order window.
+router.get('/api/v1/trader/broker-pnl', (_req: Request, res: Response) => {
   try {
-    const [orders, positions] = await Promise.all([
-      engineFetch<EngineOrderLite[]>(cfg, '/orders'),
-      engineFetch<EnginePositionLite[]>(cfg, '/positions'),
-    ])
-    // Dedup by order id first: if the engine ever returns a partially_filled
-    // snapshot AND the final filled row for the same order, counting both
-    // would inflate realized P&L. filled_qty only grows, so keep the max.
-    const latestByOrder = new Map<string, EngineOrderLite & { client_order_id?: string }>()
-    for (const o of (Array.isArray(orders) ? orders : []) as Array<EngineOrderLite & { client_order_id?: string }>) {
-      const key = o.client_order_id ?? `${o.asset}:${o.side}:${o.updated_at}`
-      const prev = latestByOrder.get(key)
-      if (!prev || (o.filled_qty ?? 0) > (prev.filled_qty ?? 0)) latestByOrder.set(key, o)
+    const row = getBotDb()?.prepare("SELECT value FROM kv_settings WHERE key='trader.accounting.last'").get() as {value: string} | undefined
+    if (!row) { res.json({available: false}); return }
+    const snapshot = JSON.parse(row.value)
+    const age = Date.now() - snapshot.evaluated_at
+    if (snapshot.available !== true || !Number.isFinite(snapshot.evaluated_at) ||
+        !['realized_total', 'open_unrealized', 'net', 'round_trips'].every(k => Number.isFinite(snapshot[k]))) {
+      res.json({available: false}); return
     }
-    const byAsset = new Map<string, Array<{ side: string; qty: number; price: number; ts: number }>>()
-    for (const o of latestByOrder.values()) {
-      const status = (o.status ?? '').toLowerCase()
-      if (!(o.filled_qty > 0) || (status !== 'filled' && status !== 'partially_filled')) continue
-      const rows = byAsset.get(o.asset) ?? []
-      rows.push({ side: o.side, qty: o.filled_qty, price: o.filled_avg_price ?? 0, ts: o.updated_at })
-      byAsset.set(o.asset, rows)
-    }
-    let realizedTotal = 0
-    let roundTrips = 0
-    const perAsset: Array<{ asset: string; round_trips: number; realized: number }> = []
-    for (const [asset, fills] of byAsset) {
-      fills.sort((a, b) => a.ts - b.ts)
-      const r = fifoRealized(fills)
-      if (r.roundTrips > 0) perAsset.push({ asset, round_trips: r.roundTrips, realized: r.realized })
-      realizedTotal += r.realized
-      roundTrips += r.roundTrips
-    }
-    const openUnrealized = (Array.isArray(positions) ? positions : []).reduce(
-      (s, p) => s + (Math.abs(p.qty) > 1e-9 ? (p.unrealized_pnl ?? 0) : 0), 0)
-    res.json({
-      available: true,
-      realized_total: realizedTotal,
-      round_trips: roundTrips,
-      open_unrealized: openUnrealized,
-      net: realizedTotal + openUnrealized,
-      per_asset: perAsset.sort((a, b) => b.realized - a.realized),
-    })
-  } catch (err) {
-    // Engine unreachable is a normal degraded state for this card. Never
-    // echo the raw error: a future engineFetch change could fold the engine
-    // URL into the message.
-    res.json({ available: false, error: 'engine unreachable' })
+    res.json({...snapshot, stale: age < 0 || age >= 15 * 60 * 1000})
+  } catch {
+    res.json({available: false, error: 'accounting snapshot unavailable'})
   }
 })
 

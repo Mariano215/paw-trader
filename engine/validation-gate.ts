@@ -51,6 +51,7 @@ export interface GateInput {
   regimesObserved: number
   /** Effective independent variants tested, for deflatedSharpe. */
   variantsTested: number
+  trialSharpeVariance?: number
   /** Caller asserts the test window had no re-tuning. Cannot be data-proven. */
   outOfSampleNoRetune: boolean
   /** Backtest Sharpe for the same strategy, for the degradation check. */
@@ -102,18 +103,13 @@ export function evaluateGate(input: GateInput): GateResult {
   })
 
   const observedSharpe = sharpe(input.closedReturns)
-  // Math.max(1, ...) clamps variantsTested to at least 1. With exactly 1
-  // variant, deflatedSharpe returns ~1.0 for any positive observed Sharpe
-  // because a single un-repeated test has no selection bias per Bailey/Lopez
-  // de Prado. The DSR criterion therefore auto-passes when only one variant
-  // was tested. The honesty of variantsTested is the caller's responsibility
-  // and cannot be enforced here.
-  const dsr = deflatedSharpe(observedSharpe, input.closedReturns, Math.max(1, input.variantsTested))
+  const dsr = deflatedSharpe(observedSharpe, input.closedReturns, input.variantsTested, input.trialSharpeVariance)
   criteria.push({
     name: 'deflated_sharpe',
     passed: dsr >= GATE_MIN_DEFLATED_SHARPE,
     detail: `deflated Sharpe ${dsr.toFixed(4)} vs floor ${GATE_MIN_DEFLATED_SHARPE} ` +
-      `(observed Sharpe ${observedSharpe.toFixed(3)}, ${input.variantsTested} variants tested)`,
+      `(trade-return score ${observedSharpe.toFixed(3)}, ${input.variantsTested} variants tested)` +
+      (input.variantsTested > 1 && input.trialSharpeVariance == null ? '; missing measured trial Sharpe variance' : ''),
   })
 
   const stats = tradeStats(input.closedReturns)
@@ -124,11 +120,14 @@ export function evaluateGate(input: GateInput): GateResult {
       `avgWin ${stats.avgWin.toFixed(4)}, avgLoss ${stats.avgLoss.toFixed(4)})`,
   })
 
-  const dd = maxDrawdown(input.equityCurve)
+  const validCurve = input.equityCurve.length >= 2 && input.equityCurve.every((p, i) =>
+    Number.isFinite(p.equity) && p.equity > 0 && Number.isFinite(p.ts_ms) &&
+    (i === 0 || p.ts_ms > input.equityCurve[i - 1].ts_ms))
+  const dd = maxDrawdown(validCurve ? input.equityCurve : [])
   criteria.push({
     name: 'max_drawdown_kill',
-    passed: dd.maxDrawdown <= GATE_MAX_DRAWDOWN_KILL,
-    detail: `max drawdown ${(dd.maxDrawdown * 100).toFixed(1)}% vs kill ${(GATE_MAX_DRAWDOWN_KILL * 100).toFixed(0)}% ` +
+    passed: validCurve && dd.maxDrawdown <= GATE_MAX_DRAWDOWN_KILL,
+    detail: !validCurve ? 'Equity history missing or invalid; drawdown cannot be verified' : `max drawdown ${(dd.maxDrawdown * 100).toFixed(1)}% vs kill ${(GATE_MAX_DRAWDOWN_KILL * 100).toFixed(0)}% ` +
       `(duration ${Math.round(dd.durationMs / 86_400_000)}d)`,
   })
 
@@ -136,7 +135,7 @@ export function evaluateGate(input: GateInput): GateResult {
   const ratio = input.backtestSharpe > 0 ? liveSharpe / input.backtestSharpe : 0
   criteria.push({
     name: 'live_vs_backtest_degradation',
-    passed: input.backtestSharpe <= 0 ? false : ratio >= GATE_MIN_LIVE_BACKTEST_RATIO,
+    passed: Number.isFinite(input.backtestSharpe) && Number.isFinite(ratio) && input.backtestSharpe > 0 && ratio >= GATE_MIN_LIVE_BACKTEST_RATIO,
     detail: input.backtestSharpe <= 0
       ? 'backtest Sharpe non-positive; cannot certify live degradation'
       : `live/backtest Sharpe ratio ${ratio.toFixed(2)} vs floor ${GATE_MIN_LIVE_BACKTEST_RATIO}`,

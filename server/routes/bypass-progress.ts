@@ -120,11 +120,14 @@ router.get('/api/v1/trader/gate-progress', async (_req: Request, res: Response) 
     const row = bdb
       .prepare("SELECT value FROM kv_settings WHERE key = 'trader.gate.last'")
       .get() as { value: string } | undefined
+    const progressRow = bdb.prepare("SELECT value FROM kv_settings WHERE key='trader.progress.last'")
+      .get() as {value: string} | undefined
+    const progress = progressRow ? JSON.parse(progressRow.value) : null
     if (!row) {
-      res.json({ available: false })
+      res.json({ available: false, progress })
       return
     }
-    res.json({ available: true, gate: JSON.parse(row.value) })
+    res.json({ available: true, gate: JSON.parse(row.value), progress })
   } catch (err) {
     // Missing kv_settings table (fresh DB before first sync) is a normal
     // "not evaluated yet" state, not an error.

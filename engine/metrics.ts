@@ -227,9 +227,13 @@ export function deflatedSharpe(
   observedSharpeAnnual: number,
   returns: number[],
   trials: number,
+  /** Variance across tested Sharpe estimates, in per-period units. */
+  trialSharpeVariance?: number,
 ): number {
   const n = returns.length
-  if (n < 4 || trials < 1) return 0
+  if (n < 4 || !Number.isInteger(trials) || trials < 1 || !Number.isFinite(observedSharpeAnnual) ||
+      returns.some((r) => !Number.isFinite(r))) return 0
+  if (trials > 1 && (trialSharpeVariance == null || !Number.isFinite(trialSharpeVariance) || trialSharpeVariance < 0)) return 0
   const srPer = observedSharpeAnnual / Math.sqrt(TRADING_DAYS_PER_YEAR)
   const m = mean(returns)
   const sd = stdevPopulation(returns)
@@ -238,9 +242,12 @@ export function deflatedSharpe(
   const kurt = returns.reduce((s, r) => s + ((r - m) / sd) ** 4, 0) / n
   // Expected max Sharpe under the null across `trials` independent trials.
   const e = 0.5772156649015329 // Euler-Mascheroni
-  const z1 = inverseNormalCdf(1 - 1 / trials)
-  const z2 = inverseNormalCdf(1 - 1 / (trials * Math.E))
-  const expectedMaxSr = z1 * (1 - e) + z2 * e
+  // One trial uses a zero null benchmark, not inverseNormalCdf(0)=-Infinity.
+  // Multiple trials require their measured Sharpe variance (Bailey/Lopez de Prado).
+  const expectedMaxSr = trials === 1 ? 0 : Math.sqrt(trialSharpeVariance!) * (
+    inverseNormalCdf(1 - 1 / trials) * (1 - e) +
+    inverseNormalCdf(1 - 1 / (trials * Math.E)) * e
+  )
   const radicand = 1 - skew * srPer + ((kurt - 1) / 4) * srPer * srPer
   if (radicand <= 0) return 0
   const denom = Math.sqrt(radicand)

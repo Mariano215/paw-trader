@@ -10,6 +10,7 @@ export const DECISION_STATUS = {
   ENGINE_DOWN: 'engine_down', // retry budget exhausted while engine unreachable
   COMMITTEE_ABSTAIN: 'committee_abstain',
   EXIT_SUBMITTED: 'exit_submitted', // closing order submitted by the exit-evaluator
+  EXIT_UNKNOWN: 'exit_unknown', // acceptance uncertain; retry only the same immutable intent
 } as const
 
 export type DecisionStatus = (typeof DECISION_STATUS)[keyof typeof DECISION_STATUS]

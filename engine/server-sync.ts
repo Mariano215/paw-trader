@@ -79,7 +79,7 @@ function buildPayload(db: Database.Database) {
     kv: (() => {
       try {
         return db.prepare(
-          "SELECT key, value FROM kv_settings WHERE key IN ('trader.gate.last', 'trader.gate.regimes_seen')",
+          "SELECT key, value FROM kv_settings WHERE key IN ('trader.gate.last', 'trader.gate.regimes_seen', 'trader.accounting.last', 'trader.progress.last')",
         ).all()
       } catch {
         return []
@@ -89,6 +89,9 @@ function buildPayload(db: Database.Database) {
 }
 
 export async function syncTraderTablesToServer(db: Database.Database): Promise<void> {
+  // Tests may inherit a developer's real dashboard URL/token from .env.
+  // Never publish fixture rows or readiness snapshots to that deployment.
+  if (process.env.NODE_ENV === 'test') return
   if (!DASHBOARD_URL) return
   const token = BOT_API_TOKEN || DASHBOARD_API_TOKEN
   if (!token) return

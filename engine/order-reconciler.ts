@@ -14,12 +14,8 @@ import { recordFill } from './audit-log.js'
 export const RECONCILE_ORPHAN_HORIZON_MS = 6 * 60 * 60 * 1000
 
 /**
- * Exit rows get a much shorter orphan horizon: an exit_submitted row with no
- * broker record means an OPEN POSITION IS UNMANAGED while the duplicate guard
- * blocks any retry. Live incident 2026-06-11: two pre-market exits were
- * accepted by the engine, the engine restarted, the queued orders were lost,
- * and the rows blocked re-exit forever. 15 minutes covers propagation lag
- * without leaving risk unmanaged for hours.
+ * After 15 minutes without a match, recover using the same immutable exit ID.
+ * Missing from an order window is not proof the broker rejected the order.
  */
 export const EXIT_ORPHAN_HORIZON_MS = 15 * 60 * 1000
 
@@ -65,10 +61,8 @@ function intendedPriceOf(row: OpenRow): number | null {
  *   live but unfilled                          -> pending_fill
  *   canceled / rejected / expired              -> failed
  *
- * ENGINE DEPENDENCY: today the engine never reports filled_qty>0 or a
- * 'filled' status (it writes only 'placed'). Until that lands, this
- * function correctly leaves rows at submitted/pending_fill and promotes
- * nothing. No row is ever fabricated to 'executed'. See engineDependencies.
+ * Only broker-confirmed fills advance the lifecycle; partial exits retain
+ * their in-flight guard until terminal completion or cancellation.
  */
 export async function reconcileOpenOrders(
   db: Database.Database,
@@ -83,9 +77,9 @@ export async function reconcileOpenOrders(
       `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at, parent_decision_id,
               entry_price
        FROM trader_decisions
-       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?)`,
+       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?, ?)`,
     )
-    .all(...OPEN_AT_BROKER, DECISION_STATUS.EXIT_SUBMITTED) as OpenRow[]
+    .all(...OPEN_AT_BROKER, DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN) as OpenRow[]
 
   const summary: ReconcileSummary = {
     checked: open.length,
@@ -107,24 +101,21 @@ export async function reconcileOpenOrders(
   }
 
   for (const row of open) {
-    const isExit = row.status === DECISION_STATUS.EXIT_SUBMITTED
+    const isExit = row.status === DECISION_STATUS.EXIT_SUBMITTED || row.status === DECISION_STATUS.EXIT_UNKNOWN
     const match = orders.find((o) => matchesBrokerOrder(o, row))
     if (!match) {
       // No broker record. Recent orders may still be propagating -- skip them.
-      // Old orders with no broker record after the horizon are true orphans:
-      // the submit may have silently failed or been lost (e.g. queued in the
-      // engine across a restart). Entries are marked failed; exit rows are
-      // DELETED so the duplicate guard frees and the next sweep re-submits
-      // the close.
+      // Missing exits retain their ID for recovery, never blind replacement.
+      // Entry orphan handling remains a separate historical policy.
       const age = Date.now() - row.decided_at
       const horizon = isExit ? EXIT_ORPHAN_HORIZON_MS : RECONCILE_ORPHAN_HORIZON_MS
       if (age < horizon) continue
       if (isExit) {
-        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(row.id)
+        db.prepare('UPDATE trader_decisions SET status=? WHERE id=?').run(DECISION_STATUS.EXIT_UNKNOWN, row.id)
         summary.expiredOrphans++
         logger.warn(
           { decisionId: row.id, parentDecisionId: row.parent_decision_id, asset: row.asset, ageMs: age },
-          'Order reconcile: exit order lost (no broker record after horizon), row removed so the exit sweep retries',
+          'Order reconcile: exit not in order window; retain ID for idempotent recovery',
         )
         continue
       }
@@ -144,13 +135,14 @@ export async function reconcileOpenOrders(
     const filled = typeof match.filled_qty === 'number' ? match.filled_qty : 0
 
     if (isExit) {
-      // Exit lifecycle: filled -> closed (terminal); canceled/rejected ->
-      // delete the row so the sweep retries; live unfilled -> leave at
-      // exit_submitted (it IS the guard state).
-      if (filled > 0 && (status === 'filled' || status === 'partially_filled')) {
+      // Cache every observed execution, including a canceled partial fill.
+      // A partial order is still live: preserve its duplicate guard.
+      const terminalFailure = ['canceled', 'rejected', 'expired', 'failed'].includes(status)
+      if (filled > 0) {
         db.prepare(
           `UPDATE trader_decisions SET status = ?, filled_qty = ?, filled_avg_price = ? WHERE id = ?`,
-        ).run(DECISION_STATUS.CLOSED, filled, match.filled_avg_price ?? null, row.id)
+        ).run(status === 'filled' ? DECISION_STATUS.CLOSED : DECISION_STATUS.EXIT_SUBMITTED,
+          filled, match.filled_avg_price ?? null, row.id)
         recordFill(db, {
           decisionId:    row.id,
           clientOrderId: row.id,
@@ -166,12 +158,13 @@ export async function reconcileOpenOrders(
           fillTsMs:      match.updated_at,
           feeUsd:        0,
         }, Date.now(), `${match.broker_order_id ?? row.id}:${filled}`)
-        summary.promotedToFilled++
-        logger.info({ decisionId: row.id, asset: row.asset, filled }, 'Order reconcile: exit filled, decision closed')
-      } else if (status === 'canceled' || status === 'rejected' || status === 'expired') {
-        db.prepare(`DELETE FROM trader_decisions WHERE id = ?`).run(row.id)
+        if (status === 'filled') summary.promotedToFilled++
+        logger.info({ decisionId: row.id, asset: row.asset, filled, status }, 'Order reconcile: exit execution recorded')
+      }
+      if (terminalFailure) {
+        db.prepare('UPDATE trader_decisions SET status=? WHERE id=?').run(DECISION_STATUS.FAILED, row.id)
         summary.canceledOrRejected++
-        logger.warn({ decisionId: row.id, asset: row.asset, status }, 'Order reconcile: exit order canceled/rejected, row removed so the exit sweep retries')
+        logger.warn({ decisionId: row.id, asset: row.asset, status }, 'Order reconcile: terminal exit retained for audit; remaining position may be retried')
       }
       continue
     }

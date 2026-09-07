@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
-import { DECISION_STATUS, MAX_SUBMIT_RETRIES, matchesBrokerOrder } from './order-lifecycle.js'
+import { DECISION_STATUS, MAX_SUBMIT_RETRIES, matchesBrokerOrder, isTerminalSubmitError } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 
 export interface RetrySweepSummary {
@@ -21,20 +21,27 @@ interface RetryRow {
   confidence: number
   submit_attempts: number
   engine_order_id: string | null
+  entry_price: number | null
+  stop_loss: number | null
+  take_profit: number | null
+  generated_at: number
+  strategy_id: string
+  strategy_status: string
 }
+
+export const MAX_RETRY_SIGNAL_AGE_MS = 30 * 60 * 1000
 
 /**
  * Re-attempt decisions parked at retry_pending whose next_retry_at has
- * elapsed. Duplicate-safe: BEFORE resending, fetch GET /orders and skip
+ * elapsed. BEFORE resending, fetch GET /orders and skip
  * any decision whose order already exists at the broker (matchesBrokerOrder,
  * shared with the reconciler) -- that order is the reconcile phase's job, not
  * ours. This guard previously compared client_order_id to the decision id,
  * which the engine never echoes back, so it matched nothing and the sweep
  * could place a second real broker order for a decision already live.
- * After MAX_SUBMIT_RETRIES, park at engine_down (terminal
- * but resumable). On the next tick where the engine is healthy, callers
- * pass engineHealthy=true and any engine_down rows are returned to
- * retry_pending so they resume cleanly.
+ * Expired, unprotected, paused or exhausted intents terminate after this
+ * reconciliation check. Full duplicate safety still requires engine-side
+ * idempotency: the broker snapshot alone cannot exclude late acceptance.
  */
 export async function runRetrySweep(
   db: Database.Database,
@@ -62,9 +69,13 @@ export async function runRetrySweep(
 
   const due = db
     .prepare(
-      `SELECT id, signal_id, asset, action, size_usd, entry_type, confidence, submit_attempts, engine_order_id
-       FROM trader_decisions
-       WHERE status = ? AND (next_retry_at IS NULL OR next_retry_at <= ?)`,
+      `SELECT d.id, d.signal_id, d.asset, d.action, d.size_usd, d.entry_type, d.confidence,
+              d.submit_attempts, d.engine_order_id, d.entry_price, d.stop_loss, d.take_profit,
+              s.generated_at, s.strategy_id, st.status AS strategy_status
+       FROM trader_decisions d
+       LEFT JOIN trader_signals s ON s.id = d.signal_id
+       LEFT JOIN trader_strategies st ON st.id = s.strategy_id
+       WHERE d.status = ? AND (d.next_retry_at IS NULL OR d.next_retry_at <= ?)`,
     )
     .all(DECISION_STATUS.RETRY_PENDING, now) as RetryRow[]
   summary.eligible = due.length
@@ -92,9 +103,19 @@ export async function runRetrySweep(
       db.prepare("UPDATE trader_decisions SET status = ? WHERE id = ?").run(DECISION_STATUS.SUBMITTED, row.id)
       continue
     }
-    if (row.submit_attempts >= MAX_SUBMIT_RETRIES) {
-      db.prepare("UPDATE trader_decisions SET status = ? WHERE id = ?").run(DECISION_STATUS.ENGINE_DOWN, row.id)
-      summary.parkedEngineDown++
+    // Reconcile first: a late broker acknowledgement still owns real exposure.
+    const invalid = row.submit_attempts >= MAX_SUBMIT_RETRIES ? 'retry budget exhausted'
+      : row.strategy_status !== 'active' ? 'strategy is not active'
+      : !Number.isFinite(row.generated_at) || now < row.generated_at || now - row.generated_at > MAX_RETRY_SIGNAL_AGE_MS ? 'signal expired'
+      : row.action !== 'buy' ? 'entry retry does not support this side'
+      : !(row.entry_price != null && Number.isFinite(row.entry_price) && row.entry_price > 0 &&
+          row.stop_loss != null && Number.isFinite(row.stop_loss) && row.stop_loss > 0 && row.stop_loss < row.entry_price &&
+          row.take_profit != null && Number.isFinite(row.take_profit) && row.take_profit > row.entry_price)
+        ? 'entry protection is missing or invalid' : null
+    if (invalid) {
+      db.prepare("UPDATE trader_decisions SET status = ?, next_retry_at = NULL, thesis = thesis || ? WHERE id = ?")
+        .run(DECISION_STATUS.FAILED, ` [Retry stopped: ${invalid}]`, row.id)
+      logger.warn({ decisionId: row.id, reason: invalid }, 'Retry intent terminated')
       continue
     }
     try {
@@ -104,8 +125,10 @@ export async function runRetrySweep(
         side: row.action as 'buy' | 'sell',
         size_usd: row.size_usd,
         entry_type: row.entry_type,
-        entry_price: 0,
-        strategy: '',
+        entry_price: row.entry_price!,
+        stop_loss: row.stop_loss!,
+        take_profit: row.take_profit!,
+        strategy: row.strategy_id,
         confidence: row.confidence,
       })
       db.prepare(
@@ -113,6 +136,12 @@ export async function runRetrySweep(
       ).run(DECISION_STATUS.SUBMITTED, res.broker_order_id ?? null, row.id)
       summary.resubmitted++
     } catch (err) {
+      if (isTerminalSubmitError(err)) {
+        db.prepare("UPDATE trader_decisions SET status = ?, next_retry_at = NULL WHERE id = ?")
+          .run(DECISION_STATUS.FAILED, row.id)
+        logger.warn({ decisionId: row.id }, 'Retry rejected permanently by engine')
+        continue
+      }
       const backoffMs = 5 * 60 * 1000
       db.prepare(
         "UPDATE trader_decisions SET submit_attempts = submit_attempts + 1, next_retry_at = ? WHERE id = ?",

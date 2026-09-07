@@ -35,6 +35,8 @@ import { BOT_API_TOKEN, DASHBOARD_API_TOKEN, DASHBOARD_URL } from '../config.js'
 import { logger } from '../logger.js'
 import type { KillSwitchLogEntry } from './weekly-report.js'
 import { syncTraderTablesToServer } from './server-sync.js'
+import { checkPaperProgress } from './progress-monitor.js'
+import type { HealthResponse } from './types.js'
 
 /**
  * Interval between trader ticks. 5 minutes is the sweet spot:
@@ -314,6 +316,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   let polled = false
   let sent = 0
   let reconcilerHalted = false
+  let entriesBlocked = true // unknown mode/connectivity never authorizes a new entry
+  let observedHealth: HealthResponse | null = null
   let closedOut = 0
   let exited = 0
   let exitErrors = 0
@@ -336,6 +340,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       throw new Error('Engine health probe timed out — process may be wedged')
     }
     const health = await client.getHealth()
+    observedHealth = health
+    entriesBlocked = health?.alpaca_mode !== 'paper'
     // Engine reachable -- reset unreachable counter and send recovery notice if needed.
     if (_healthCheckConsecutiveFailures > 0) {
       logger.info({ was: _healthCheckConsecutiveFailures }, 'Trader engine reachable again')
@@ -440,10 +446,10 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     // unless the last persisted gate evaluation passed. Survives bot
     // restarts because the result lives in kv_settings.
     if (health && health.alpaca_mode === 'live') {
-      const { readLastGateResult } = await import('./go-live-gate.js')
-      const gate = readLastGateResult(deps.db)
-      if (!gate?.passed) {
-        logger.error({ gate }, 'Trader: engine in LIVE mode without a passed go-live gate, halting')
+      const { gateAuthorizesLive } = await import('./go-live-gate.js')
+      entriesBlocked = !gateAuthorizesLive(deps.db)
+      if (entriesBlocked) {
+        logger.error('Trader: engine in LIVE mode without current validated evidence, blocking entries')
         try {
           await client.haltTrading('go-live gate not passed')
         } catch (haltErr) {
@@ -451,7 +457,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         }
         await deps.send(
           'TRADER ALERT: engine switched to LIVE mode but the go-live validation gate has not passed. ' +
-          'Trading halted. Flip the engine back to paper or clear the gate first.',
+          'New entries blocked locally; a halt was requested. Verify engine state and return to paper until validation is complete.',
         ).catch(() => {})
       }
     }
@@ -568,7 +574,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //     minutes) parks a perfectly good decision at engine_down for the whole
   //     overnight, having burned its entire retry budget on a condition that
   //     was never the decision's fault.
-  if (!reconcilerHalted && ((deps.isMarketOpen ?? isEquityMarketHours)() || hasRetryableCryptoDecisions(deps.db))) {
+  if (!entriesBlocked && !reconcilerHalted && ((deps.isMarketOpen ?? isEquityMarketHours)() || hasRetryableCryptoDecisions(deps.db))) {
     try {
       const client = deps.getEngineClient()
       const engineHealthy = _healthCheckConsecutiveFailures === 0
@@ -605,8 +611,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   // decision outright while paging the operator after hours. Signals stay
   // pending and go out on the first in-hours tick. Crypto is unaffected --
   // it has its own 24/7 path and no equity signal survives this gate.
-  if (reconcilerHalted) {
-    logger.info('Trader tick: skipping auto-dispatch because reconciler is halted')
+  if (reconcilerHalted || entriesBlocked) {
+    logger.info('Trader tick: skipping auto-dispatch because reconciliation or live eligibility is blocked')
   } else if (!(deps.isMarketOpen ?? isEquityMarketHours)() && !hasPendingCryptoSignals(deps.db)) {
     logger.info('Trader tick: skipping auto-dispatch, NYSE closed and no crypto signals pending')
   } else {
@@ -752,10 +758,23 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //    self-records its own +1/-1 sign every tick inside the check.
   await runMonitorPhase(deps)
 
+  try {
+    const { refreshAccountingSnapshot } = await import('./go-live-gate.js')
+    await refreshAccountingSnapshot(deps.db, deps.getEngineClient())
+  } catch (err) {
+    // Keep the prior timestamp so consumers can identify stale data.
+    logger.warn({ err }, 'Trader: accounting snapshot unavailable; retaining last known snapshot')
+  }
+
   // 7. Push a snapshot of all trader tables to the dashboard server so
   //    the Signal Queue and other cards always show current data. This runs
   //    after every phase so the server sees the latest state. Fire-and-forget
   //    -- a sync failure never stalls the tick or surfaces to the operator.
+  try {
+    await checkPaperProgress(deps.db, observedHealth, deps.rawSend ?? deps.send)
+  } catch (err) {
+    logger.warn({ err }, 'Trader: progress report failed; delivery will retry next tick')
+  }
   void syncTraderTablesToServer(deps.db)
 
   return { polled, sent, reconcilerHalted, closedOut, exited, exitErrors, weeklyReportFired }

@@ -22,13 +22,14 @@
  *
  * Control: with the switch clear, all phases run normally.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 
 // Tuesday 2026-04-21 10:00 ET = 14:00 UTC — always within NYSE market hours
 const MARKET_HOURS_TS = new Date('2026-04-21T14:00:00Z').getTime()
 
 import { initTraderTables } from './db.js'
+import { GATE_VERSION, gateConfigFingerprint } from './go-live-gate.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import { runTraderTick, _resetHaltAlertForTest } from './trader-scheduler.js'
 import type { EngineClient } from './engine-client.js'
@@ -61,6 +62,8 @@ function makeDb() {
   // Same for the weekly go-live gate run, exercised in its own test file.
   db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
     .run('trader.gate.last_run_ms', String(Date.now()))
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last', JSON.stringify({version: GATE_VERSION, configFingerprint: gateConfigFingerprint(db), passed: false, criteria: [], evaluatedAt: Date.now()}))
   return db
 }
 
@@ -147,6 +150,13 @@ describe('runTraderTick + kill switch', () => {
   let getEngineClient: () => EngineClient
 
   beforeEach(() => {
+    // Pin the clock: the daily readiness digest (progress-monitor) fires on any
+    // tick at or after 17:00 ET, so on a real clock these tests pass in the
+    // morning and fail in the evening. Fake Date only, never the timer queue,
+    // so async code that awaits real timeouts still runs. Tests that need a
+    // different moment call vi.setSystemTime themselves.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-22T15:00:00Z')) // 11:00 ET
     db = makeDb()
     engineClient = {
       pingHealth: vi.fn().mockResolvedValue(true),
@@ -164,6 +174,10 @@ describe('runTraderTick + kill switch', () => {
     // Reset the module-level mock between tests so call counts start fresh.
     vi.mocked(autoDispatchPendingSignals).mockReset()
     vi.mocked(autoDispatchPendingSignals).mockResolvedValue([])
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
   })
 
   // -------------------------------------------------------------------------

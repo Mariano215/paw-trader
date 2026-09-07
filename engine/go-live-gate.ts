@@ -22,11 +22,17 @@ import { matchLotsFifo, type FillRow, type RealizedLot } from './audit-log.js'
 import { evaluateGate, type GateResult } from './validation-gate.js'
 import type { EquityPoint } from './metrics.js'
 import { logger } from '../logger.js'
+import { createHash } from 'node:crypto'
+import type { EngineOrder } from './types.js'
 
 export const GATE_KV_KEY = 'trader.gate.last'
 export const GATE_REGIMES_KV_KEY = 'trader.gate.regimes_seen'
 const GATE_RUN_KV_KEY = 'trader.gate.last_run_ms'
 export const GATE_RUN_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000 // weekly
+export const GATE_VERSION = 2
+export const ACCOUNTING_KV_KEY = 'trader.accounting.last'
+export const REQUIRED_GATE_CRITERIA = ['closed_trades', 'market_regimes', 'out_of_sample_no_retune',
+  'deflated_sharpe', 'positive_expectancy', 'max_drawdown_kill', 'live_vs_backtest_degradation', 'evaluation_cohort'] as const
 
 export interface BrokerTruth {
   realizedLots: RealizedLot[]
@@ -34,6 +40,40 @@ export interface BrokerTruth {
   openUnrealized: number
   roundTrips: number
   perAsset: Array<{ asset: string; roundTrips: number; realized: number }>
+  closedReturns: number[]
+  warnings: string[]
+}
+
+/** Existing trader_fills rows are cumulative order snapshots, not deltas.
+ * Broker IDs bridge legacy rows whose client_order_id was a brain decision ID.
+ * Prefer archived execution time and costs when quantities agree.
+ */
+export function mergeBrokerFills(orders: EngineOrder[], archived: FillRow[]): FillRow[] {
+  const merged = new Map<string, FillRow>()
+  const keyOf = (f: FillRow): string => f.broker_order_id || f.client_order_id || f.id
+  for (const f of archived) {
+    if (!(Number.isFinite(f.fill_qty) && f.fill_qty > 0 && Number.isFinite(f.fill_price) && f.fill_price > 0)) continue
+    const key = keyOf(f)
+    const prev = merged.get(key)
+    if (!prev || f.fill_qty > prev.fill_qty || (f.fill_qty === prev.fill_qty && f.fee_usd > prev.fee_usd)) merged.set(key, f)
+  }
+  for (const o of orders) {
+    // A canceled or expired partially-filled order still owns real fills.
+    if (!(Number.isFinite(o.filled_qty) && o.filled_qty > 0 && o.filled_avg_price != null &&
+        Number.isFinite(o.filled_avg_price) && o.filled_avg_price > 0)) continue
+    const key = o.broker_order_id || o.client_order_id
+    const prev = merged.get(key)
+    if (prev && prev.fill_qty >= o.filled_qty) continue
+    merged.set(key, {
+      id: key, decision_id: prev?.decision_id ?? o.decision_id ?? o.client_order_id,
+      client_order_id: o.client_order_id, broker_order_id: o.broker_order_id,
+      asset: o.asset, side: o.side, fill_qty: o.filled_qty, fill_price: o.filled_avg_price,
+      intended_price: prev?.intended_price ?? null, intended_ts_ms: prev?.intended_ts_ms ?? null,
+      fill_ts_ms: o.updated_at, fee_usd: prev?.fee_usd ?? 0, slippage_usd: prev?.slippage_usd ?? 0,
+      entry_thesis: prev?.entry_thesis ?? null, exit_reason: prev?.exit_reason ?? null, recorded_at: o.updated_at,
+    })
+  }
+  return [...merged.values()].sort((a, b) => a.fill_ts_ms - b.fill_ts_ms || a.id.localeCompare(b.id))
 }
 
 /**
@@ -43,74 +83,40 @@ export interface BrokerTruth {
  */
 export async function computeBrokerTruth(client: EngineClient, db?: Database.Database): Promise<BrokerTruth> {
   const [orders, positions] = await Promise.all([client.getOrders(), client.getPositions()])
-
-  // Dedup by order id: a partially_filled snapshot plus the final filled row
-  // for the same order must not both count. filled_qty only grows.
-  const latestByOrder = new Map<string, (typeof orders)[number]>()
-  for (const o of orders) {
-    const key = o.client_order_id ?? `${o.asset}:${o.side}:${o.updated_at}`
-    const prev = latestByOrder.get(key)
-    if (!prev || (o.filled_qty ?? 0) > (prev.filled_qty ?? 0)) latestByOrder.set(key, o)
-  }
+  let archived: FillRow[] = []
+  if (db) archived = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms, recorded_at').all() as FillRow[]
+  const merged = mergeBrokerFills(orders, archived)
   const byAsset = new Map<string, FillRow[]>()
-  for (const o of latestByOrder.values()) {
-    const status = (o.status ?? '').toLowerCase()
-    if (!(o.filled_qty > 0) || (status !== 'filled' && status !== 'partially_filled')) continue
-    const rows = byAsset.get(o.asset) ?? []
-    // Adapt the engine order into the minimal FillRow surface matchLotsFifo
-    // reads (side, fill_qty, fill_price, fill_ts_ms, fee_usd, decision_id).
-    rows.push({
-      id: o.broker_order_id ?? o.client_order_id,
-      decision_id: o.decision_id ?? o.client_order_id,
-      client_order_id: o.client_order_id,
-      broker_order_id: o.broker_order_id,
-      asset: o.asset,
-      side: o.side,
-      fill_qty: o.filled_qty,
-      fill_price: o.filled_avg_price ?? 0,
-      intended_price: null,
-      intended_ts_ms: null,
-      fill_ts_ms: o.updated_at,
-      fee_usd: 0,
-      slippage_usd: 0,
-      entry_thesis: null,
-      exit_reason: null,
-      recorded_at: o.updated_at,
-    })
-    byAsset.set(o.asset, rows)
-  }
-
-  // The engine's /orders is a rolling window (100 rows, about two weeks), so
-  // on its own it can never show 100 closed trades. trader_fills is the bot's
-  // append-only copy of every engine fill since June; add the fills the
-  // window no longer carries. Found 2026-09-02: the gate read 0 round trips
-  // while 207 fills sat in this table.
-  if (db) {
-    const seen = new Set<string>()
-    for (const rows of byAsset.values()) for (const r of rows) if (r.client_order_id) seen.add(r.client_order_id)
-    let fills: FillRow[] = []
-    try {
-      fills = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms ASC, recorded_at ASC').all() as FillRow[]
-    } catch { /* fresh DB without the table: engine window only */ }
-    for (const f of fills) {
-      if (f.client_order_id && seen.has(f.client_order_id)) continue
-      if (!(f.fill_qty > 0)) continue
-      const rows = byAsset.get(f.asset) ?? []
-      rows.push(f)
-      byAsset.set(f.asset, rows)
-    }
+  for (const f of merged) {
+    const rows = byAsset.get(f.asset) ?? []
+    rows.push(f)
+    byAsset.set(f.asset, rows)
   }
 
   const realizedLots: RealizedLot[] = []
+  const closedReturns: number[] = []
   const perAsset: BrokerTruth['perAsset'] = []
   for (const [asset, fills] of byAsset) {
     fills.sort((a, b) => a.fill_ts_ms - b.fill_ts_ms)
     const lots = matchLotsFifo(fills)
     realizedLots.push(...lots)
+    // Count a completed entry once, regardless of how many exit lots match it.
+    const entries = new Map<string, { qty: number; basis: number; closed: number; pnl: number }>()
+    for (const f of fills.filter(f => f.side === 'buy')) {
+      const e = entries.get(f.decision_id) ?? {qty: 0, basis: 0, closed: 0, pnl: 0}
+      e.qty += f.fill_qty; e.basis += f.fill_qty * f.fill_price
+      entries.set(f.decision_id, e)
+    }
+    for (const l of lots) {
+      const e = entries.get(l.entryDecisionId)
+      if (e) { e.closed += l.qty; e.pnl += l.pnlNet }
+    }
+    const completed = [...entries.values()].filter(e => Math.abs(e.qty - e.closed) <= 1e-8 && e.basis > 0)
+    closedReturns.push(...completed.map(e => e.pnl / e.basis))
     if (lots.length > 0) {
       perAsset.push({
         asset,
-        roundTrips: lots.length,
+        roundTrips: completed.length,
         realized: lots.reduce((s, l) => s + l.pnlNet, 0),
       })
     }
@@ -124,9 +130,42 @@ export async function computeBrokerTruth(client: EngineClient, db?: Database.Dat
     realizedLots,
     realizedTotal: realizedLots.reduce((s, l) => s + l.pnlNet, 0),
     openUnrealized,
-    roundTrips: realizedLots.length,
+    roundTrips: closedReturns.length,
     perAsset: perAsset.sort((a, b) => b.realized - a.realized),
+    closedReturns,
+    warnings: ['Recorded fees only; complete broker fees and estimated paper execution costs are not yet verified.'],
   }
+}
+
+/** One producer for dashboard/report accounting; never fabricate zero on outage. */
+export async function refreshAccountingSnapshot(db: Database.Database, client: EngineClient, nowMs = Date.now()): Promise<void> {
+  const truth = await computeBrokerTruth(client, db)
+  writeKv(db, ACCOUNTING_KV_KEY, JSON.stringify({
+    available: true, evaluated_at: nowMs, realized_total: truth.realizedTotal,
+    open_unrealized: truth.openUnrealized, net: truth.realizedTotal + truth.openUnrealized,
+    round_trips: truth.roundTrips,
+    per_asset: truth.perAsset.map(p => ({asset: p.asset, round_trips: p.roundTrips, realized: p.realized})),
+    warnings: truth.warnings, costs_complete: false,
+  }))
+}
+
+export function gateConfigFingerprint(db: Database.Database): string {
+  const strategies = db.prepare('SELECT id, status, params_json, max_size_usd FROM trader_strategies ORDER BY id').all()
+  let knobs: unknown = null
+  try { knobs = db.prepare("SELECT knobs FROM project_settings WHERE project_id='trader'").get() ?? null } catch { /* fresh standalone DB */ }
+  // Explicit allowlist: never include credentials in evaluation fingerprints.
+  const env = ['TRADER_SIGNAL_SCORE_THRESHOLD', 'TRADER_COMMITTEE_BYPASS', 'TRADER_DAILY_TRADE_CAP',
+    'TRADER_STRATEGY_GATE_ENABLED', 'TRADER_BLIND_SIGNAL_SCORE_THRESHOLD'].map(k => [k, process.env[k] ?? null])
+  return createHash('sha256').update(JSON.stringify({version: GATE_VERSION, strategies, knobs, env})).digest('hex')
+}
+
+export function gateAuthorizesLive(db: Database.Database, nowMs = Date.now()): boolean {
+  const gate = readLastGateResult(db)
+  return gate?.passed === true && gate.version === GATE_VERSION &&
+    gate.configFingerprint === gateConfigFingerprint(db) && Number.isFinite(gate.evaluatedAt) &&
+    nowMs >= gate.evaluatedAt && nowMs - gate.evaluatedAt < GATE_RUN_INTERVAL_MS &&
+    Array.isArray(gate.criteria) && REQUIRED_GATE_CRITERIA.every(name => gate.criteria.some(c => c.name === name && c.passed === true)) &&
+    gate.criteria.every(c => c.passed === true)
 }
 
 function readKv(db: Database.Database, key: string): string | null {
@@ -160,6 +199,8 @@ async function accumulateRegimes(db: Database.Database, client: EngineClient): P
 }
 
 export interface StoredGateResult {
+  version?: number
+  configFingerprint?: string
   /**
    * Snapshot of the backtest that produced backtestSharpe, or null when it was
    * unreachable. Persisted so the weekly report and the pipeline watchdog can
@@ -209,9 +250,7 @@ export async function runGoLiveGate(
   const regimes = await accumulateRegimes(db, client)
 
   // Per-trade fractional net returns on cost basis.
-  const closedReturns = truth.realizedLots
-    .filter((l) => l.entryPrice * l.qty > 0)
-    .map((l) => l.pnlNet / (l.entryPrice * l.qty))
+  const closedReturns = truth.closedReturns
 
   // Paper equity curve from engine NAV snapshots (account truth).
   let equityCurve: EquityPoint[] = []
@@ -221,9 +260,7 @@ export async function runGoLiveGate(
       .map((s) => ({ ts_ms: s.recorded_at, equity: s.nav }))
       .sort((a, b) => a.ts_ms - b.ts_ms)
   } catch {
-    // Missing NAV history leaves the curve empty; maxDrawdown of an empty
-    // curve is 0 which PASSES the kill criterion, so warn loudly instead.
-    logger.warn('Go-live gate: NAV snapshots unavailable, drawdown criterion evaluated on empty curve')
+    logger.warn('Go-live gate: NAV snapshots unavailable; drawdown criterion blocked')
   }
 
   // Every strategy ever tried counts as a trial, not just the ones still
@@ -275,12 +312,20 @@ export async function runGoLiveGate(
     equityCurve,
     regimesObserved: regimes.length,
     variantsTested: Math.max(1, variantsTested),
-    outOfSampleNoRetune: true, // strategies frozen since the 2026-06 eval restart
+    outOfSampleNoRetune: false, // no versioned prospective evaluation cohort exists yet
     backtestSharpe,
     liveReconReturns: closedReturns,
   })
+  // These inputs cannot be inferred from an all-time aggregate. Surface the
+  // missing evidence rather than silently certifying an unfrozen strategy.
+  result.criteria.push({name: 'evaluation_cohort', passed: false,
+    detail: 'Create a versioned prospective evaluation with matched paper/backtest rules, costs and trade-linked regimes. Historical aggregate is diagnostic only.'})
+  result.passed = result.criteria.every(c => c.passed)
+  result.warnings.push(...truth.warnings, 'Trade-return scores use per-trade observations; they are not annualized daily portfolio Sharpe ratios.')
 
   const stored: StoredGateResult = {
+    version: GATE_VERSION,
+    configFingerprint: gateConfigFingerprint(db),
     backtest: backtest && {
       sharpe: backtest.sharpe,
       n_trades: backtest.n_trades,
@@ -305,6 +350,8 @@ export async function runGoLiveGate(
 }
 
 export function gateRunDue(db: Database.Database, nowMs: number): boolean {
+  const gate = readLastGateResult(db)
+  if (gate?.version !== GATE_VERSION || gate.configFingerprint !== gateConfigFingerprint(db)) return true
   const last = Number(readKv(db, GATE_RUN_KV_KEY) ?? 0)
   return nowMs - last >= GATE_RUN_INTERVAL_MS
 }

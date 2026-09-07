@@ -100,6 +100,19 @@ describe('alphaBeta', () => {
 })
 
 describe('deflatedSharpe', () => {
+  it('assigns weak evidence approximately 50%, not 100%, for one trial', () => {
+    const r = Array.from({length: 100}, (_, i) => i % 2 ? -0.01 : 0.01001)
+    expect(deflatedSharpe(sharpe(r), r, 1)).toBeCloseTo(0.501984, 5)
+    expect(deflatedSharpe(sharpe(r), r, 4)).toBe(0)
+  })
+
+  it('scales the multiple-trial benchmark by measured Sharpe variance', () => {
+    const r = Array.from({length: 100}, (_, i) => i % 2 ? -0.01 : 0.02)
+    const sr = sharpe(r)
+    expect(deflatedSharpe(sr, r, 4, 0)).toBeCloseTo(deflatedSharpe(sr, r, 1), 10)
+    expect(deflatedSharpe(sr, r, 4, 0.01)).toBeGreaterThan(deflatedSharpe(sr, r, 4, 1))
+    expect(deflatedSharpe(sr, r, 4, Number.NaN)).toBe(0)
+  })
   it('returns a probability in [0,1] and shrinks as trials grow', () => {
     const r = [0.02, -0.01, 0.03, -0.02, 0.04, -0.01, 0.02, 0.01]
     const sr = sharpe(r)

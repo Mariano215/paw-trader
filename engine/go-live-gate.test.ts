@@ -258,3 +258,21 @@ describe('runGoLiveGate', () => {
     expect(JSON.parse(seen.value)).toEqual(['sideways'])
   })
 })
+
+describe('gateConfigFingerprint', () => {
+  it('ignores scorecard computed_at so a per-tick refresh does not re-run the gate', () => {
+    const db = makeDb()
+    db.exec(`INSERT INTO trader_evaluation_cohorts (id,strategy_id,asset_class,status,config_json,config_fingerprint,universe_json,
+      data_venue,execution_venue,mode,fee_bps_per_side,slippage_bps_per_side,benchmark_asset,max_position_usd,daily_trade_cap,
+      claudepaw_revision,engine_revision,created_at)
+      VALUES ('c1','s1','stocks','running','{}','fp','[]','v','v','paper',0,0,'SPY',100,1,'r','r',1)`)
+    db.exec(`INSERT INTO trader_cohort_scorecards (cohort_id,trade_count,win_count,net_pnl_usd,expectancy,sharpe,deflated_sharpe,
+      max_drawdown_pct,benchmark_return,excess_return,failure_rate,regimes_json,evidence_complete,passed,criteria_json,computed_at)
+      VALUES ('c1',0,0,0,0,0,0,0,0,0,0,'[]',0,0,'[]',1000)`)
+    const before = gateConfigFingerprint(db)
+    db.exec('UPDATE trader_cohort_scorecards SET computed_at=2000')
+    expect(gateConfigFingerprint(db)).toBe(before)
+    db.exec('UPDATE trader_cohort_scorecards SET passed=1')
+    expect(gateConfigFingerprint(db)).not.toBe(before)
+  })
+})

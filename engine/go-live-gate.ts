@@ -168,7 +168,7 @@ export async function refreshAccountingSnapshot(db: Database.Database, client: E
 export function gateConfigFingerprint(db: Database.Database): string {
   const strategies = db.prepare('SELECT id, status, params_json, max_size_usd FROM trader_strategies ORDER BY id').all()
   const cohorts = db.prepare(`SELECT c.id,c.asset_class,c.status,c.config_fingerprint,c.no_retune,
-      s.passed,s.evidence_complete,s.computed_at
+      s.passed,s.evidence_complete
     FROM trader_evaluation_cohorts c
     LEFT JOIN trader_cohort_scorecards s ON s.cohort_id=c.id
     ORDER BY c.id`).all()

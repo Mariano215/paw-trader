@@ -148,4 +148,25 @@ describe('reconcileOpenOrders', () => {
     await reconcileOpenOrders(db, client as unknown as EngineClient)
     expect(listFillsForDecision(db, 'd1')).toHaveLength(1)
   })
+
+  it('keeps an executed partial entry under reconciliation and replaces it with the final cumulative fill', async () => {
+    insertDecision(db, DECISION_STATUS.EXECUTED, 'boid-fill-1')
+    db.prepare("UPDATE trader_decisions SET filled_qty=3, filled_avg_price=100 WHERE id='d1'").run()
+    db.prepare(`INSERT INTO trader_fills
+      (id,decision_id,client_order_id,broker_order_id,asset,side,fill_qty,fill_price,fill_ts_ms,fee_usd,slippage_usd,recorded_at)
+      VALUES ('boid-fill-1:3','d1','d1','boid-fill-1','AAPL','buy',3,100,1000,0,0,1000)`).run()
+    const finalOrder = order({
+      broker_order_id: 'boid-fill-1', decision_id: 'd1', status: 'filled',
+      filled_qty: 6, filled_avg_price: 101, updated_at: 2000,
+    })
+    const client = {getOrders: vi.fn().mockResolvedValue([finalOrder])}
+
+    await reconcileOpenOrders(db, client as unknown as EngineClient)
+
+    expect(db.prepare("SELECT status,filled_qty,filled_avg_price FROM trader_decisions WHERE id='d1'").get())
+      .toEqual({status: 'executed', filled_qty: 6, filled_avg_price: 101})
+    expect(listFillsForDecision(db, 'd1')).toEqual([
+      expect.objectContaining({fill_qty: 6, fill_price: 101}),
+    ])
+  })
 })

@@ -4,6 +4,7 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import type Database from 'better-sqlite3'
 import { logger } from '../logger.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
 import { rollupRecentOutcomes, type AssetClass } from './reasoning-bank.js'
@@ -843,6 +844,7 @@ export function storeTranscript(
   totals: { totalTokens?: number; totalCostUsd?: number } = {},
 ): void {
   try {
+    const createdAt = Date.now()
     db.prepare(`
       INSERT OR REPLACE INTO trader_committee_transcripts
         (id, signal_id, transcript_json, rounds, total_tokens, total_cost_usd, created_at)
@@ -854,8 +856,22 @@ export function storeTranscript(
       result.transcript.rounds_executed,
       totals.totalTokens ?? 0,
       totals.totalCostUsd ?? 0,
-      Date.now(),
+      createdAt,
     )
+    recordTraderOperationalEvent(db, {
+      eventId: `committee:${result.transcript_id}`,
+      sourceTs: result.transcript.finished_at || createdAt,
+      recordedAt: createdAt,
+      source: 'brain.committee',
+      stage: 'committee',
+      eventType: 'committee.decision.committed',
+      state: result.decision === 'approve' ? 'succeeded' : 'suppressed',
+      signalId: result.transcript.signal_id,
+      metadata: {
+        decision: result.decision,
+        confidence: result.confidence,
+      },
+    })
   } catch (err) {
     logger.error({ err, transcriptId: result.transcript_id }, 'Failed to persist committee transcript')
   }

@@ -11,6 +11,7 @@ export interface HealthResponse {
   // builds predate the field; callers null-coalesce when surfacing on the
   // dashboard and the monitor treats missing as healthy.
   coinbase_connected?: boolean;
+  crypto_enabled?: boolean;
 }
 
 export interface EnginePosition {
@@ -26,6 +27,15 @@ export interface EnginePosition {
 export interface AdoptPositionResult {
   adopted: EnginePosition;
   reconcile_cleared: boolean;
+}
+
+export interface CoverPaperShortResult {
+  asset: string;
+  prior_qty: number;
+  client_order_id: string | null;
+  broker_order_id: string | null;
+  status: string;
+  submitted: boolean;
 }
 
 export interface EngineOrder {
@@ -71,7 +81,7 @@ export interface DecisionRequest {
   asset: string;
   side: "buy" | "sell";
   size_usd: number;
-  entry_type: string;
+  entry_type: "limit" | "market";
   entry_price: number;
   stop_loss?: number;
   take_profit?: number;
@@ -212,6 +222,7 @@ export interface BacktestResult {
   expectancy: number | null;
   total_return: number;
   slippage_bps: number;
+  fee_bps?: number;
   min_score: number;
   sharpe_convention: string;
   assets: string[];

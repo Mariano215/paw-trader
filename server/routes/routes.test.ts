@@ -21,6 +21,7 @@ import {
   initUserStore,
   createUser,
   createUserToken,
+  grantProjectMembership,
 } from './users.js'
 import { authenticate, scopeProjects } from './auth.js'
 
@@ -292,6 +293,7 @@ function httpReq(
 let srv: ReturnType<typeof createServer>
 let adminToken: string
 let memberToken: string
+let outsiderToken: string
 
 const DECISION_WITH_TRANSCRIPT = 'dec-with-transcript'
 const DECISION_NO_TRANSCRIPT = 'dec-no-transcript'
@@ -333,6 +335,10 @@ beforeAll(async () => {
 
   const member = createUser({ email: 'member@trader.test', name: 'Member', global_role: 'member' })
   memberToken = createUserToken({ user_id: member.id }).token
+  grantProjectMembership({ project_id: 'trader', user_id: member.id, role: 'viewer' })
+
+  const outsider = createUser({ email: 'outsider@trader.test', name: 'Outsider', global_role: 'member' })
+  outsiderToken = createUserToken({ user_id: outsider.id }).token
 
   // Seed one transcript and two decisions (one linked, one unlinked)
   testDb.prepare(`
@@ -501,6 +507,30 @@ describe('GET /api/v1/trader/decisions', () => {
   it('rejects unauthenticated callers with 401', async () => {
     const res = await httpReq(srv, 'GET', '/api/v1/trader/decisions')
     expect(res.status).toBe(401)
+  })
+
+  it('status=open treats only the real DECISION_STATUS terminal states as closed', async () => {
+    // 'filled' is not a value order-lifecycle.ts's DECISION_STATUS ever writes;
+    // it must not be treated as terminal, or a stuck decision would silently
+    // disappear from the open list.
+    testDb.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+         committee_transcript_id, decided_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'dec-open-filled', 'sig-3', 'buy', 'TSLA', 100, 'market',
+      'unknown legacy status', 0.5, null, 1_700_000_030_000, 'filled',
+    )
+    try {
+      const res = await httpReq(srv, 'GET', '/api/v1/trader/decisions?status=open', { headers: tok(adminToken) })
+      expect(res.status).toBe(200)
+      const body = res.body as { decisions: Array<{ id: string }> }
+      expect(body.decisions.map(d => d.id)).toContain('dec-open-filled')
+      expect(body.decisions.map(d => d.id)).not.toContain(DECISION_WITH_TRANSCRIPT) // status 'executed', terminal
+    } finally {
+      testDb.prepare(`DELETE FROM trader_decisions WHERE id = 'dec-open-filled'`).run()
+    }
   })
 })
 
@@ -2070,5 +2100,21 @@ describe('GET /api/v1/trader/bypass-progress', () => {
     expect(body.flipped).toBe(body.count >= 20)
     // daily should include bp-test-1 and bp-test-3 (non-abstain, today)
     expect(body.daily).toBeGreaterThanOrEqual(2)
+  })
+})
+
+// ===========================================================================
+// Phase 0 Task 4 -- trader routes require trader project membership
+// ===========================================================================
+
+describe('trader routes: non-trader member', () => {
+  it('GET /api/v1/trader/positions returns 404 for a member without trader membership', async () => {
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/positions', { headers: tok(outsiderToken) })
+    expect(res.status).toBe(404)
+  })
+
+  it('GET /api/v1/trader/signals returns 404 for a member without trader membership', async () => {
+    const res = await httpReq(srv, 'GET', '/api/v1/trader/signals', { headers: tok(outsiderToken) })
+    expect(res.status).toBe(404)
   })
 })

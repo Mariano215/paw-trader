@@ -51,6 +51,50 @@ describe("EngineClient", () => {
     expect(positions[0].asset).toBe("AAPL");
   });
 
+  it("coverPaperShort POSTs an encoded asset to the guarded cleanup endpoint", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({
+      asset: "IWM", prior_qty: -3, client_order_id: "repair-cover-1",
+      broker_order_id: "broker-cover-1", status: "pending_new", submitted: true,
+    }));
+
+    const result = await client.coverPaperShort("IWM");
+
+    expect(result.submitted).toBe(true);
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toContain("/positions/IWM/cover-paper-short");
+    expect((options as RequestInit).method).toBe("POST");
+  });
+
+  it("getAllOrders reads deterministic pages until the final short page", async () => {
+    const makeOrders = (start: number, count: number) => Array.from({length: count}, (_, i) => ({
+      client_order_id: `c-${start + i}`, broker_order_id: `b-${start + i}`, decision_id: `d-${start + i}`,
+      asset: 'AAPL', side: 'buy', qty: 1, order_type: 'limit', limit_price: 100,
+      status: 'filled', filled_qty: 1, filled_avg_price: 100, source: 'alpaca',
+      created_at: 1000 - start - i, updated_at: 1000 - start - i,
+    }))
+    mockFetch
+      .mockReturnValueOnce(mockResp(makeOrders(0, 500)))
+      .mockReturnValueOnce(mockResp(makeOrders(500, 2)))
+
+    const orders = await client.getAllOrders()
+
+    expect(orders).toHaveLength(502)
+    expect(mockFetch.mock.calls[0][0]).toContain('/orders?limit=500&offset=0')
+    expect(mockFetch.mock.calls[1][0]).toContain('/orders?limit=500&offset=500')
+  });
+
+  it("getAllOrders stops safely when an older engine ignores pagination", async () => {
+    const legacyPage = [{
+      client_order_id: 'c-1', broker_order_id: 'b-1', decision_id: 'd-1', asset: 'AAPL', side: 'buy',
+      qty: 1, order_type: 'limit', limit_price: 100, status: 'filled', filled_qty: 1,
+      filled_avg_price: 100, source: 'alpaca', created_at: 1, updated_at: 1,
+    }]
+    mockFetch.mockReturnValueOnce(mockResp(legacyPage))
+
+    await expect(client.getAllOrders()).resolves.toHaveLength(1)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+  });
+
   it("sends X-Engine-Token header on every request", async () => {
     mockFetch.mockReturnValueOnce(
       mockResp({ status: "ok", version: "0.1.0", alpaca_connected: true, alpaca_mode: "paper" })
@@ -78,6 +122,41 @@ describe("EngineClient", () => {
     const result = await client.getSignals(30);
     expect(result).toHaveLength(1);
     expect(result[0].asset).toBe("AAPL");
+  });
+
+  it("requests the frozen hourly BTC backtest with engine auth", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({
+      strategy: 'mean-reversion-hourly-crypto', n_trades: 12, sharpe: 1.1,
+      max_drawdown: 0.08, warnings: [],
+    }));
+    const result = await client.getCryptoHourlyMeanReversionBacktest(8760);
+    expect(result.strategy).toBe('mean-reversion-hourly-crypto');
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toContain('/backtest/crypto-hourly-mean-reversion?hours=8760');
+    expect((options as RequestInit).headers).toMatchObject({ 'X-Engine-Token': 'tok' });
+    await expect(client.getCryptoHourlyMeanReversionBacktest(499)).rejects.toThrow(/500 to 43800/);
+  });
+
+  it("requests the deployed BTC momentum backtest", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({
+      strategy: 'momentum-crypto', n_trades: 20, sharpe: 0.8,
+      max_drawdown: 0.12, warnings: [],
+    }));
+    const result = await client.getCryptoMomentumBacktest(1825);
+    expect(result.strategy).toBe('momentum-crypto');
+    expect(mockFetch.mock.calls[0][0]).toContain('/backtest/crypto-momentum?days=1825');
+    await expect(client.getCryptoMomentumBacktest(299)).rejects.toThrow(/300 to 5000/);
+  });
+
+  it("requests the frozen BTC four-hour trend backtest", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({
+      strategy: 'trend-4h-crypto', n_trades: 120, sharpe: 1.0,
+      max_drawdown: 0.18, warnings: [],
+    }));
+    const result = await client.getCryptoFourHourTrendBacktest(10_950);
+    expect(result.strategy).toBe('trend-4h-crypto');
+    expect(mockFetch.mock.calls[0][0]).toContain('/backtest/crypto-4h-trend?periods=10950');
+    await expect(client.getCryptoFourHourTrendBacktest(999)).rejects.toThrow(/1000 to 12000/);
   });
 
   it("submitDecision returns client_order_id", async () => {

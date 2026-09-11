@@ -16,48 +16,6 @@
 // --- page init dispatcher ---
 if (pageId === 'page-trader') initTraderPage();
 
-// --- page id map entry ---
-'trader': 'page-trader',
-
-// --- hash router: strategy drill-down ---
-// Phase 4 Task D -- trader strategy drill-down: #trader/strategy/:id
-    if (hash.startsWith('trader/strategy/')) {
-      const strategyId = decodeURIComponent(hash.slice('trader/strategy/'.length));
-      if (strategyId) {
-        navigateToPage('page-trader', false);
-        initStrategyDetail(strategyId);
-        return;
-      }
-    }
-
-// --- hash router: kill-switch audit log ---
-// Phase 6 Task 5 -- kill-switch audit log: #trader/kill-switch-log
-    if (hash === 'trader/kill-switch-log') {
-      navigateToPage('page-trader', false);
-      renderKillSwitchLogPage();
-      return;
-    }
-
-// --- hash router: plain #trader back-nav ---
-// Navigating back to plain #trader should dismiss any open drill-down.
-    if (hash === 'trader' && typeof closeStrategyDetail === 'function') {
-      closeStrategyDetail();
-      closeKillSwitchLogPage();
-    }
-
-// --- initial-hash: strategy drill-down ---
-} else if (initialHash.startsWith('trader/strategy/')) {
-    // Phase 4 Task D -- trader strategy drill-down initial load
-    const strategyId = decodeURIComponent(initialHash.slice('trader/strategy/'.length));
-    navigateToPage('page-trader', false);
-    if (strategyId) initStrategyDetail(strategyId);
-
-// --- initial-hash: kill-switch log ---
-} else if (initialHash === 'trader/kill-switch-log') {
-    // Phase 6 Task 5 -- kill-switch audit log initial load
-    navigateToPage('page-trader', false);
-    renderKillSwitchLogPage();
-
 
 // -------------------------------------------------------
 // Main trader page body (contiguous block from app.js)
@@ -92,8 +50,31 @@ var TRADER_STATE = {
   committeeHealth: null, // abstain rate + per-asset breakdown
   signalFunnel: null,    // generation → committee → executed conversion
   reconcilerStatus: null,
+  riskAvailable: false,
+  engineStatus: null,
+  brokerPnl: null,
+  gateProgress: null,
+  strategies: [],
+  cohorts: [],
+  cohortsAvailable: false,
+  bitcoinOrderFlowCollection: null,
+  orders: [],
+  ordersUpdatedAt: null,
+  ordersAvailable: false,
+  missionUpdatedAt: null,
   verdictCursor: { beforeClosedAt: null, beforeId: null, exhausted: false, loaded: false },
+  operationalEvents: [],
+  operationalCursor: 0,
+  operationalAvailable: false,
+  operationalSeen: {},
+  operationalAnimated: {},
+  operationalPulseIds: {},
+  operationalRenderedPulseIds: {},
+  operationalStagePulses: {},
 };
+
+var _armedCancelOrderId = null;
+var _armedCancelTimer = null;
 
 function makeInfoBtn(title, body, example, align) {
   var alignClass = align === 'left' ? 'trader-tooltip--left' : align === 'right' ? 'trader-tooltip--right' : '';
@@ -125,112 +106,37 @@ function ensureTraderPageDOM() {
   }
   if (document.getElementById('trader-kpi-strip')) return; // already built
 
-  page.innerHTML = '';
+  page.innerHTML =
+    '<div class="trader-command">' +
+      '<div class="trader-command__identity"><span class="trader-command__eyebrow">AUTONOMOUS EXECUTION OBSERVATORY</span><h2>PAWTRADER <em>//</em> MISSION CONTROL</h2><p id="trader-command-note">Near-live operational snapshots every 5 seconds. Profit requires evidence.</p></div>' +
+      '<div class="trader-command__status" aria-label="Trading system status">' +
+        '<span id="trader-command-mode" class="trader-command-pill">MODE UNKNOWN</span>' +
+        '<span id="trader-command-engine" class="trader-command-pill">ENGINE UNKNOWN</span>' +
+        '<span id="trader-command-alpaca" class="trader-command-pill">ALPACA UNKNOWN</span>' +
+        '<span id="trader-command-coinbase" class="trader-command-pill">COINBASE UNKNOWN</span>' +
+        '<span id="trader-freshness" class="trader-command-clock">WAITING FOR SNAPSHOT</span>' +
+      '</div>' +
+      '<button id="trader-command-halt" class="trader-btn-danger trader-command__halt">HALT ENGINE</button>' +
+    '</div>' +
+    '<section class="trader-flow-shell" aria-labelledby="trader-flow-title"><div class="trader-section-kicker"><span id="trader-flow-title">AUTONOMY PIPELINE</span><span id="trader-flow-caption">State, not decoration</span></div><div id="trader-flow" class="trader-flow"></div></section>' +
+    '<div id="trader-kpi-strip" class="trader-kpi-strip trader-kpi-strip--mission"></div>' +
+    '<div class="trader-mission-grid">' +
+      '<section class="trader-mission-panel trader-mission-panel--performance"><div class="trader-section-head"><div><span class="trader-section-kicker">PERFORMANCE</span><h3>Capital curve</h3></div><span id="trader-performance-delta" class="trader-panel-metric">—</span></div><div id="trader-performance-chart" class="trader-performance-chart"></div></section>' +
+      '<section class="trader-mission-panel trader-mission-panel--orders"><div class="trader-section-head"><div><span class="trader-section-kicker">EXECUTION CONTROL</span><h3>Order blotter</h3></div><span id="trader-orders-count" class="trader-panel-metric">—</span></div><div id="trader-orders-book"></div></section>' +
+      '<section class="trader-mission-panel trader-mission-panel--exposure"><div class="trader-section-head"><div><span class="trader-section-kicker">CAPITAL AT RISK</span><h3>Exposure book</h3></div><span id="trader-exposure-total" class="trader-panel-metric">—</span></div><div id="trader-exposure-book"></div></section>' +
+      '<section class="trader-mission-panel trader-mission-panel--evidence"><div class="trader-section-head"><div><span class="trader-section-kicker">PROOF OF EDGE</span><h3>Readiness lanes</h3></div><span id="trader-evidence-score" class="trader-panel-metric">—</span></div><div id="trader-evidence-lanes"></div></section>' +
+    '<section class="trader-mission-panel trader-mission-panel--activity"><div class="trader-section-head"><div><span class="trader-section-kicker">SYSTEM TAPE</span><h3>Recent observed events</h3></div><span class="trader-panel-metric">LATEST FIRST</span></div><div id="trader-activity-rail" role="log" aria-live="off"></div></section>' +
+    '</div>' +
+    '<details class="trader-intelligence"><summary>Decision intelligence, trade history, and safety detail</summary>' +
+      '<div id="trader-grid" class="trader-grid">' +
+        '<div id="trader-col-1" class="trader-col"></div><div id="trader-col-2" class="trader-col"></div><div id="trader-col-3" class="trader-col"></div>' +
+        '<div id="trader-row-2" class="trader-row-2"><div id="trader-bottom-grid" class="trader-bottom-grid"><div id="trader-bottom-col-1" class="trader-bottom-col"></div><div id="trader-bottom-col-2" class="trader-bottom-col"></div><div id="trader-bottom-col-3" class="trader-bottom-col"></div></div></div>' +
+      '</div>' +
+    '</details>' +
+    '<div id="trader-footer" class="trader-mission-footer"><button id="trader-guide-open" class="trader-guide-btn">OPEN TRADING GUIDE</button><div id="trader-bypass-card" class="stat-card"></div><div id="trader-gate-card" class="stat-card"></div></div>';
 
-  // Ticker tape — scrolling portfolio snapshot. Delayed data from the engine,
-  // NOT a live market feed (no quote API, no per-request cost).
-  var ticker = document.createElement('div');
-  ticker.id = 'trader-ticker';
-  ticker.className = 'trader-ticker';
-  ticker.setAttribute('aria-label', 'Portfolio ticker — delayed data, not a live market feed');
-  page.appendChild(ticker);
-
-  // KPI strip
-  var strip = document.createElement('div');
-  strip.id = 'trader-kpi-strip';
-  strip.className = 'trader-kpi-strip';
-  page.appendChild(strip);
-
-  // 3-column grid
-  var grid = document.createElement('div');
-  grid.id = 'trader-grid';
-  grid.className = 'trader-grid';
-  page.appendChild(grid);
-
-  // Col 1 — Positions + Trade History
-  var col1 = document.createElement('div');
-  col1.id = 'trader-col-1';
-  col1.className = 'trader-col';
-  grid.appendChild(col1);
-
-  // Col 2 — Signals + NAV + Win Rates
-  var col2 = document.createElement('div');
-  col2.id = 'trader-col-2';
-  col2.className = 'trader-col';
-  grid.appendChild(col2);
-
-  // Col 3 — Safety + Committee
-  var col3 = document.createElement('div');
-  col3.id = 'trader-col-3';
-  col3.className = 'trader-col';
-  grid.appendChild(col3);
-
-  // Row 2 — full-width bottom band
-  var row2 = document.createElement('div');
-  row2.id = 'trader-row-2';
-  row2.className = 'trader-row-2';
-  grid.appendChild(row2);
-
-  var bottomGrid = document.createElement('div');
-  bottomGrid.id = 'trader-bottom-grid';
-  bottomGrid.className = 'trader-bottom-grid';
-  row2.appendChild(bottomGrid);
-
-  var bc1 = document.createElement('div');
-  bc1.id = 'trader-bottom-col-1';
-  bc1.className = 'trader-bottom-col';
-  bottomGrid.appendChild(bc1);
-
-  var bc2 = document.createElement('div');
-  bc2.id = 'trader-bottom-col-2';
-  bc2.className = 'trader-bottom-col';
-  bottomGrid.appendChild(bc2);
-
-  var bc3 = document.createElement('div');
-  bc3.id = 'trader-bottom-col-3';
-  bc3.className = 'trader-bottom-col';
-  bottomGrid.appendChild(bc3);
-
-  // Guide strip + bypass card container
-  var footer = document.createElement('div');
-  footer.id = 'trader-footer';
-  page.appendChild(footer);
-
-  var guideStrip = document.createElement('div');
-  guideStrip.className = 'trader-guide-strip';
-  var guideStripLabel = document.createElement('span');
-  guideStripLabel.textContent = 'New to trading? ';
-  var guideStripBtn = document.createElement('button');
-  guideStripBtn.className = 'trader-guide-btn';
-  guideStripBtn.textContent = 'Open Guide →';
-  guideStripBtn.onclick = openTraderGuide;
-  guideStripLabel.appendChild(guideStripBtn);
-  guideStrip.appendChild(guideStripLabel);
-  footer.appendChild(guideStrip);
-
-  // Bypass progress card placeholder (rendered by refreshTraderBypassProgress)
-  var bypassCard = document.createElement('div');
-  bypassCard.id = 'trader-bypass-card';
-  bypassCard.className = 'stat-card';
-  footer.appendChild(bypassCard);
-
-  // Go-live gate card placeholder (rendered by refreshTraderGateProgress)
-  var gateCard = document.createElement('div');
-  gateCard.id = 'trader-gate-card';
-  gateCard.className = 'stat-card';
-  page.insertBefore(gateCard, grid);
-  gateCard.style.marginBottom = '16px';
-
-  // Halt button
-  var haltWrap = document.createElement('div');
-  haltWrap.id = 'trader-halt-wrap';
-  haltWrap.style.cssText = 'margin-top:16px;';
-  var haltBtn = document.createElement('button');
-  haltBtn.className = 'trader-btn-danger';
-  haltBtn.textContent = '⚡ Halt Engine';
-  haltBtn.onclick = engineKillSwitch;
-  haltWrap.appendChild(haltBtn);
-  footer.appendChild(haltWrap);
+  document.getElementById('trader-command-halt').onclick = engineKillSwitch;
+  document.getElementById('trader-guide-open').onclick = openTraderGuide;
 }
 
 var _traderRefreshPending = new Set();
@@ -250,7 +156,9 @@ function initTraderPage() {
   var refreshers = [refreshTraderKPI_nav, refreshTraderKPI_engine, refreshTraderKPI_brokerPnl,
     refreshTraderCol1, refreshTraderCol2, refreshTraderCol3, refreshTraderBypassProgress, refreshTraderGateProgress];
   refreshers.forEach(function (fn) { runTraderRefresh(fn); });
-  _renderTraderTicker();
+  runTraderRefresh(refreshTraderMissionControl);
+  refreshTraderOperationalEvents(false);
+  renderTraderMissionControl();
   _renderBottomRow();
 
   // Polling (match existing intervals from spec)
@@ -260,6 +168,7 @@ function initTraderPage() {
     refreshers.forEach(function (fn, i) {
       addPollingInterval(function () { return runTraderRefresh(fn); }, periods[i]);
     });
+    addPollingInterval(function () { return runTraderRefresh(refreshTraderMissionControl); }, 5000);
   }
 }
 
@@ -330,33 +239,39 @@ async function refreshTraderKPI_nav() {
     TRADER_STATE.trackRecords = (tr && tr.track_records) ? tr.track_records : ((tr && tr.records) ? tr.records : []);
     _renderWinRates(TRADER_STATE.trackRecords);
   } catch (_) { /* non-fatal */ }
-  _renderTraderTicker();
+  renderTraderMissionControl();
 }
 
 async function refreshTraderKPI_brokerPnl() {
   try {
     var data = await fetchFromAPI('/api/v1/trader/broker-pnl');
     if (!data || !data.available) throw new Error('Accounting unavailable');
-    var v = Number(data.realized_total) || 0;
+    TRADER_STATE.brokerPnl = data;
+    var v = Number(data.net) || 0;
     var colorAttr = v >= 0 ? 'style="color:var(--green,#3ddc84)"' : 'style="color:#ff5c5c"';
     var fmtd = (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
-    _renderKpiCell('kpi-realized', 'REALIZED P&L',
+    _renderKpiCell('kpi-realized', 'CORRECTED NET P&L',
       '<span ' + colorAttr + '>' + fmtd + '</span>',
-      (data.stale ? 'STALE · ' : '') + (data.round_trips || 0) + ' completed entries · ' + new Date(data.evaluated_at).toLocaleString(),
-      'Realized P&L — recorded fees only',
-      'FIFO profit from archived and recent fills. Complete fees and paper execution costs are not yet verified. Paper profit does not establish live profitability.', null);
+      (data.stale ? 'STALE · ' : '') + 'realized ' + _traderMoney(data.realized_total, true) + ' · open ' + _traderMoney(data.open_unrealized, true),
+      'Corrected net P&L',
+      'Durable FIFO realized P&L plus current open P&L. Complete fees and paper execution costs are not yet verified. Paper profit does not establish live profitability.', null);
   } catch (_) {
-    _renderKpiCell('kpi-realized', 'REALIZED P&L', '--', 'Accounting unavailable', null, null, null);
+    TRADER_STATE.brokerPnl = null;
+    _renderKpiCell('kpi-realized', 'CORRECTED NET P&L', '--', 'Accounting unavailable', null, null, null);
   }
+  renderTraderMissionControl();
 }
 
 async function refreshTraderKPI_engine() {
   try {
     var st = await fetchFromAPI('/api/v1/trader/status');
+    TRADER_STATE.engineStatus = st;
     _renderKpiEngineCell(st);
   } catch (e) {
+    TRADER_STATE.engineStatus = null;
     _renderKpiEngineCell(null);
   }
+  renderTraderMissionControl();
 }
 
 function _renderKpiNavCells(data) {
@@ -436,6 +351,621 @@ function _renderTraderHaltBanner(st) {
   }
   banner.textContent = 'ENGINE HALTED: ' + (st.halt_reason || 'no reason given') +
     ' — no orders will fill until cleared.';
+}
+
+// ---------------------------------------------------------------------------
+// TRADER — Mission Control operational surface
+// ---------------------------------------------------------------------------
+
+var TRADER_OPEN_ORDER_STATUSES = {
+  pending: true, placed: true, unknown: true, new: true, pending_new: true,
+  accepted: true, partially_filled: true, pending_cancel: true, pending_replace: true
+};
+
+function _traderIsCrypto(asset) {
+  var value = String(asset || '').toUpperCase();
+  return value.indexOf('/') !== -1 || /^(BTC|ETH|SOL|AVAX|DOGE)(USD|USDC)?$/.test(value);
+}
+
+function _traderMoney(value, signed) {
+  var n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  var prefix = signed && n > 0 ? '+' : (n < 0 ? '-' : '');
+  return prefix + '$' + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+
+function _traderTime(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 'time unknown';
+  if (n < 100000000000) n *= 1000;
+  var delta = Math.max(0, Date.now() - n);
+  if (delta < 60000) return Math.floor(delta / 1000) + 's ago';
+  if (delta < 3600000) return Math.floor(delta / 60000) + 'm ago';
+  if (delta < 86400000) return Math.floor(delta / 3600000) + 'h ago';
+  return new Date(n).toLocaleDateString();
+}
+
+function _traderTimestampMs(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n < 100000000000 ? n * 1000 : n;
+}
+
+function _traderAgeMs(value) {
+  var n = _traderTimestampMs(value);
+  return n == null ? Infinity : Math.max(0, Date.now() - n);
+}
+
+async function refreshTraderMissionControl() {
+  var results = await Promise.all([
+    fetchFromAPI('/api/v1/trader/orders?status=open&limit=500&offset=0'),
+    fetchFromAPI('/api/v1/trader/orders?status=closed&limit=20&offset=0'),
+    fetchFromAPI('/api/v1/trader/strategy-status')
+  ]);
+  var openOrderData = results[0];
+  var closedOrderData = results[1];
+  if (Array.isArray(openOrderData)) {
+    TRADER_STATE.orders = openOrderData.concat(Array.isArray(closedOrderData) ? closedOrderData : []);
+    TRADER_STATE.ordersAvailable = true;
+    TRADER_STATE.ordersUpdatedAt = Date.now();
+  } else {
+    TRADER_STATE.ordersAvailable = false;
+  }
+  var strategyData = results[2];
+  TRADER_STATE.strategies = strategyData && Array.isArray(strategyData.strategies)
+    ? strategyData.strategies : [];
+  TRADER_STATE.cohorts = strategyData && Array.isArray(strategyData.cohorts)
+    ? strategyData.cohorts : [];
+  TRADER_STATE.cohortsAvailable = !!(strategyData && strategyData.cohorts_available);
+  TRADER_STATE.bitcoinOrderFlowCollection = strategyData && strategyData.bitcoin_order_flow_collection
+    ? strategyData.bitcoin_order_flow_collection : null;
+  TRADER_STATE.missionUpdatedAt = Date.now();
+  renderTraderMissionControl();
+}
+
+function _setTraderCommandPill(id, text, state) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'trader-command-pill trader-command-pill--' + state;
+}
+
+function renderTraderMissionControl() {
+  var root = document.getElementById('trader-orders-book');
+  if (!root) return;
+  var st = TRADER_STATE.engineStatus;
+  var connected = !!(st && st.engine_connected);
+  var halted = !!(st && st.reconciler_halted);
+  var mode = st && st.alpaca_mode ? String(st.alpaca_mode).toUpperCase() : 'UNKNOWN';
+  _setTraderCommandPill('trader-command-mode', mode + ' MODE', mode === 'LIVE' ? 'danger' : (mode === 'PAPER' ? 'paper' : 'unknown'));
+  _setTraderCommandPill('trader-command-engine', halted ? 'ENGINE HALTED' : (connected ? 'ENGINE ONLINE' : 'ENGINE OFFLINE'), halted ? 'danger' : (connected ? 'ok' : 'danger'));
+  _setTraderCommandPill('trader-command-alpaca', st && st.alpaca_connected ? 'ALPACA CONNECTED' : 'ALPACA OFFLINE', st && st.alpaca_connected ? 'ok' : 'danger');
+  var cbKnown = st && st.coinbase_connected != null;
+  var cryptoDisabled = st && st.crypto_enabled === false;
+  _setTraderCommandPill('trader-command-coinbase', cryptoDisabled ? 'CRYPTO DISABLED' : (cbKnown ? (st.coinbase_connected ? 'COINBASE CONNECTED' : 'COINBASE OFFLINE') : 'COINBASE UNKNOWN'), cryptoDisabled ? 'danger' : (cbKnown && st.coinbase_connected ? 'ok' : (cbKnown ? 'danger' : 'unknown')));
+
+  var freshness = document.getElementById('trader-freshness');
+  if (freshness) freshness.textContent = TRADER_STATE.missionUpdatedAt
+    ? 'SNAPSHOT ' + new Date(TRADER_STATE.missionUpdatedAt).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})
+    : 'WAITING FOR SNAPSHOT';
+  var note = document.getElementById('trader-command-note');
+  if (note) note.textContent = halted
+    ? 'Orders are blocked. ' + (st.halt_reason || 'The engine is halted.')
+    : 'Near-live operational snapshots every 5 seconds. Profit requires evidence.';
+
+  _renderTraderFlow();
+  _renderMissionPerformance();
+  _renderMissionOrders();
+  _renderMissionExposure();
+  _renderMissionEvidence();
+  _renderMissionActivity();
+}
+
+function _renderTraderFlow() {
+  var flow = document.getElementById('trader-flow');
+  if (!flow) return;
+  flow.innerHTML = '';
+  var st = TRADER_STATE.engineStatus || {};
+  var strategies = TRADER_STATE.strategies || [];
+  var activeStrategies = strategies.filter(function(s) { return s.status === 'active'; });
+  var riskKnown = TRADER_STATE.riskAvailable;
+  var riskTripped = !!(st.reconciler_halted || (riskKnown && TRADER_STATE.risk && (
+    (TRADER_STATE.risk.tripped && TRADER_STATE.risk.tripped.length) ||
+    (TRADER_STATE.risk.rules || []).some(function(r) { return r.tripped || r.status === 'tripped'; })
+  )));
+  var rec = st.last_reconcile || TRADER_STATE.reconcilerStatus;
+  var reconcileAge = rec ? _traderAgeMs(rec.ran_at) : Infinity;
+  var reconcileFresh = reconcileAge < 10 * 60 * 1000;
+  var reconcileJustRan = reconcileAge < 30 * 1000;
+  var recentDecision = (TRADER_STATE.decisions || []).some(function(d) {
+    return _traderAgeMs(d.decided_at || d.created_at) < 5 * 60 * 1000;
+  });
+  var hasOpenOrder = (TRADER_STATE.ordersAvailable ? TRADER_STATE.orders : []).some(function(o) {
+    return TRADER_OPEN_ORDER_STATUSES[String(o.status || '').toLowerCase()];
+  });
+  function pulseFor(stage) {
+    var pulse = TRADER_STATE.operationalStagePulses && TRADER_STATE.operationalStagePulses[stage];
+    if (!pulse || pulse.consumed) return false;
+    pulse.consumed = true;
+    return true;
+  }
+  var marketPulse = pulseFor('scheduler');
+  var strategyPulse = pulseFor('strategy');
+  var committeePulse = pulseFor('committee');
+  var riskPulse = pulseFor('risk') || pulseFor('watchdog');
+  var brokerPulse = pulseFor('broker') || pulseFor('exit') || pulseFor('verdict');
+  var reconcilePulse = pulseFor('reconcile');
+  var stages = [
+    {name: 'Market data', detail: st.engine_connected ? 'polled ' + _traderTime(TRADER_STATE.missionUpdatedAt) : 'unavailable', state: st.engine_connected ? 'ok' : 'bad', moving: marketPulse},
+    {name: 'Strategies', detail: activeStrategies.length ? activeStrategies.length + ' enabled' : 'all paused', state: strategyPulse ? 'active' : (activeStrategies.length ? 'ok' : 'idle'), moving: strategyPulse},
+    {name: 'Committee', detail: recentDecision ? 'recent decision' : ((TRADER_STATE.decisions || []).length ? 'pending · last >5m' : 'standing by'), state: committeePulse ? 'active' : 'idle', moving: committeePulse},
+    {name: 'Risk', detail: riskTripped ? 'blocked' : (!riskKnown ? 'state unknown' : 'clear'), state: riskTripped ? 'bad' : (!riskKnown ? 'unknown' : (riskPulse ? 'active' : 'ok')), moving: riskPulse},
+    {name: 'Broker', detail: !st.alpaca_connected ? 'offline' : (hasOpenOrder ? 'order in flight' : (st.trade_updates_alive === true ? 'fill stream live · idle' : (st.trade_updates_alive === false ? 'REST fill sync · idle' : 'fill stream unknown'))), state: !st.alpaca_connected ? 'bad' : (brokerPulse ? 'active' : 'ok'), moving: brokerPulse},
+    {name: 'Reconcile', detail: !rec ? 'no snapshot' : (!reconcileFresh ? 'stale · ' + _traderTime(rec.ran_at) : (rec.drift_detected ? 'drift found · ' : 'clean · ') + _traderTime(rec.ran_at)), state: !rec || !reconcileFresh ? 'unknown' : (rec.drift_detected ? 'bad' : (reconcilePulse ? 'active' : 'ok')), moving: reconcilePulse}
+  ];
+  stages.forEach(function(stage, index) {
+    var item = document.createElement('div');
+    item.className = 'trader-flow-stage trader-flow-stage--' + stage.state;
+    var node = document.createElement('span');
+    node.className = 'trader-flow-node';
+    node.setAttribute('aria-hidden', 'true');
+    var copy = document.createElement('span');
+    copy.className = 'trader-flow-copy';
+    var label = document.createElement('strong');
+    label.textContent = stage.name;
+    var detail = document.createElement('small');
+    detail.textContent = stage.detail;
+    copy.appendChild(label);
+    copy.appendChild(detail);
+    item.appendChild(node);
+    item.appendChild(copy);
+    flow.appendChild(item);
+    if (index < stages.length - 1) {
+      var link = document.createElement('span');
+      var nextStage = stages[index + 1];
+      var blocked = stage.state === 'bad' || stage.state === 'unknown' || (nextStage && (nextStage.state === 'bad' || nextStage.state === 'unknown'));
+      link.className = 'trader-flow-link' + (blocked ? ' trader-flow-link--blocked' : '') + (!blocked && nextStage && nextStage.moving ? ' trader-flow-link--moving' : '');
+      link.setAttribute('aria-hidden', 'true');
+      flow.appendChild(link);
+    }
+  });
+}
+
+function _renderMissionPerformance() {
+  var container = document.getElementById('trader-performance-chart');
+  if (!container) return;
+  var history = (TRADER_STATE.navHistory || []).slice(-60);
+  var current = TRADER_STATE.nav && (TRADER_STATE.nav.current_nav != null ? TRADER_STATE.nav.current_nav : TRADER_STATE.nav.nav);
+  var values = history.map(function(p) { return Number(p.nav != null ? p.nav : p.value); }).filter(Number.isFinite);
+  if (Number.isFinite(Number(current))) {
+    if (!values.length) values = [100000, Number(current)];
+    else if (Math.abs(values[values.length - 1] - Number(current)) > 0.005) values.push(Number(current));
+  }
+  container.innerHTML = '';
+  var deltaEl = document.getElementById('trader-performance-delta');
+  if (!values.length) {
+    if (deltaEl) deltaEl.textContent = 'NAV UNAVAILABLE';
+    var empty = document.createElement('div');
+    empty.className = 'trader-mission-empty';
+    empty.textContent = 'Waiting for durable NAV snapshots.';
+    container.appendChild(empty);
+    return;
+  }
+  var startCapital = 100000;
+  var latest = values[values.length - 1];
+  var delta = latest - startCapital;
+  if (deltaEl) {
+    deltaEl.textContent = _traderMoney(delta, true) + ' VS START';
+    deltaEl.className = 'trader-panel-metric ' + (delta >= 0 ? 'is-positive' : 'is-negative');
+  }
+  var width = 800, height = 260, left = 74, right = 22, top = 22, bottom = 40;
+  var low = Math.min.apply(null, values.concat([startCapital]));
+  var high = Math.max.apply(null, values.concat([startCapital]));
+  var pad = Math.max((high - low) * 0.16, 100);
+  low -= pad; high += pad;
+  function x(i) { return left + (values.length === 1 ? 0 : i / (values.length - 1)) * (width - left - right); }
+  function y(v) { return top + (high - v) / (high - low) * (height - top - bottom); }
+  var d = values.map(function(v, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(v).toFixed(1); }).join(' ');
+  var area = d + ' L' + x(values.length - 1).toFixed(1) + ',' + (height - bottom) + ' L' + x(0).toFixed(1) + ',' + (height - bottom) + ' Z';
+  var ns = 'http://www.w3.org/2000/svg';
+  var svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', 'Portfolio NAV ' + _traderMoney(latest, false) + ', ' + _traderMoney(delta, true) + ' versus starting capital');
+  svg.innerHTML = '<defs><linearGradient id="trader-nav-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#43e6b1" stop-opacity=".28"/><stop offset="1" stop-color="#43e6b1" stop-opacity="0"/></linearGradient></defs>' +
+    '<line class="trader-chart-grid" x1="' + left + '" y1="' + y(startCapital) + '" x2="' + (width-right) + '" y2="' + y(startCapital) + '"/>' +
+    '<text class="trader-chart-label" x="' + (left-10) + '" y="' + (y(startCapital)+4) + '" text-anchor="end">$100K START</text>' +
+    '<path class="trader-chart-area" d="' + area + '"/><path class="trader-chart-line ' + (delta >= 0 ? 'is-positive' : 'is-negative') + '" d="' + d + '"/>' +
+    '<circle class="trader-chart-now ' + (delta >= 0 ? 'is-positive' : 'is-negative') + '" cx="' + x(values.length-1) + '" cy="' + y(latest) + '" r="5"/>' +
+    '<text class="trader-chart-value" x="' + (width-right) + '" y="' + Math.max(18, y(latest)-12) + '" text-anchor="end">' + _traderMoney(latest, false) + '</text>' +
+    '<text class="trader-chart-axis" x="' + left + '" y="' + (height-10) + '">' + (history.length ? 'OLDEST SNAPSHOT' : 'START') + '</text><text class="trader-chart-axis" x="' + (width-right) + '" y="' + (height-10) + '" text-anchor="end">' + (history.length ? 'LATEST ' + _traderTime(history[history.length - 1].recorded_at || history[history.length - 1].timestamp) : 'LATEST POLL') + '</text>';
+  container.appendChild(svg);
+}
+
+function _renderMissionOrders() {
+  var container = document.getElementById('trader-orders-book');
+  var count = document.getElementById('trader-orders-count');
+  if (!container || !count) return;
+  container.innerHTML = '';
+  if (!TRADER_STATE.ordersAvailable) {
+    count.textContent = 'UNKNOWN';
+    count.className = 'trader-panel-metric is-negative';
+    var unavailable = document.createElement('div');
+    unavailable.className = 'trader-mission-empty trader-mission-empty--danger';
+    unavailable.textContent = 'Order ledger unavailable. Open-order exposure is unknown; use the Alpaca dashboard for emergency control.';
+    container.appendChild(unavailable);
+    return;
+  }
+  var orders = (TRADER_STATE.orders || []).slice().sort(function(a, b) {
+    var ao = TRADER_OPEN_ORDER_STATUSES[String(a.status || '').toLowerCase()] ? 1 : 0;
+    var bo = TRADER_OPEN_ORDER_STATUSES[String(b.status || '').toLowerCase()] ? 1 : 0;
+    return bo - ao || Number(b.created_at || 0) - Number(a.created_at || 0);
+  });
+  var open = orders.filter(function(o) { return TRADER_OPEN_ORDER_STATUSES[String(o.status || '').toLowerCase()]; });
+  count.textContent = open.length + ' OPEN';
+  count.className = 'trader-panel-metric ' + (open.length ? 'is-warning' : 'is-positive');
+  if (!orders.length) {
+    var empty = document.createElement('div');
+    empty.className = 'trader-mission-empty';
+    empty.textContent = 'No order records.';
+    container.appendChild(empty);
+    return;
+  }
+  var table = document.createElement('div');
+  table.className = 'trader-order-table';
+  var header = document.createElement('div');
+  header.className = 'trader-order-row trader-order-row--header';
+  ['Asset / route', 'Intent', 'Fill', 'State', 'Age', 'Control'].forEach(function(label) { var cell = document.createElement('span'); cell.textContent = label; header.appendChild(cell); });
+  table.appendChild(header);
+  orders.slice(0, 12).forEach(function(order) {
+    var status = String(order.status || 'unknown').toLowerCase();
+    var isOpen = !!TRADER_OPEN_ORDER_STATUSES[status];
+    var row = document.createElement('div');
+    row.className = 'trader-order-row' + (isOpen ? ' trader-order-row--open' : '');
+    var assetCell = document.createElement('span');
+    var symbol = document.createElement('strong'); symbol.textContent = order.asset || '—';
+    var route = document.createElement('small'); route.textContent = (_traderIsCrypto(order.asset) ? 'BITCOIN / CRYPTO' : 'STOCK') + ' · ' + String(order.source || 'unknown').toUpperCase();
+    assetCell.appendChild(symbol); assetCell.appendChild(route);
+    var intent = document.createElement('span'); intent.textContent = String(order.side || '—').toUpperCase() + ' ' + Number(order.qty || 0).toLocaleString() + ' · ' + String(order.order_type || 'order').toUpperCase();
+    var filled = Number(order.filled_qty || 0), qty = Number(order.qty || 0);
+    var fillCell = document.createElement('span');
+    var fillText = document.createElement('small'); fillText.textContent = filled.toLocaleString() + ' / ' + qty.toLocaleString();
+    var track = document.createElement('i'); track.className = 'trader-fill-track';
+    var bar = document.createElement('i'); bar.style.width = Math.max(0, Math.min(100, qty ? filled / qty * 100 : 0)) + '%'; track.appendChild(bar);
+    fillCell.appendChild(fillText); fillCell.appendChild(track);
+    var stateCell = document.createElement('span'); var badge = document.createElement('b'); badge.className = 'trader-order-state trader-order-state--' + (isOpen ? 'open' : status); badge.textContent = status.replace(/_/g, ' ').toUpperCase(); stateCell.appendChild(badge);
+    var age = document.createElement('span'); age.textContent = _traderTime(order.updated_at || order.created_at);
+    var control = document.createElement('span'); control.className = 'trader-order-control';
+    if (isOpen && status !== 'pending_cancel' && String(order.source || '').toLowerCase() === 'alpaca' && order.broker_order_id) {
+      var button = document.createElement('button');
+      var armed = _armedCancelOrderId === order.client_order_id;
+      button.className = 'trader-cancel-btn' + (armed ? ' trader-cancel-btn--armed' : '');
+      button.textContent = armed ? 'CONFIRM' : 'CANCEL';
+      button.setAttribute('aria-label', (armed ? 'Confirm cancellation of ' : 'Cancel ') + (order.asset || 'order'));
+      button.onclick = function() { armTraderOrderCancel(order.client_order_id); };
+      control.appendChild(button);
+    } else if (status === 'pending_cancel') {
+      control.textContent = 'REQUESTED';
+    } else if (isOpen) {
+      control.textContent = 'BROKER UI';
+      control.title = 'This order source is not connected to PawTrader cancellation.';
+    } else {
+      control.textContent = '—';
+    }
+    [assetCell, intent, fillCell, stateCell, age, control].forEach(function(cell) { row.appendChild(cell); });
+    table.appendChild(row);
+  });
+  container.appendChild(table);
+  var foot = document.createElement('p');
+  foot.className = 'trader-order-footnote';
+  foot.textContent = 'Individual cancellation only · click Cancel, then Confirm · broker remains authoritative';
+  container.appendChild(foot);
+}
+
+function armTraderOrderCancel(clientOrderId) {
+  if (_armedCancelOrderId === clientOrderId) {
+    executeTraderOrderCancel(clientOrderId);
+    return;
+  }
+  _armedCancelOrderId = clientOrderId;
+  if (_armedCancelTimer) clearTimeout(_armedCancelTimer);
+  _armedCancelTimer = setTimeout(function() {
+    _armedCancelOrderId = null;
+    _renderMissionOrders();
+  }, 8000);
+  _renderMissionOrders();
+}
+
+async function executeTraderOrderCancel(clientOrderId) {
+  var order = (TRADER_STATE.orders || []).find(function(item) { return item.client_order_id === clientOrderId; });
+  if (!order || !TRADER_OPEN_ORDER_STATUSES[String(order.status || '').toLowerCase()]) {
+    _armedCancelOrderId = null;
+    _renderMissionOrders();
+    return;
+  }
+  var response = await apiFetch('/api/v1/trader/orders/' + encodeURIComponent(clientOrderId) + '/cancel', {method: 'POST'});
+  _armedCancelOrderId = null;
+  if (response.ok && response.data) {
+    order.status = response.data.status || 'pending_cancel';
+    if (typeof showToast === 'function') showToast(response.data.submitted ? 'Cancellation requested' : 'Order already terminal', 'success');
+    _renderMissionOrders();
+    setTimeout(function() { runTraderRefresh(refreshTraderMissionControl); }, 750);
+    return;
+  }
+  if (typeof showToast === 'function') showToast(response.status === 403 ? 'Admin access required to cancel orders' : 'Cancellation failed. Check the broker dashboard.', 'error');
+  _renderMissionOrders();
+}
+
+function _renderMissionExposure() {
+  var container = document.getElementById('trader-exposure-book');
+  var totalEl = document.getElementById('trader-exposure-total');
+  if (!container || !totalEl) return;
+  container.innerHTML = '';
+  if (TRADER_STATE.positionsStale || !TRADER_STATE.positionsUpdatedAt) {
+    totalEl.textContent = 'UNKNOWN';
+    totalEl.className = 'trader-panel-metric is-negative';
+    var unavailable = document.createElement('div'); unavailable.className = 'trader-mission-empty trader-mission-empty--danger'; unavailable.textContent = 'Broker positions unavailable. Exposure is unknown.'; container.appendChild(unavailable); return;
+  }
+  var positions = TRADER_STATE.positions || [];
+  var total = positions.reduce(function(sum, p) { return sum + Math.abs(Number(p.market_value || 0)); }, 0);
+  totalEl.textContent = _traderMoney(total, false) + ' GROSS';
+  totalEl.className = 'trader-panel-metric';
+  if (!positions.length) { var empty = document.createElement('div'); empty.className = 'trader-mission-empty'; empty.textContent = 'Flat. No capital deployed.'; container.appendChild(empty); return; }
+  ['stock', 'crypto'].forEach(function(kind) {
+    var group = positions.filter(function(p) { return _traderIsCrypto(p.asset || p.symbol) === (kind === 'crypto'); });
+    var section = document.createElement('div'); section.className = 'trader-exposure-group';
+    var head = document.createElement('div'); head.className = 'trader-exposure-group__head'; head.textContent = kind === 'crypto' ? 'BITCOIN / CRYPTO' : 'STOCKS'; section.appendChild(head);
+    if (!group.length) { var zero = document.createElement('p'); zero.textContent = 'No open ' + kind + ' positions'; section.appendChild(zero); }
+    group.forEach(function(p) {
+      var pnl = Number(p.unrealized_pnl || 0);
+      var row = document.createElement('div'); row.className = 'trader-exposure-row';
+      var left = document.createElement('span'); var strong = document.createElement('strong'); strong.textContent = p.asset || p.symbol || '—'; var meta = document.createElement('small'); meta.textContent = Number(p.qty != null ? p.qty : p.quantity || 0).toLocaleString() + ' @ ' + _traderMoney(p.avg_entry_price != null ? p.avg_entry_price : p.avg_entry, false); left.appendChild(strong); left.appendChild(meta);
+      var value = document.createElement('span'); value.textContent = _traderMoney(p.market_value, false);
+      var pnlEl = document.createElement('span'); pnlEl.textContent = _traderMoney(pnl, true); pnlEl.className = pnl >= 0 ? 'is-positive' : 'is-negative';
+      row.appendChild(left); row.appendChild(value); row.appendChild(pnlEl); section.appendChild(row);
+    });
+    container.appendChild(section);
+  });
+}
+
+function _traderEvidenceLaneState(laneKey, laneStrategies, laneCohorts) {
+  var running = laneCohorts.find(function(c) { return c.status === 'running'; }) || null;
+  var cohort = running || laneCohorts[0] || null;
+  var active = laneStrategies.filter(function(s) { return s.status === 'active'; }).length;
+  var orderFlowResearch = laneKey === 'crypto' && laneStrategies.some(function(s) {
+    return s.id === 'order-flow-imbalance-crypto' && s.status === 'paused';
+  });
+  if (!running && orderFlowResearch && active === 0) return {cohort: cohort, label: 'RESEARCH PAUSED'};
+  return {cohort: cohort, label: cohort ? String(cohort.status || 'unknown').toUpperCase() : (active ? 'UNTRACKED' : 'PAUSED')};
+}
+
+function _traderBitcoinResearchProgressFacts(collection) {
+  if (!collection) return [];
+  if (!Number.isSafeInteger(collection.declaration_at)) return ['Research progress awaiting collector refresh'];
+  var eligible = Number(collection.eligible_bars_total || 0);
+  var ineligible = Number(collection.ineligible_bars_total || 0);
+  var days = Number(collection.collection_days_completed || 0);
+  var minimumDays = Number(collection.minimum_forward_days || 180);
+  var facts = [eligible.toLocaleString() + ' / ' + (eligible + ineligible).toLocaleString() + ' eligible decision bars'];
+  facts.push(days + ' / ' + minimumDays + ' forward days collected');
+  if (collection.collection_mature) {
+    if (collection.evaluation_status === 'passed') {
+      facts.push('Frozen research evaluation passed · production review only');
+    } else if (collection.evaluation_status === 'rejected_pre_holdout') {
+      facts.push('Research rejected before holdout · no qualifying frozen variant');
+    } else if (collection.evaluation_status === 'rejected') {
+      facts.push('One-time holdout rejected the research family');
+    } else if (collection.evaluation_status === 'error') {
+      facts.push('Evaluation blocked by an integrity or execution-lock check');
+    } else {
+      facts.push('Collection minimum matured; frozen evaluation pending');
+    }
+    if (Number.isSafeInteger(collection.evaluation_trade_count)) {
+      facts.push(collection.evaluation_trade_count.toLocaleString() + ' one-time holdout trades');
+    }
+  } else if (Number.isSafeInteger(collection.earliest_evaluation_at)) {
+    facts.push('Final evaluation no earlier than ' + new Date(collection.earliest_evaluation_at).toLocaleDateString());
+  }
+  return facts;
+}
+
+function _renderMissionEvidence() {
+  var container = document.getElementById('trader-evidence-lanes');
+  var score = document.getElementById('trader-evidence-score');
+  if (!container || !score) return;
+  container.innerHTML = '';
+  var gatePayload = TRADER_STATE.gateProgress;
+  var gate = gatePayload && gatePayload.gate;
+  var criteria = gate && Array.isArray(gate.criteria) ? gate.criteria : [];
+  var passed = criteria.filter(function(c) { return c.passed; }).length;
+  var gateFresh = !!(gate && gate.version >= 2 && Number.isFinite(gate.evaluatedAt) && gate.evaluatedAt <= Date.now() && Date.now() - gate.evaluatedAt < 7 * 86400000);
+  score.textContent = !criteria.length ? 'NOT EVALUATED' : (!gateFresh ? 'REVIEW REQUIRED' : passed + ' / ' + criteria.length + ' GATE');
+  score.className = 'trader-panel-metric ' + (gate && gate.passed && gateFresh ? 'is-positive' : 'is-warning');
+  var net = TRADER_STATE.brokerPnl && TRADER_STATE.brokerPnl.available ? Number(TRADER_STATE.brokerPnl.net) : null;
+  var accountTruth = document.createElement('div');
+  accountTruth.className = 'trader-evidence-truth ' + (net == null ? '' : (net >= 0 ? 'is-positive' : 'is-negative'));
+  accountTruth.textContent = net == null ? 'Corrected account P&L unavailable' : 'Corrected paper result ' + _traderMoney(net, true) + ' · fees/cost completeness still open';
+  container.appendChild(accountTruth);
+  var strategies = TRADER_STATE.strategies || [];
+  var cohorts = TRADER_STATE.cohorts || [];
+  var orders = TRADER_STATE.ordersAvailable ? TRADER_STATE.orders : [];
+  [
+    {key: 'stock', title: 'STOCKS', broker: TRADER_STATE.engineStatus && TRADER_STATE.engineStatus.alpaca_connected ? 'Alpaca connected' : 'Alpaca offline'},
+    {key: 'crypto', title: 'BITCOIN', broker: TRADER_STATE.engineStatus && TRADER_STATE.engineStatus.alpaca_connected ? 'Alpaca crypto route connected' : 'Alpaca crypto route offline'}
+  ].forEach(function(lane) {
+    var laneStrategies = strategies.filter(function(s) { return (String(s.asset_class).toLowerCase() === 'crypto') === (lane.key === 'crypto'); });
+    var laneCohorts = cohorts.filter(function(c) { return (String(c.asset_class).toLowerCase() === 'crypto') === (lane.key === 'crypto'); });
+    var laneState = _traderEvidenceLaneState(lane.key, laneStrategies, laneCohorts);
+    var cohort = laneState.cohort;
+    var fills = orders.filter(function(o) { return String(o.status).toLowerCase() === 'filled' && _traderIsCrypto(o.asset) === (lane.key === 'crypto'); }).length;
+    var item = document.createElement('div'); item.className = 'trader-evidence-lane';
+    var head = document.createElement('div'); head.className = 'trader-evidence-lane__head';
+    var name = document.createElement('strong'); name.textContent = lane.title;
+    var state = document.createElement('b'); state.className = 'trader-order-state ' + (cohort && cohort.status === 'running' ? 'trader-order-state--open' : 'trader-order-state--paused'); state.textContent = laneState.label;
+    head.appendChild(name); head.appendChild(state); item.appendChild(head);
+    var facts = document.createElement('div'); facts.className = 'trader-evidence-facts';
+    var laneFacts = [lane.broker];
+    if (lane.key === 'crypto') laneFacts.push(TRADER_STATE.engineStatus && TRADER_STATE.engineStatus.coinbase_connected ? 'Coinbase monitor connected' : 'Coinbase monitor not ready');
+    if (lane.key === 'crypto') {
+      var collection = TRADER_STATE.bitcoinOrderFlowCollection;
+      if (!collection) laneFacts.push('Order-flow collection awaiting first sync');
+      else if (collection.state === 'connected') laneFacts.push('Order-flow collection connected · ' + Number(collection.trades_stored || 0).toLocaleString() + ' trades · ' + Number(collection.l2_updates_stored || 0).toLocaleString() + ' book updates');
+      else laneFacts.push('Order-flow collection ' + String(collection.state || 'unknown'));
+      laneFacts = laneFacts.concat(_traderBitcoinResearchProgressFacts(collection));
+    }
+    laneFacts.push(fills + ' filled order records in current ledger');
+    if (!TRADER_STATE.cohortsAvailable) {
+      laneFacts.push('Cohort evidence unavailable');
+    } else if (!cohort) {
+      laneFacts.push('Prospective cohort missing');
+    } else {
+      laneFacts.push(Number(cohort.trade_count || 0) + ' / ' + Number(cohort.min_closed_trades || 100) + ' cohort round trips');
+      laneFacts.push(cohort.net_pnl_usd == null || Number(cohort.trade_count || 0) === 0
+        ? 'Net after modeled costs pending'
+        : 'Net after modeled costs ' + _traderMoney(cohort.net_pnl_usd, true));
+      laneFacts.push(cohort.deflated_sharpe == null ? 'Deflated Sharpe pending' : 'Deflated Sharpe ' + Number(cohort.deflated_sharpe).toFixed(3));
+      try {
+        var criteria = JSON.parse(cohort.criteria_json || '[]');
+        var blockers = Array.isArray(criteria) ? criteria.filter(function(c) { return c && c.passed !== true; }) : [];
+        if (blockers.length) {
+          laneFacts.push('Blocked: ' + blockers.slice(0, 3).map(function(c) {
+            return String(c.name || 'unknown').replaceAll('_', ' ');
+          }).join(', ') + (blockers.length > 3 ? ' +' + (blockers.length - 3) : ''));
+        }
+      } catch (_) {
+        laneFacts.push('Scorecard criteria unavailable');
+      }
+      if (cohort.invalidation_reason) laneFacts.push('Invalidated: ' + cohort.invalidation_reason);
+    }
+    laneFacts.push(cohort && cohort.status === 'passed' ? 'Evidence passed; live still needs operator approval' : 'Live capital blocked');
+    laneFacts.forEach(function(copy, index) { var fact = document.createElement('span'); fact.className = index >= (lane.key === 'crypto' ? 4 : 2) ? 'is-blocker' : ''; fact.textContent = copy; facts.appendChild(fact); });
+    item.appendChild(facts); container.appendChild(item);
+  });
+}
+
+var _traderOperationalFetchInFlight = false;
+var _traderOperationalFetchPending = false;
+var _traderOperationalPendingAnimate = false;
+
+function freezeTraderOperationalMotion() {
+  if (typeof TRADER_STATE === 'undefined') return;
+  TRADER_STATE.operationalPulseIds = {};
+  TRADER_STATE.operationalStagePulses = {};
+  if (document.getElementById('trader-orders-book')) renderTraderMissionControl();
+}
+
+function _mergeTraderOperationalEvents(events, animate) {
+  if (!Array.isArray(events)) return;
+  var receivedNew = false;
+  events.forEach(function(event) {
+    if (!event || !event.event_id || TRADER_STATE.operationalSeen[event.event_id]) return;
+    TRADER_STATE.operationalSeen[event.event_id] = true;
+    TRADER_STATE.operationalEvents.push(event);
+    receivedNew = true;
+    if (animate && !TRADER_STATE.operationalAnimated[event.event_id] && _traderAgeMs(event.source_ts) < 30000) {
+      TRADER_STATE.operationalAnimated[event.event_id] = true;
+      TRADER_STATE.operationalPulseIds[event.event_id] = true;
+      TRADER_STATE.operationalStagePulses[event.stage] = { event_id: event.event_id, consumed: false };
+    }
+  });
+  if (!receivedNew) return;
+  TRADER_STATE.operationalEvents.sort(function(a, b) { return Number(b.seq || 0) - Number(a.seq || 0); });
+  TRADER_STATE.operationalEvents = TRADER_STATE.operationalEvents.slice(0, 200);
+  if (animate) {
+    setTimeout(function() {
+      TRADER_STATE.operationalPulseIds = {};
+      TRADER_STATE.operationalStagePulses = {};
+      renderTraderMissionControl();
+    }, 3000);
+  }
+}
+
+async function refreshTraderOperationalEvents(animate) {
+  if (_traderOperationalFetchInFlight) {
+    _traderOperationalFetchPending = true;
+    _traderOperationalPendingAnimate = _traderOperationalPendingAnimate || !!animate;
+    return;
+  }
+  _traderOperationalFetchInFlight = true;
+  try {
+    var keepFetching = true;
+    while (keepFetching) {
+      var requestedAfter = TRADER_STATE.operationalCursor > 0;
+      var suffix = requestedAfter ? '?after_seq=' + TRADER_STATE.operationalCursor + '&limit=200' : '?limit=100';
+      var data = await fetchFromAPI('/api/v1/trader/operational-events' + suffix);
+      var events = data && Array.isArray(data.events) ? data.events : [];
+      _mergeTraderOperationalEvents(events, !!animate && requestedAfter);
+      TRADER_STATE.operationalCursor = Number(data && data.cursor) || TRADER_STATE.operationalCursor;
+      TRADER_STATE.operationalAvailable = true;
+      keepFetching = requestedAfter && !!(data && data.has_more) && events.length > 0;
+    }
+    renderTraderMissionControl();
+  } catch (_) {
+    TRADER_STATE.operationalAvailable = false;
+    freezeTraderOperationalMotion();
+  } finally {
+    _traderOperationalFetchInFlight = false;
+    if (_traderOperationalFetchPending) {
+      var pendingAnimate = _traderOperationalPendingAnimate;
+      _traderOperationalFetchPending = false;
+      _traderOperationalPendingAnimate = false;
+      refreshTraderOperationalEvents(pendingAnimate);
+    }
+  }
+}
+
+function _traderOperationalCopy(event) {
+  var metadata = event.metadata || {};
+  var label = String(event.event_type || 'operational event').replace(/[._]/g, ' ');
+  var facts = [];
+  if (metadata.reason) facts.push(String(metadata.reason).replace(/_/g, ' '));
+  if (metadata.decision) facts.push(String(metadata.decision));
+  if (metadata.status) facts.push(String(metadata.status).replace(/_/g, ' '));
+  if (metadata.filled_qty != null) facts.push('qty ' + Number(metadata.filled_qty).toLocaleString());
+  if (metadata.pnl_net != null) facts.push(_traderMoney(metadata.pnl_net, true));
+  if (metadata.checked != null) facts.push(Number(metadata.checked) + ' checked');
+  if (metadata.exited != null) facts.push(Number(metadata.exited) + ' exits');
+  return label + (facts.length ? ' · ' + facts.slice(0, 3).join(' · ') : '');
+}
+
+function _renderMissionActivity() {
+  var container = document.getElementById('trader-activity-rail');
+  if (!container) return;
+  container.innerHTML = '';
+  var metric = document.querySelector('.trader-mission-panel--activity .trader-panel-metric');
+  var events = TRADER_STATE.operationalEvents || [];
+  var newest = events.length ? events[0] : null;
+  var stale = newest && _traderAgeMs(newest.source_ts) >= 10 * 60 * 1000;
+  if (metric) metric.textContent = !document.body.classList.contains('ws-connected')
+    ? 'UPDATES DISCONNECTED'
+    : (!TRADER_STATE.operationalAvailable
+      ? 'LEDGER UNAVAILABLE'
+      : (stale ? 'SOURCE STALE' : 'CURSOR ' + TRADER_STATE.operationalCursor));
+  if (!events.length) {
+    var empty = document.createElement('div');
+    empty.className = 'trader-mission-empty';
+    empty.textContent = TRADER_STATE.operationalAvailable
+      ? 'No committed operational events yet.'
+      : 'Waiting for the operational event ledger.';
+    container.appendChild(empty);
+    return;
+  }
+  events.slice(0, 12).forEach(function(event) {
+    var failed = event.state === 'failed' || event.state === 'blocked' || event.state === 'warning';
+    var canPulse = TRADER_STATE.operationalPulseIds[event.event_id] && !TRADER_STATE.operationalRenderedPulseIds[event.event_id];
+    if (canPulse) TRADER_STATE.operationalRenderedPulseIds[event.event_id] = true;
+    var state = canPulse ? 'active' : (failed ? 'bad' : (event.state === 'completed' || event.state === 'filled' || event.state === 'succeeded' ? 'ok' : 'idle'));
+    var row = document.createElement('div');
+    row.className = 'trader-activity-row trader-activity-row--' + state;
+    var marker = document.createElement('i'); marker.setAttribute('aria-hidden', 'true');
+    var type = document.createElement('span'); type.className = 'trader-activity-type'; type.textContent = String(event.stage || 'event').toUpperCase();
+    var copy = document.createElement('span');
+    var asset = document.createElement('strong'); asset.textContent = event.asset || event.strategy_id || 'SYSTEM';
+    var detail = document.createElement('small'); detail.textContent = _traderOperationalCopy(event);
+    copy.appendChild(asset); copy.appendChild(detail);
+    var age = document.createElement('time'); age.textContent = _traderTime(event.source_ts);
+    row.appendChild(marker); row.appendChild(type); row.appendChild(copy); row.appendChild(age); container.appendChild(row);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +1117,7 @@ async function refreshTraderCol1() {
   }
 
   _renderCol1();
-  _renderTraderTicker();
+  renderTraderMissionControl();
 }
 
 function _renderCol1() {
@@ -755,6 +1285,7 @@ async function refreshTraderCol2() {
 
   _renderCol2();
   _renderBottomRow();
+  renderTraderMissionControl();
 }
 
 function _renderCol2() {
@@ -952,8 +1483,13 @@ async function refreshTraderCol3() {
 
   try {
     riskData = await fetchFromAPI('/api/v1/trader/risk');
+    if (!riskData || !Array.isArray(riskData.tripped)) throw new Error('Risk state unavailable');
     TRADER_STATE.risk = riskData;
-  } catch (_) {}
+    TRADER_STATE.riskAvailable = true;
+  } catch (_) {
+    TRADER_STATE.risk = null;
+    TRADER_STATE.riskAvailable = false;
+  }
 
   // Committee data refreshed by refreshTraderKPI_nav on 60s cycle; re-render from cache
   var commitData = TRADER_STATE.committeeReport || null;
@@ -976,6 +1512,7 @@ async function refreshTraderCol3() {
   } catch (_) {}
 
   _renderCol3(riskData, commitData, reconcilerData);
+  renderTraderMissionControl();
 }
 
 function _renderCol3(riskData, commitData, reconcilerData) {
@@ -1001,10 +1538,10 @@ function _renderCol3CircuitBreakers(col, data) {
   ));
   col.appendChild(header);
 
-  if (!data || !data.rules) {
+  if (!TRADER_STATE.riskAvailable || !data || !Array.isArray(data.tripped)) {
     var empty = document.createElement('div');
     empty.className = 'trader-empty';
-    empty.textContent = 'No risk data';
+    empty.textContent = 'Risk state unavailable — safety status unknown';
     col.appendChild(empty);
     return;
   }
@@ -1012,7 +1549,13 @@ function _renderCol3CircuitBreakers(col, data) {
   var grid = document.createElement('div');
   grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:8px';
 
-  var rules = data.rules || [];
+  var rules = Array.isArray(data.details) ? data.details : [];
+  if (rules.length === 0) {
+    var clear = document.createElement('span');
+    clear.className = 'trader-risk-badge';
+    clear.textContent = 'All breakers clear';
+    grid.appendChild(clear);
+  }
   for (var i = 0; i < rules.length; i++) {
     var rule = rules[i];
     var tripped = rule.tripped || rule.status === 'tripped';
@@ -1497,86 +2040,6 @@ function _goToGuideSlide(idx) {
       }(i));
       dotsEl.appendChild(dot);
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// TRADER — How It Works reference page
-// ---------------------------------------------------------------------------
-
-function initHowItWorksPage() {
-  var page = document.getElementById('page-how-it-works');
-  if (!page || page.dataset.loaded) return;
-  page.dataset.loaded = '1';
-
-  var sections = [
-    {
-      id: 'hiw-overview',
-      title: 'System Overview',
-      content: '<p>Paw Trader is an automated trading system that runs 24/7. It uses multiple strategies to find trade opportunities, puts every trade through an AI committee vote, and executes approved trades via a broker API.</p><div style="background:rgba(0,255,159,0.06);border:1px solid rgba(0,255,159,0.15);border-radius:6px;padding:16px;margin:12px 0"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px"><span style="color:var(--color-accent)">Strategy</span> <span style="opacity:0.4">→</span> <span>Signal Generated</span> <span style="opacity:0.4">→</span> <span>Committee Vote (5 AIs)</span> <span style="opacity:0.4">→</span> <span>Broker Order</span> <span style="opacity:0.4">→</span> <span style="color:var(--color-success)">Verdict + Grade</span></div></div><p>No human approval is required. The circuit breakers and risk rules are the safety layer. You can halt the engine at any time with the halt button.</p>'
-    },
-    {
-      id: 'hiw-pnl',
-      title: 'P&L Explained',
-      content: '<p><strong>NAV (Net Asset Value)</strong> is your total account value: cash on hand plus the current market value of every open position.</p><p><strong>Today P&L</strong> resets at market open. It measures all gains and losses from trades that closed today plus unrealized moves on open positions.</p><p><strong>Unrealized P&L</strong> is the paper gain or loss on positions you still hold. It only becomes real when the position closes.</p><p><strong>The NAV Chart</strong> shows your account value over 30 days. An upward slope means the bot is making money.</p>'
-    },
-    {
-      id: 'hiw-strategies',
-      title: 'Strategies',
-      content: '<p>Each strategy monitors the market independently and generates signals when it finds an opportunity.</p><p><strong>Momentum</strong> — Looks for assets already moving strongly in one direction. Uses price rate-of-change and volume. "Strong gets stronger."</p><p><strong>Mean Reversion (Equity)</strong> — Looks for stocks that have fallen further than their historical patterns suggest. Uses RSI below 30 and price outside Bollinger Bands. "What goes down too fast comes back up."</p><p><strong>Mean Reversion (Crypto)</strong> — Same logic for BTC and ETH. Wider thresholds and smaller position sizes for crypto volatility.</p>'
-    },
-    {
-      id: 'hiw-committee',
-      title: 'The AI Committee',
-      content: '<p>Every signal must pass through a committee of 5 AI specialists. Each votes independently.</p><ul style="line-height:1.9;padding-left:20px"><li><strong>Quant</strong> — evaluates math: momentum, volume, price patterns</li><li><strong>Macro</strong> — checks whether the broader economy supports the trade</li><li><strong>Sentiment</strong> — reads news and social signals about the asset</li><li><strong>Fundamentals</strong> — checks revenue growth, earnings quality, valuation (equities)</li><li><strong>Risk Officer</strong> — veto power; checks position sizing and drawdown limits</li></ul><p>If the committee is split, a coordinator can call a second round for challenge and rebuttal.</p>'
-    },
-    {
-      id: 'hiw-breakers',
-      title: 'Circuit Breakers',
-      content: '<p>Circuit breakers automatically halt trading when a safety threshold is breached. Most self-heal when the underlying condition clears.</p><table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px"><thead><tr style="opacity:0.5;text-align:left"><th style="padding:6px 8px">Breaker</th><th style="padding:6px 8px">Triggers When</th></tr></thead><tbody><tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 8px">Daily Loss Cap</td><td style="padding:6px 8px">Portfolio losses exceed the configured daily max</td></tr><tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 8px">Reconciler Halt</td><td style="padding:6px 8px">Bot\'s position view doesn\'t match broker\'s view</td></tr><tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 8px">Engine Unreachable</td><td style="padding:6px 8px">Trader engine hasn\'t responded in N minutes</td></tr><tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 8px">Signal Drought</td><td style="padding:6px 8px">No signals generated in 1+ hour during market hours</td></tr></tbody></table>'
-    },
-    {
-      id: 'hiw-glossary',
-      title: 'Glossary',
-      content: '<dl style="font-size:13px;line-height:1.8"><dt style="color:var(--color-accent);font-weight:600">NAV</dt><dd style="margin:0 0 8px 16px">Net Asset Value — total account value including cash and open positions</dd><dt style="color:var(--color-accent);font-weight:600">P&L</dt><dd style="margin:0 0 8px 16px">Profit and Loss — how much money was made or lost</dd><dt style="color:var(--color-accent);font-weight:600">Signal</dt><dd style="margin:0 0 8px 16px">A trade idea generated by a strategy, before committee review</dd><dt style="color:var(--color-accent);font-weight:600">Verdict</dt><dd style="margin:0 0 8px 16px">The outcome after a trade closes — includes final P&L and thesis grade</dd><dt style="color:var(--color-accent);font-weight:600">Win Rate</dt><dd style="margin:0 0 8px 16px">% of completed trades that were profitable. Above 50% = strategy is net-positive</dd><dt style="color:var(--color-accent);font-weight:600">Circuit Breaker</dt><dd style="margin:0 0 8px 16px">Safety rule that halts trading automatically when a limit is exceeded</dd><dt style="color:var(--color-accent);font-weight:600">RSI</dt><dd style="margin:0 0 8px 16px">Relative Strength Index — momentum indicator (0-100). Below 30 = oversold, above 70 = overbought</dd></dl>'
-    }
-  ];
-
-  page.innerHTML =
-    '<div style="max-width:800px;margin:0 auto;padding:24px">' +
-      '<h1 style="font-size:22px;margin-bottom:4px">How Paw Trader Works</h1>' +
-      '<p style="opacity:0.5;font-size:13px;margin-bottom:24px">A plain-English reference for everything on the Trader dashboard.</p>' +
-      '<div id="hiw-accordion"></div>' +
-    '</div>';
-
-  var accordion = page.querySelector('#hiw-accordion');
-  for (var i = 0; i < sections.length; i++) {
-    var s = sections[i];
-    var item = document.createElement('div');
-    item.style.cssText = 'border:1px solid rgba(0,255,159,0.12);border-radius:8px;margin-bottom:12px;overflow:hidden';
-
-    var btn = document.createElement('button');
-    btn.style.cssText = 'width:100%;text-align:left;background:rgba(0,255,159,0.04);border:none;color:inherit;padding:14px 18px;font-size:15px;font-weight:600;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-    btn.innerHTML = s.title + ' <span class="hiw-chevron">&#9660;</span>';
-    btn.setAttribute('aria-expanded', 'false');
-
-    var body = document.createElement('div');
-    body.style.cssText = 'padding:16px 18px;font-size:13px;line-height:1.7;display:none';
-    body.innerHTML = s.content;
-
-    (function(b, bd) {
-      b.onclick = function() {
-        var open = bd.style.display !== 'none';
-        bd.style.display = open ? 'none' : 'block';
-        b.setAttribute('aria-expanded', String(!open));
-        var ch = b.querySelector('.hiw-chevron');
-        if (ch) ch.textContent = open ? '▼' : '▲';
-      };
-    }(btn, body));
-
-    item.appendChild(btn);
-    item.appendChild(body);
-    accordion.appendChild(item);
   }
 }
 
@@ -2503,6 +2966,7 @@ async function refreshTraderGateProgress() {
   try {
     var data = await fetchFromAPI('/api/v1/trader/gate-progress');
     if (data === null) return; // auth redirect
+    TRADER_STATE.gateProgress = data;
     while (container.firstChild) container.removeChild(container.firstChild);
 
     var heading = document.createElement('div');
@@ -2572,8 +3036,10 @@ async function refreshTraderGateProgress() {
       container.appendChild(ts);
     }
   } catch (e) {
+    TRADER_STATE.gateProgress = null;
     container.textContent = 'Gate status unavailable: ' + String(e);
   }
+  renderTraderMissionControl();
 }
 
 // ---------------------------------------------------------------------------

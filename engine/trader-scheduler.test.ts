@@ -61,6 +61,7 @@ const healthOk = {
   reconciler_halted: false,
   halt_reason: null,
   coinbase_connected: true,
+  crypto_enabled: true,
 }
 
 describe('trader-scheduler', () => {
@@ -94,6 +95,17 @@ describe('trader-scheduler', () => {
       getSignals: vi.fn().mockResolvedValue([]),
       getPositions: vi.fn().mockResolvedValue([]),
       getOrders: vi.fn().mockResolvedValue([]),
+      getReconcileLast: vi.fn().mockResolvedValue({
+        id: 'rec-current', ran_at: Date.now(), drift_detected: false,
+        drift_summary: null, action_taken: 'none',
+      }),
+      getNavLatest: vi.fn().mockResolvedValue({
+        date: '2026-07-22', period: 'day_open', nav: 100_000, recorded_at: Date.now(),
+      }),
+      coverPaperShort: vi.fn().mockResolvedValue({
+        asset: 'IWM', prior_qty: -3, client_order_id: 'repair-cover-1',
+        broker_order_id: 'broker-cover-1', status: 'pending_new', submitted: true,
+      }),
       // Phase 4 Task B: close-out watcher calls /prices when a decision
       // closes in a given tick. Stub as empty so the trader-scheduler
       // tests stay focused on scheduler behaviour, not price math.
@@ -110,6 +122,70 @@ describe('trader-scheduler', () => {
   })
 
   describe('runTraderTick', () => {
+    it('timestamps tick completion when the tick finishes', async () => {
+      const startedAt = Date.now()
+      vi.mocked(engineClient.getSignals!).mockImplementation(async () => {
+        vi.setSystemTime(startedAt + 1_600)
+        return []
+      })
+
+      await runTraderTick({db, send, rawSend: send, getEngineClient, isMarketOpen: () => true})
+
+      const rows = db.prepare(`SELECT event_type, source_ts, recorded_at, metadata_json
+        FROM trader_operational_events
+        WHERE event_type IN ('scheduler.tick.started','scheduler.tick.completed')
+        ORDER BY seq`).all() as Array<{event_type:string;source_ts:number;recorded_at:number;metadata_json:string}>
+      expect(rows).toHaveLength(2)
+      expect(rows[0].source_ts).toBe(startedAt)
+      expect(rows[1].source_ts).toBe(startedAt + 1_600)
+      expect(rows[1].recorded_at).toBe(startedAt + 1_600)
+      expect(JSON.parse(rows[1].metadata_json).duration_ms).toBe(1_600)
+    })
+
+    it('blocks new entries and alerts once when broker truth contains a short position', async () => {
+      insertSignal(db, 'short-safety')
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+
+      await runTraderTick({
+        db, send, rawSend: send, getEngineClient, isMarketOpen: () => true,
+        restartEngineAsync: vi.fn(),
+      })
+
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+      expect(engineClient.coverPaperShort).toHaveBeenCalledWith('IWM')
+      expect(sendMock.mock.calls.some(([message]) => String(message).includes('UNEXPECTED SHORT POSITION'))).toBe(true)
+      expect((db.prepare("SELECT status FROM trader_signals WHERE id='short-safety'").get() as any).status).toBe('pending')
+    })
+
+    it('does not cover a paper short outside equity market hours', async () => {
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => false})
+
+      expect(engineClient.coverPaperShort).not.toHaveBeenCalled()
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
+    it('never requests automatic short covering in live mode', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({...healthOk, alpaca_mode: 'live'})
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+      engineClient.haltTrading = vi.fn().mockResolvedValue(undefined)
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => true})
+
+      expect(engineClient.coverPaperShort).not.toHaveBeenCalled()
+      expect(engineClient.haltTrading).toHaveBeenCalled()
+    })
+
     // A wedged engine holds the port in LISTEN but never answers. getHealth
     // returns null for that AND for a 404, so the wedge used to look like a
     // healthy tick and the auto-restart never fired (13h outage 2026-07-20).
@@ -432,7 +508,7 @@ describe('trader-scheduler', () => {
       expect(verdict.pnl_gross).toBe(10)
     })
 
-    it('close-out failure does not halt other phases', async () => {
+    it('position outage blocks new exposure while later phases still complete', async () => {
       insertSignal(db, 'sig-poll')
       vi.mocked(engineClient.getPositions!).mockRejectedValue(new Error('positions endpoint down'))
       vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
@@ -449,7 +525,8 @@ describe('trader-scheduler', () => {
 
       const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
       expect(result.polled).toBe(true)
-      expect(result.sent).toBe(1)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
       expect(result.closedOut).toBe(0)
     })
   })
@@ -906,6 +983,21 @@ describe('trader-scheduler', () => {
 
       const row = db.prepare("SELECT status FROM trader_decisions WHERE id='d-down'").get() as any
       expect(row.status).toBe('retry_pending')
+    })
+
+    it('startup keeps a dispatching signal that already has a retry_pending decision', () => {
+      insertSignal(db, 'sig-parked')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-parked')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-parked', 'sig-parked', 'buy', 'AAPL', 150, 'market', 't', 0.7, ?, 'retry_pending')`).run(Date.now())
+      insertSignal(db, 'sig-orphan', 0.72, 'sell')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-orphan')
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-parked')).toEqual({ status: 'dispatching' })
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-orphan')).toEqual({ status: 'pending' })
     })
 
     it('exit sweep phase fires and counts exits when a position breaches its stop', async () => {

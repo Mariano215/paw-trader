@@ -1,19 +1,19 @@
 /**
  * Phase E Task 2 -- per-trade audit log.
  *
- * trader_fills is append-only broker truth. trader_realized_pnl is the
- * derived layer. This module is the only writer for both. It exists
- * because engine_orders never carries fills (status stays 'placed',
- * filled_qty=0, filled_avg_price=NULL forever), so the evaluation
- * stack cannot read fills from there. Real fills are fed in from the
- * broker via the engine (see plan engineDependencies); this writer is
- * the brain-side sink and is unit-tested against synthetic fills.
+ * trader_fills stores broker truth. Native execution events are append-only;
+ * cumulative engine order snapshots are replaced by broker order id so a
+ * partial fill followed by its final quantity cannot be double-counted.
+ * trader_realized_pnl is the derived layer. This module is the only writer
+ * for both and is unit-tested against synthetic fills.
  *
  * Lot-matching rule for v1 is FIFO, recorded on every derived row so
  * the rule is auditable and changeable without rewriting history.
  */
 import { randomUUID } from 'node:crypto'
 import type Database from 'better-sqlite3'
+import type { EngineOrder } from './types.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 export const LOT_MATCH_RULE = 'FIFO' as const
 
@@ -82,7 +82,7 @@ export function recordFill(
 ): string {
   const id = pinnedId ?? randomUUID()
   const slippage = computeSlippageUsd(input.side, input.fillPrice, input.fillQty, input.intendedPrice)
-  db.prepare(`
+  const inserted = db.prepare(`
     INSERT OR IGNORE INTO trader_fills
       (id, decision_id, client_order_id, broker_order_id, asset, side,
        fill_qty, fill_price, intended_price, intended_ts_ms, fill_ts_ms,
@@ -95,7 +95,109 @@ export function recordFill(
     input.feeUsd ?? 0, slippage, input.entryThesis ?? null,
     input.exitReason ?? null, nowMs,
   )
+  if (inserted.changes > 0) {
+    recordTraderOperationalEvent(db, {
+      eventId: `fill:${id}:${input.fillQty}:${input.fillTsMs}`,
+      sourceTs: input.fillTsMs,
+      recordedAt: nowMs,
+      source: 'brain.fill-ledger',
+      stage: 'broker',
+      eventType: 'broker.fill.recorded',
+      state: 'filled',
+      asset: input.asset,
+      decisionId: input.decisionId,
+      orderId: input.brokerOrderId ?? input.clientOrderId,
+      metadata: {
+        side: input.side,
+        filled_qty: input.fillQty,
+        fill_price: input.fillPrice,
+        fee_usd: input.feeUsd ?? 0,
+        slippage_usd: slippage,
+      },
+    })
+  }
   return id
+}
+
+/**
+ * Store one canonical cumulative snapshot for a broker order. Engine `/orders`
+ * reports cumulative filled quantity, not execution deltas. Replacing an older
+ * partial snapshot prevents `3 filled` followed by `6 filled` from becoming
+ * nine shares in FIFO accounting.
+ */
+export function upsertCumulativeOrderFill(
+  db: Database.Database,
+  input: FillInput & {brokerOrderId: string},
+  nowMs: number = Date.now(),
+): string {
+  const existing = db.prepare(`
+    SELECT * FROM trader_fills
+    WHERE broker_order_id = ?
+    ORDER BY fill_qty DESC, fill_ts_ms DESC
+  `).all(input.brokerOrderId) as FillRow[]
+  const best = existing[0]
+  if (best && (best.fill_qty > input.fillQty ||
+      (best.fill_qty === input.fillQty && (best.fill_ts_ms > input.fillTsMs ||
+        (best.fill_ts_ms === input.fillTsMs && best.fill_price === input.fillPrice))))) {
+    return best.id
+  }
+
+  const canonicalId = `order:${input.brokerOrderId}`
+  const merged: FillInput = {
+    ...input,
+    intendedPrice: input.intendedPrice ?? best?.intended_price ?? null,
+    intendedTsMs: input.intendedTsMs ?? best?.intended_ts_ms ?? null,
+    feeUsd: Math.max(input.feeUsd ?? 0, best?.fee_usd ?? 0),
+    entryThesis: input.entryThesis ?? best?.entry_thesis ?? null,
+    exitReason: input.exitReason ?? best?.exit_reason ?? null,
+  }
+  const replace = db.transaction(() => {
+    db.prepare('DELETE FROM trader_fills WHERE broker_order_id = ?').run(input.brokerOrderId)
+    recordFill(db, merged, nowMs, canonicalId)
+  })
+  replace()
+  return canonicalId
+}
+
+/** Archive cumulative engine order snapshots for decisions known to the brain. */
+export function archiveCumulativeOrderFills(
+  db: Database.Database,
+  orders: EngineOrder[],
+  nowMs: number = Date.now(),
+): number {
+  const findDecision = db.prepare(`
+    SELECT id, entry_price, decided_at, thesis
+    FROM trader_decisions
+    WHERE id = ? OR engine_order_id = ?
+    ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
+    LIMIT 1
+  `)
+  let archived = 0
+  for (const order of orders) {
+    if (!order.broker_order_id || !(Number.isFinite(order.filled_qty) && order.filled_qty > 0) ||
+        order.filled_avg_price == null || !Number.isFinite(order.filled_avg_price) || order.filled_avg_price <= 0) continue
+    const decisionKey = order.decision_id ?? order.client_order_id
+    const decision = findDecision.get(decisionKey, order.broker_order_id, decisionKey) as
+      | {id: string; entry_price: number | null; decided_at: number; thesis: string | null}
+      | undefined
+    if (!decision) continue
+    upsertCumulativeOrderFill(db, {
+      decisionId: decision.id,
+      clientOrderId: order.client_order_id,
+      brokerOrderId: order.broker_order_id,
+      asset: order.asset,
+      side: order.side,
+      fillQty: order.filled_qty,
+      fillPrice: order.filled_avg_price,
+      intendedPrice: decision.entry_price,
+      intendedTsMs: decision.decided_at,
+      fillTsMs: order.updated_at,
+      feeUsd: 0,
+      entryThesis: order.side === 'buy' ? decision.thesis : null,
+    }, nowMs)
+    archived++
+  }
+  return archived
 }
 
 /** Read all fills for a decision, ascending by fill time. */

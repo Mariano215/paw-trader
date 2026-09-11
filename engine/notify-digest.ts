@@ -18,6 +18,7 @@
  */
 import type Database from 'better-sqlite3'
 import { logger as baseLogger } from '../logger.js'
+import { isUrgent } from '../channels/quiet-hours.js'
 
 const logger = baseLogger.child({ mod: 'trader-digest' })
 
@@ -29,12 +30,6 @@ const MIN_GAP_MS = 6 * 60 * 60 * 1000
 
 let inFlightFire = false
 
-/**
- * Issue = a real problem the operator must see now. Matched case-insensitively
- * against the message text. Keep this list aligned with the trader alert call
- * sites: anything that is NOT an issue gets buffered into the digest.
- */
-const ISSUE_RE = /\bALERT\b|\bhalt(ed)?\b|unreachable|could not|did not start|kill[\s-]?switch|NAV drop|engine submit rejected/i
 /** Weekly report is low-volume and already a digest; let it through instantly. */
 const REPORT_RE = /weekly report|^Report:|\bReport:\s/im
 /** Trade event lines we can render into plain English. */
@@ -59,9 +54,22 @@ function plainName(ticker: string): string {
   return TICKER_NAMES[t] ? `${t} (${TICKER_NAMES[t]})` : t
 }
 
+/**
+ * Generic failure words, scoped to trader text only. They used to live in the
+ * app-wide URGENT_RE, where a routine paw report saying "could not find a new
+ * listing" woke the operator at 3am. Here they only ever see trader output,
+ * where an unreachable engine really is worth a page.
+ */
+const TRADER_ISSUE_RE = /\bALERT\b|unreachable|could not|did not start/i
+
+/**
+ * One classifier for trader messages (spec 5.1). Reports also go out at once
+ * because they are already a digest.
+ */
 export function isTraderIssue(text: string): boolean {
-  if (REPORT_RE.test(text)) return true // reports go out instantly, not in digest
-  return ISSUE_RE.test(text)
+  if (REPORT_RE.test(text)) return true
+  if (TRADER_ISSUE_RE.test(text)) return true
+  return isUrgent(text)
 }
 
 function ensureBufferTable(db: Database.Database): void {

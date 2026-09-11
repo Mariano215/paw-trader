@@ -8,6 +8,7 @@ import {
   maybeFireTraderDigest,
   readLastDigestMs,
 } from './notify-digest.js'
+import { renderProgressReport, type ProgressSnapshot } from './progress-monitor.js'
 
 describe('isTraderIssue', () => {
   it('flags real problems as instant', () => {
@@ -22,6 +23,35 @@ describe('isTraderIssue', () => {
     expect(isTraderIssue('EXECUTED: BUY QQQ $200 @ market')).toBe(false)
     expect(isTraderIssue('SKIPPED: SELL IWM (committee abstained)')).toBe(false)
     expect(isTraderIssue('TRADER: Reconciler auto-healed. Trading resumed.')).toBe(false)
+  })
+  it('treats the real daily readiness report as routine (buffered), not an instant issue', () => {
+    // Regression for Task 5 fix round 1: the readiness text goes through
+    // checkPaperProgress's `send`, which is makeDigestingSend's wrapped
+    // function. If a future wording change trips TRADER_ISSUE_RE or
+    // isUrgent(), this report would jump the daily/twice-daily digest and
+    // page the operator instantly instead.
+    const snapshot: ProgressSnapshot = {
+      checked_at: Date.now(),
+      mode: 'paper',
+      broker_connected: false,
+      halted: null,
+      accounting_fresh: false,
+      completed_entries: 234,
+      realized_recorded_fees: -966.46,
+      uncertain_exits: 0,
+      active_strategies: ['mean-reversion-stocks'],
+      paused_strategies: ['momentum-crypto'],
+      gate_evaluated_at: Date.now(),
+      gate_current: false,
+      blockers: [
+        'Engine/broker connectivity is unknown or unavailable.',
+        'Readiness evaluation is missing, stale or belongs to different strategy settings.',
+        'positive_expectancy: expectancy -0.01100 (win rate 45.3%, avgWin 0.0161, avgLoss 0.0335)',
+      ],
+      schedule: 'Health/progress: every 5 minutes while the bot runs. Daily summary: 17:00 America/New_York.',
+    }
+    const text = renderProgressReport(snapshot, null)
+    expect(isTraderIssue(text)).toBe(false)
   })
 })
 

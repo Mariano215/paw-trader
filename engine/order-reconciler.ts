@@ -4,7 +4,8 @@ import type { EngineOrder } from './types.js'
 import { DECISION_STATUS, OPEN_AT_BROKER, matchesBrokerOrder } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 import { renderAlert, explainLostOrder } from './plain-english.js'
-import { recordFill } from './audit-log.js'
+import { recordFill, upsertCumulativeOrderFill } from './audit-log.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 /**
  * How old a submitted/pending_fill decision must be (ms) before a missing
@@ -38,6 +39,7 @@ interface OpenRow {
   parent_decision_id: string | null
   /** Entry reference price resolved at dispatch; the slippage baseline. */
   entry_price: number | null
+  filled_qty: number | null
 }
 
 /**
@@ -54,9 +56,9 @@ function intendedPriceOf(row: OpenRow): number | null {
  * Reconcile every decision the brain believes is live at the broker
  * (submitted / pending_fill) against the engine's order snapshot.
  *
- * Source of truth is GET /orders -> EngineOrder[]. We match by
- * broker_order_id (engine_order_id on our side) and fall back to
- * client_order_id == decision.id. Transitions:
+ * Source of truth is GET /orders -> EngineOrder[]. We match the brain's
+ * engine_order_id to broker_order_id and fall back to the engine's persisted
+ * decision_id. Transitions:
  *   filled_qty > 0 and status terminal-filled  -> executed
  *   live but unfilled                          -> pending_fill
  *   canceled / rejected / expired              -> failed
@@ -69,17 +71,18 @@ export async function reconcileOpenOrders(
   client: EngineClient,
   send?: (text: string) => Promise<void>,
 ): Promise<ReconcileSummary> {
+  const reconcileStartedAt = Date.now()
   // Exit rows (status exit_submitted) are tracked alongside entries: a lost
   // exit means an open position is unmanaged while the duplicate guard blocks
   // any retry, so they MUST be reconciled against the broker every tick.
   const open = db
     .prepare(
       `SELECT id, asset, action, size_usd, engine_order_id, status, decided_at, parent_decision_id,
-              entry_price
+              entry_price, filled_qty
        FROM trader_decisions
-       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?, ?)`,
+       WHERE status IN (${OPEN_AT_BROKER.map(() => '?').join(',')}, ?, ?, ?)`,
     )
-    .all(...OPEN_AT_BROKER, DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN) as OpenRow[]
+    .all(...OPEN_AT_BROKER, DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN, DECISION_STATUS.EXECUTED) as OpenRow[]
 
   const summary: ReconcileSummary = {
     checked: open.length,
@@ -88,7 +91,17 @@ export async function reconcileOpenOrders(
     canceledOrRejected: 0,
     expiredOrphans: 0,
   }
-  if (open.length === 0) return summary
+  if (open.length === 0) {
+    recordTraderOperationalEvent(db, {
+      sourceTs: reconcileStartedAt,
+      source: 'brain.reconciler',
+      stage: 'reconcile',
+      eventType: 'reconcile.run.completed',
+      state: 'completed',
+      metadata: { checked: 0 },
+    })
+    return summary
+  }
 
   // Source of truth: the broker order snapshot. One call per tick.
   let orders: EngineOrder[]
@@ -97,6 +110,14 @@ export async function reconcileOpenOrders(
   } catch (err) {
     // Engine unreachable: do NOT mutate. Leave rows live; next tick retries.
     logger.warn({ err }, 'Order reconcile: getOrders failed, skipping (no mutation)')
+    recordTraderOperationalEvent(db, {
+      sourceTs: reconcileStartedAt,
+      source: 'brain.reconciler',
+      stage: 'reconcile',
+      eventType: 'reconcile.run.failed',
+      state: 'failed',
+      metadata: { checked: open.length, reason: 'engine_unreachable' },
+    })
     return summary
   }
 
@@ -107,6 +128,7 @@ export async function reconcileOpenOrders(
       // No broker record. Recent orders may still be propagating -- skip them.
       // Missing exits retain their ID for recovery, never blind replacement.
       // Entry orphan handling remains a separate historical policy.
+      if (row.status === DECISION_STATUS.EXECUTED) continue
       const age = Date.now() - row.decided_at
       const horizon = isExit ? EXIT_ORPHAN_HORIZON_MS : RECONCILE_ORPHAN_HORIZON_MS
       if (age < horizon) continue
@@ -143,10 +165,9 @@ export async function reconcileOpenOrders(
           `UPDATE trader_decisions SET status = ?, filled_qty = ?, filled_avg_price = ? WHERE id = ?`,
         ).run(status === 'filled' ? DECISION_STATUS.CLOSED : DECISION_STATUS.EXIT_SUBMITTED,
           filled, match.filled_avg_price ?? null, row.id)
-        recordFill(db, {
+        const fillInput = {
           decisionId:    row.id,
           clientOrderId: row.id,
-          brokerOrderId: match.broker_order_id ?? null,
           asset:         row.asset,
           side:          (row.action === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
           fillQty:       filled,
@@ -157,7 +178,12 @@ export async function reconcileOpenOrders(
           intendedTsMs:  row.decided_at,
           fillTsMs:      match.updated_at,
           feeUsd:        0,
-        }, Date.now(), `${match.broker_order_id ?? row.id}:${filled}`)
+        }
+        if (match.broker_order_id) {
+          upsertCumulativeOrderFill(db, {...fillInput, brokerOrderId: match.broker_order_id}, Date.now())
+        } else {
+          recordFill(db, {...fillInput, brokerOrderId: null}, Date.now(), `${row.id}:${filled}`)
+        }
         if (status === 'filled') summary.promotedToFilled++
         logger.info({ decisionId: row.id, asset: row.asset, filled, status }, 'Order reconcile: exit execution recorded')
       }
@@ -169,7 +195,8 @@ export async function reconcileOpenOrders(
       continue
     }
 
-    if (filled > 0 && (status === 'filled' || status === 'partially_filled')) {
+    if (filled > 0) {
+      if (row.filled_qty != null && filled < row.filled_qty) continue
       // Confirmed fill. Promote to executed and cache the fill numbers.
       // NOTE: for partially_filled the cached filled_qty may lag the final
       // total if the order continues filling. The verdict path calls
@@ -191,11 +218,9 @@ export async function reconcileOpenOrders(
       // computes slippage via computeSlippageUsd, but that returns 0 when
       // intendedPrice is null, and this call site never passed one. Passing the
       // decision's entry reference price fixes it without touching the engine.
-      const brokerFillId = `${match.broker_order_id ?? row.id}:${filled}`
-      recordFill(db, {
+      const fillInput = {
         decisionId:     row.id,
         clientOrderId:  row.id,
-        brokerOrderId:  match.broker_order_id ?? null,
         asset:          row.asset,
         side:           (row.action === 'sell' ? 'sell' : 'buy') as 'buy' | 'sell',
         fillQty:        filled,
@@ -204,9 +229,18 @@ export async function reconcileOpenOrders(
         intendedTsMs:   row.decided_at,
         fillTsMs:       match.updated_at,
         feeUsd:         0,
-      }, Date.now(), brokerFillId)
-      summary.promotedToFilled++
+      }
+      if (match.broker_order_id) {
+        upsertCumulativeOrderFill(db, {...fillInput, brokerOrderId: match.broker_order_id}, Date.now())
+      } else {
+        recordFill(db, {...fillInput, brokerOrderId: null}, Date.now(), `${row.id}:${filled}`)
+      }
+      if (row.status !== DECISION_STATUS.EXECUTED || row.filled_qty !== filled) summary.promotedToFilled++
       logger.info({ decisionId: row.id, asset: row.asset, filled }, 'Order reconcile: promoted to executed (filled)')
+    } else if (row.status === DECISION_STATUS.EXECUTED) {
+      // A previously observed partial fill remains real even when a later
+      // order snapshot is terminal or temporarily reports no fill.
+      continue
     } else if (status === 'canceled' || status === 'rejected' || status === 'expired') {
       db.prepare(`UPDATE trader_decisions SET status = ? WHERE id = ?`).run(
         DECISION_STATUS.FAILED,
@@ -223,5 +257,19 @@ export async function reconcileOpenOrders(
       summary.promotedToPending++
     }
   }
+  recordTraderOperationalEvent(db, {
+    sourceTs: reconcileStartedAt,
+    source: 'brain.reconciler',
+    stage: 'reconcile',
+    eventType: 'reconcile.run.completed',
+    state: summary.canceledOrRejected > 0 || summary.expiredOrphans > 0 ? 'warning' : 'completed',
+    metadata: {
+      checked: summary.checked,
+      promoted_to_filled: summary.promotedToFilled,
+      promoted_to_pending: summary.promotedToPending,
+      canceled_or_rejected: summary.canceledOrRejected,
+      expired_orphans: summary.expiredOrphans,
+    },
+  })
   return summary
 }

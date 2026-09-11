@@ -30,6 +30,8 @@ import type { EnginePosition } from './types.js'
 import { logger } from '../logger.js'
 import { DECISION_STATUS } from './order-lifecycle.js'
 import { isEquityMarketHours } from './signal-poller.js'
+import { notifyUnexpectedShortPositions, POSITION_QTY_EPSILON } from './position-safety.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 export const EXIT_MARK_MAX_AGE_MS = 5 * 60 * 1000
@@ -52,6 +54,7 @@ export interface OpenExitRow {
   horizon_days: number
   decided_at: number
   enrichment_json: string | null
+  cohort_id: string | null
 }
 
 export type ExitReason = 'stop' | 'target' | 'time' | 'momentum' | 'hold'
@@ -84,7 +87,7 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
   return db.prepare(`
     SELECT d.id, d.signal_id, d.asset, d.action, d.entry_price,
            d.stop_loss, d.take_profit, s.horizon_days, d.decided_at,
-           s.enrichment_json
+           s.enrichment_json, d.cohort_id
     FROM trader_decisions d
     JOIN trader_signals s ON s.id = d.signal_id
     WHERE d.status = 'executed'
@@ -159,7 +162,7 @@ export async function runExitSweep(
    * decides whether equities are tradeable.
    */
   opts?: { nowMs?: number; isMarketOpen?: () => boolean },
-): Promise<{ checked: number; exited: number; errors: number; drifted: number; skippedClosed: number }> {
+): Promise<{ checked: number; exited: number; errors: number; drifted: number; skippedClosed: number; unsafeShorts: number }> {
   // Preserve the decision ID across ambiguous transport failure. The engine's
   // durable idempotency contract either returns that order or creates it once.
   const uncertain = db.prepare("SELECT id, asset, action FROM trader_decisions WHERE status=?")
@@ -182,15 +185,17 @@ export async function runExitSweep(
     }
   }
   const candidates = findOpenExitCandidates(db)
-  if (candidates.length === 0) return { checked: 0, exited: recovered, errors: recoveryErrors, drifted: 0, skippedClosed: 0 }
+  if (candidates.length === 0) return { checked: 0, exited: recovered, errors: recoveryErrors, drifted: 0, skippedClosed: 0, unsafeShorts: 0 }
 
   let positions: EnginePosition[]
   try {
     positions = await engineClient.getPositions()
   } catch (err) {
     logger.warn({ err, candidates: candidates.length }, 'Exit sweep: getPositions failed')
-    return { checked: 0, exited: recovered, errors: 1 + recoveryErrors, drifted: 0, skippedClosed: 0 }
+    return { checked: 0, exited: recovered, errors: 1 + recoveryErrors, drifted: 0, skippedClosed: 0, unsafeShorts: 0 }
   }
+  const unsafeShorts = await notifyUnexpectedShortPositions(db, positions, send)
+  const unsafeShortAssets = new Set(unsafeShorts.map(position => position.asset))
   const hasPosition = (asset: string): EnginePosition | undefined =>
     positions.find(p => p.asset === asset && Math.abs(p.qty) > 1e-9)
 
@@ -232,6 +237,10 @@ export async function runExitSweep(
         drifted += 1
         continue
       }
+      if (unsafeShortAssets.has(row.asset) || pos.qty < -POSITION_QTY_EPSILON) {
+        logger.error({asset: row.asset, qty: pos.qty}, 'Exit sweep blocked: position is unexpectedly short')
+        continue
+      }
       checked += 1
 
       const mark = Math.abs(pos.market_value / pos.qty)
@@ -260,13 +269,13 @@ export async function runExitSweep(
       // an enforced FK to trader_signals(id) in production.
       db.prepare(`
         INSERT INTO trader_decisions
-          (id, signal_id, parent_decision_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, signal_id, parent_decision_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, cohort_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         exitDecisionId, row.signal_id, row.id, verdict.side, row.asset,
         0, 'market',
         `Auto-exit (${verdict.reason}): last=${last} entry=${row.entry_price} stop=${row.stop_loss} target=${row.take_profit}`,
-        1.0, nowMs, DECISION_STATUS.EXIT_SUBMITTED,
+        1.0, nowMs, DECISION_STATUS.EXIT_SUBMITTED, row.cohort_id,
       )
 
       try {
@@ -274,7 +283,7 @@ export async function runExitSweep(
         // The engine closes the entire position when size_usd <= 0. Sending
         // market_value would be interpreted as a share count and could
         // mis-size the close for fractional positions.
-        await engineClient.submitDecision({
+        const submission = await engineClient.submitDecision({
           decision_id: exitDecisionId,
           asset: row.asset,
           side: verdict.side,
@@ -283,6 +292,20 @@ export async function runExitSweep(
           entry_price: 0,
           strategy: 'exit',
           confidence: 1.0,
+        })
+        recordTraderOperationalEvent(db, {
+          eventId: `exit:${exitDecisionId}`,
+          sourceTs: nowMs,
+          source: 'brain.exit-evaluator',
+          stage: 'exit',
+          eventType: 'exit.order.submitted',
+          state: 'submitted',
+          asset: row.asset,
+          signalId: row.signal_id,
+          decisionId: exitDecisionId,
+          cohortId: row.cohort_id,
+          orderId: submission.broker_order_id ?? submission.client_order_id,
+          metadata: { side: verdict.side, exit_reason: verdict.reason, status: submission.status },
         })
       } catch (submitErr) {
         const msg = submitErr instanceof Error ? submitErr.message : String(submitErr)
@@ -327,5 +350,5 @@ export async function runExitSweep(
     )
   }
 
-  return { checked, exited, errors, drifted, skippedClosed }
+  return { checked, exited, errors, drifted, skippedClosed, unsafeShorts: unsafeShorts.length }
 }

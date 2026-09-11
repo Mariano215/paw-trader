@@ -12,6 +12,108 @@ function load(name: string, context: Record<string, unknown>): (...args: unknown
 }
 
 describe('PawTrader degraded dashboard states', () => {
+  it('labels the paused predeclared Bitcoin family as research, not invalidated', () => {
+    const state = load('_traderEvidenceLaneState', {})('crypto', [{
+      id: 'order-flow-imbalance-crypto', status: 'paused',
+    }], [{id: 'bitcoin-4h-v5', status: 'invalidated'}]) as {label: string; cohort: {id: string}}
+    expect(state.label).toBe('RESEARCH PAUSED')
+    expect(state.cohort.id).toBe('bitcoin-4h-v5')
+  })
+
+  it('renders fail-closed Bitcoin forward-research progress', () => {
+    const facts = load('_traderBitcoinResearchProgressFacts', {Date})({
+      declaration_at: Date.UTC(2026, 8, 9),
+      eligible_bars_total: 7,
+      ineligible_bars_total: 2,
+      collection_days_completed: 1,
+      minimum_forward_days: 180,
+      earliest_evaluation_at: Date.UTC(2027, 2, 8),
+      collection_mature: false,
+    }) as string[]
+    expect(facts).toEqual([
+      '7 / 9 eligible decision bars',
+      '1 / 180 forward days collected',
+      expect.stringContaining('Final evaluation no earlier than'),
+    ])
+  })
+
+  it.each([
+    ['passed', 'Frozen research evaluation passed · production review only'],
+    ['rejected_pre_holdout', 'Research rejected before holdout · no qualifying frozen variant'],
+    ['rejected', 'One-time holdout rejected the research family'],
+    ['error', 'Evaluation blocked by an integrity or execution-lock check'],
+  ])('renders the terminal frozen evaluation state %s', (evaluationStatus, expected) => {
+    const facts = load('_traderBitcoinResearchProgressFacts', {Date})({
+      declaration_at: Date.UTC(2026, 8, 9), eligible_bars_total: 100,
+      ineligible_bars_total: 2, collection_days_completed: 180,
+      minimum_forward_days: 180, collection_mature: true,
+      evaluation_status: evaluationStatus, evaluation_trade_count: 123,
+    }) as string[]
+    expect(facts).toContain(expected)
+    expect(facts).toContain('123 one-time holdout trades')
+  })
+
+  it('merges each operational event UUID into the visible tape once', () => {
+    const state = {
+      operationalSeen: {}, operationalEvents: [], operationalAnimated: {},
+      operationalPulseIds: {}, operationalStagePulses: {},
+    }
+    const merge = load('_mergeTraderOperationalEvents', {
+      TRADER_STATE: state,
+      _traderAgeMs: () => 0,
+      setTimeout: vi.fn(),
+      renderTraderMissionControl: vi.fn(),
+    })
+    const event = {event_id: 'event-1', seq: 1, stage: 'scheduler', source_ts: Date.now()}
+    merge([event, event], true)
+    merge([event], true)
+    expect(state.operationalEvents).toEqual([event])
+  })
+
+  it.each([
+    ['BTC/USD', true], ['BTCUSD', true], ['ETH/USDC', true], ['AAPL', false], ['BITO', false],
+  ])('classifies %s for the stock/crypto lanes', (asset, expected) => {
+    expect(load('_traderIsCrypto', {})(asset)).toBe(expected)
+  })
+
+  it('loads open orders independently from recent terminal history', async () => {
+    const state: Record<string, unknown> = {orders: [], strategies: []}
+    const fetchFromAPI = vi.fn()
+      .mockResolvedValueOnce([{client_order_id: 'open', status: 'accepted'}])
+      .mockResolvedValueOnce([{client_order_id: 'closed', status: 'filled'}])
+      .mockResolvedValueOnce({strategies: [{id: 'momentum-crypto', status: 'paused'}]})
+    const render = vi.fn()
+    await load('refreshTraderMissionControl', {TRADER_STATE: state, fetchFromAPI, renderTraderMissionControl: render, Date})()
+    expect(fetchFromAPI).toHaveBeenNthCalledWith(1, '/api/v1/trader/orders?status=open&limit=500&offset=0')
+    expect(fetchFromAPI).toHaveBeenNthCalledWith(2, '/api/v1/trader/orders?status=closed&limit=20&offset=0')
+    expect(state.orders).toEqual([
+      {client_order_id: 'open', status: 'accepted'},
+      {client_order_id: 'closed', status: 'filled'},
+    ])
+    expect(state.ordersAvailable).toBe(true)
+    expect(state.strategies).toEqual([{id: 'momentum-crypto', status: 'paused'}])
+    expect(render).toHaveBeenCalledOnce()
+  })
+
+  it('requires two deliberate clicks before canceling an order', () => {
+    const executeTraderOrderCancel = vi.fn()
+    const render = vi.fn()
+    const context = {
+      _armedCancelOrderId: null,
+      _armedCancelTimer: null,
+      executeTraderOrderCancel,
+      _renderMissionOrders: render,
+      setTimeout: vi.fn(() => 1),
+      clearTimeout: vi.fn(),
+    }
+    const arm = load('armTraderOrderCancel', context)
+    arm('order-1')
+    expect(executeTraderOrderCancel).not.toHaveBeenCalled()
+    expect(render).toHaveBeenCalledOnce()
+    arm('order-1')
+    expect(executeTraderOrderCancel).toHaveBeenCalledWith('order-1')
+  })
+
   it.each([true, false])('ticker distinguishes unknown holdings from a confirmed empty account: %s', stale => {
     const nodes: Array<{textContent: string; className: string; appendChild: ReturnType<typeof vi.fn>}> = []
     const document = {createElement: () => {
@@ -34,7 +136,7 @@ describe('PawTrader degraded dashboard states', () => {
         return node
       },
     }
-    await load('refreshTraderGateProgress', {document, Date, fetchFromAPI: vi.fn().mockResolvedValue({
+    await load('refreshTraderGateProgress', {document, Date, TRADER_STATE: {}, renderTraderMissionControl: vi.fn(), fetchFromAPI: vi.fn().mockResolvedValue({
       available: false, progress: {checked_at: Date.now() - (fresh ? 0 : 3600000)},
     })})()
     expect(nodes.map(n => n.textContent).join(' ')).toContain(fresh ? 'Daily update: 5 p.m. Eastern' : 'not yet confirmed or stale')
@@ -64,7 +166,7 @@ describe('PawTrader degraded dashboard states', () => {
     const state = {positions: [{asset: 'SPY', qty: 1}], positionsUpdatedAt: 100, positionsStale: false, verdictCursor: {loaded: true}}
     await load('refreshTraderCol1', {
       TRADER_STATE: state, fetchFromAPI: vi.fn().mockRejectedValue(new Error('offline')),
-      document: {getElementById: () => null}, _renderCol1: vi.fn(), _renderTraderTicker: vi.fn(),
+      document: {getElementById: () => null}, _renderCol1: vi.fn(), renderTraderMissionControl: vi.fn(),
     })()
     expect(state.positions).toEqual([{asset: 'SPY', qty: 1}])
     expect(state.positionsUpdatedAt).toBe(100)
@@ -74,8 +176,9 @@ describe('PawTrader degraded dashboard states', () => {
   it('renders unavailable accounting as unknown rather than stale unlabelled profit', async () => {
     const render = vi.fn()
     await load('refreshTraderKPI_brokerPnl', {
+      TRADER_STATE: {}, renderTraderMissionControl: vi.fn(),
       fetchFromAPI: vi.fn().mockResolvedValue({available: false}), _renderKpiCell: render,
     })()
-    expect(render).toHaveBeenCalledWith('kpi-realized', 'REALIZED P&L', '--', 'Accounting unavailable', null, null, null)
+    expect(render).toHaveBeenCalledWith('kpi-realized', 'CORRECTED NET P&L', '--', 'Accounting unavailable', null, null, null)
   })
 })

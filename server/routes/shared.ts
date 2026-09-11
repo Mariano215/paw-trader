@@ -17,8 +17,24 @@
  * anyway.
  */
 
+import type { Request, Response, NextFunction } from 'express'
 import { getBotDb, credDecryptForVerify } from '../db.js'
 import { logger } from '../logger.js'
+
+export const TRADER_PROJECT_ID = 'trader'
+
+export function canReadTraderProject(req: Request): boolean {
+  return Boolean(req.user?.isAdmin || req.scope?.allowedProjectIds?.includes(TRADER_PROJECT_ID))
+}
+
+/** 404, not 403, so non-members cannot tell the trader routes exist. */
+export function requireTraderProjectRead(req: Request, res: Response, next: NextFunction): void {
+  if (canReadTraderProject(req)) {
+    next()
+    return
+  }
+  res.status(404).json({ error: 'Not found' })
+}
 
 export const ENGINE_REQUEST_TIMEOUT_MS = 5000
 
@@ -33,6 +49,7 @@ export interface EngineHealth {
   // field. Dashboard null-coalesces to suppress the Coinbase pill in that
   // case rather than showing a misleading "Coinbase ERROR".
   coinbase_connected?: boolean
+  trade_updates_alive?: boolean
 }
 
 export interface EngineReconcile {

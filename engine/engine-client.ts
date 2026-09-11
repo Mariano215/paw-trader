@@ -2,6 +2,7 @@ import type {
   HealthResponse,
   EnginePosition,
   AdoptPositionResult,
+  CoverPaperShortResult,
   EngineOrder,
   ReconcileResult,
   Candidate,
@@ -61,6 +62,14 @@ export interface EngineClientOptions {
   baseUrl: string;
   token: string;
   timeoutMs?: number;
+}
+
+/** Test doubles and rolling deployments may not expose getAllOrders yet. */
+export async function readCompleteOrderHistory(client: EngineClient): Promise<EngineOrder[]> {
+  const compatible = client as EngineClient & {getAllOrders?: () => Promise<EngineOrder[]>}
+  return typeof compatible.getAllOrders === 'function'
+    ? compatible.getAllOrders()
+    : client.getOrders()
 }
 
 export class EngineClient {
@@ -215,6 +224,9 @@ export class EngineClient {
       coinbase_connected: typeof body.coinbase_connected === "boolean"
         ? body.coinbase_connected
         : undefined,
+      crypto_enabled: typeof body.crypto_enabled === "boolean"
+        ? body.crypto_enabled
+        : undefined,
     };
   }
 
@@ -235,8 +247,39 @@ export class EngineClient {
     );
   }
 
+  /** Paper-only, idempotent cover for an unexpected stock short. */
+  async coverPaperShort(asset: string): Promise<CoverPaperShortResult> {
+    return this.request<CoverPaperShortResult>(
+      `/positions/${encodeURIComponent(asset)}/cover-paper-short`,
+      {method: 'POST'},
+    )
+  }
+
   async getOrders(): Promise<EngineOrder[]> {
     return this.request<EngineOrder[]>("/orders");
+  }
+
+  /**
+   * Read complete order history from paginated engines. An older engine ignores
+   * the query and returns its legacy 100-row page; that short page terminates
+   * the loop safely and preserves backward compatibility during rollout.
+   */
+  async getAllOrders(pageSize = 500, maxOrders = 20_000): Promise<EngineOrder[]> {
+    const orders: EngineOrder[] = []
+    const seen = new Set<string>()
+    for (let offset = 0; offset < maxOrders; offset += pageSize) {
+      const page = await this.request<EngineOrder[]>(`/orders?limit=${pageSize}&offset=${offset}`)
+      let added = 0
+      for (const order of page) {
+        const key = order.client_order_id
+        if (seen.has(key)) continue
+        seen.add(key)
+        orders.push(order)
+        added++
+      }
+      if (page.length < pageSize || added === 0) break
+    }
+    return orders
   }
 
   async getReconcileLast(): Promise<ReconcileResult> {
@@ -371,6 +414,39 @@ export class EngineClient {
       `/backtest/momentum?days=${days}`,
       { signal: AbortSignal.timeout(120_000) },
     );
+  }
+
+  /** Frozen BTC/USD hourly pullback simulation. Never called on the trade tick. */
+  async getCryptoHourlyMeanReversionBacktest(hours = 8_760): Promise<BacktestResult> {
+    if (!Number.isInteger(hours) || hours < 500 || hours > 43_800) {
+      throw new Error('crypto backtest hours must be an integer from 500 to 43800')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-hourly-mean-reversion?hours=${hours}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
+  /** Deployed BTC-only daily breakout simulation. Never called on the trade tick. */
+  async getCryptoMomentumBacktest(days = 1_825): Promise<BacktestResult> {
+    if (!Number.isInteger(days) || days < 300 || days > 5_000) {
+      throw new Error('crypto momentum backtest days must be an integer from 300 to 5000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-momentum?days=${days}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
+  /** Frozen BTC/USD four-hour trend simulation. */
+  async getCryptoFourHourTrendBacktest(periods = 10_950): Promise<BacktestResult> {
+    if (!Number.isInteger(periods) || periods < 1_000 || periods > 12_000) {
+      throw new Error('crypto 4h backtest periods must be an integer from 1000 to 12000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-4h-trend?periods=${periods}`,
+      { signal: AbortSignal.timeout(300_000) },
+    )
   }
 
   async getPrices(asset: string, fromMs: number, toMs: number): Promise<PricePoint[]> {

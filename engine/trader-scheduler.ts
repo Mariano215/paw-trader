@@ -13,6 +13,7 @@ import {
   explainServiceBack,
 } from './plain-english.js'
 import { syncSignalStatuses } from './signal-state-sync.js'
+import type { CohortOperationalEvidence } from './cohort-scorecard.js'
 import { runCloseOutSweep } from './close-out-watcher.js'
 import { runExitSweep } from './exit-evaluator.js'
 import { maybeFireWeeklyReport } from './weekly-report.js'
@@ -37,6 +38,8 @@ import type { KillSwitchLogEntry } from './weekly-report.js'
 import { syncTraderTablesToServer } from './server-sync.js'
 import { checkPaperProgress } from './progress-monitor.js'
 import type { HealthResponse } from './types.js'
+import { notifyUnexpectedShortPositions } from './position-safety.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 /**
  * Interval between trader ticks. 5 minutes is the sweet spot:
@@ -164,9 +167,18 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // Reset them to 'pending' so the next tick picks them up; otherwise
   // autoDispatchPendingSignals' "WHERE status = 'pending'" query silently
   // returns 0 rows and the queue stays frozen across restarts.
+  // A signal that already owns a decision in retry_pending, submitting,
+  // submitted or pending_fill stays out of the fresh-dispatch queue; the
+  // retry sweep and reconcile own it, and re-queuing it could place a
+  // second order.
   try {
     const reset = deps.db
-      .prepare("UPDATE trader_signals SET status = 'pending' WHERE status = 'dispatching'")
+      .prepare(`UPDATE trader_signals SET status = 'pending'
+                 WHERE status = 'dispatching'
+                   AND id NOT IN (
+                     SELECT signal_id FROM trader_decisions
+                      WHERE status IN ('retry_pending', 'submitting', 'submitted', 'pending_fill')
+                   )`)
       .run()
     if (reset.changes > 0) {
       logger.warn(
@@ -300,6 +312,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
 }> {
   if (_tickInProgress) {
     logger.info('Trader tick skipped: previous tick still running')
+    recordTraderOperationalEvent(deps.db, {
+      source: 'brain.scheduler',
+      stage: 'scheduler',
+      eventType: 'scheduler.tick.skipped',
+      state: 'skipped',
+      metadata: { reason: 'overlap' },
+    })
     return {
       polled: false,
       sent: 0,
@@ -312,6 +331,16 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     }
   }
   _tickInProgress = true
+  const tickStartedAt = Date.now()
+  let tickCompleted = false
+  recordTraderOperationalEvent(deps.db, {
+    sourceTs: tickStartedAt,
+    recordedAt: tickStartedAt,
+    source: 'brain.scheduler',
+    stage: 'scheduler',
+    eventType: 'scheduler.tick.started',
+    state: 'started',
+  })
 
   let polled = false
   let sent = 0
@@ -440,6 +469,38 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
         _haltAlertSent = false
       }
       _phantomConfirm = {}
+    }
+
+    // Long-only invariant: broker truth must never contain a negative qty.
+    // Block only new exposure here; keep long exit management running so an
+    // unrelated safety anomaly cannot strand other holdings.
+    if (health) {
+      try {
+        const positions = await client.getPositions()
+        const shorts = await notifyUnexpectedShortPositions(deps.db, positions, deps.send)
+        if (shorts.length > 0) {
+          entriesBlocked = true
+          logger.error(
+            {shorts: shorts.map(position => ({asset: position.asset, qty: position.qty}))},
+            'Trader: unexpected short position blocks new entries',
+          )
+          if (health.alpaca_mode === 'paper' && (deps.isMarketOpen ?? isEquityMarketHours)()) {
+            for (const position of shorts) {
+              try {
+                const result = await client.coverPaperShort(position.asset)
+                logger.warn({asset: position.asset, qty: position.qty, result},
+                  'Trader: paper short cleanup requested')
+              } catch (coverErr) {
+                logger.error({err: coverErr, asset: position.asset, qty: position.qty},
+                  'Trader: automatic paper short cleanup failed; entries remain blocked')
+              }
+            }
+          }
+        }
+      } catch (positionErr) {
+        entriesBlocked = true
+        logger.warn({err: positionErr}, 'Trader: position snapshot unavailable, blocking new entries')
+      }
     }
 
     // Go-live gate enforcement: the engine must never run in live mode
@@ -757,6 +818,13 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
   //    nav_drop_alert) get a recordAlertFired call here; sharpe-flip
   //    self-records its own +1/-1 sign every tick inside the check.
   await runMonitorPhase(deps)
+  recordTraderOperationalEvent(deps.db, {
+    source: 'brain.scheduler-monitor',
+    stage: 'watchdog',
+    eventType: 'watchdog.check.completed',
+    state: 'completed',
+    metadata: { collector: 'scheduler_monitor_suite' },
+  })
 
   try {
     const { refreshAccountingSnapshot } = await import('./go-live-gate.js')
@@ -766,19 +834,95 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     logger.warn({ err }, 'Trader: accounting snapshot unavailable; retaining last known snapshot')
   }
 
+  // Prospective cohort scorecards use only cohort-linked fills. Recompute after
+  // close-out and verdict work so the dashboard and go-live gate see one
+  // internally consistent evidence snapshot. A score cannot pass on local
+  // fills alone: current paper-mode health, broker/data connectivity, a clean
+  // recent reconcile, and a current positive NAV snapshot are mandatory.
+  try {
+    const { refreshCohortScorecards } = await import('./cohort-scorecard.js')
+    const nowMs = Date.now()
+    let operations: CohortOperationalEvidence | undefined
+    try {
+      const client = deps.getEngineClient()
+      const [reconcile, nav] = await Promise.all([
+        client.getReconcileLast(),
+        client.getNavLatest('day_open'),
+      ])
+      operations = {
+        engineMode: observedHealth?.alpaca_mode ?? null,
+        brokerConnected: observedHealth?.alpaca_connected ?? null,
+        coinbaseConnected: observedHealth?.coinbase_connected ?? null,
+        cryptoEnabled: observedHealth?.crypto_enabled ?? null,
+        reconcilerHalted: observedHealth?.reconciler_halted ?? null,
+        reconcileDriftDetected: reconcile.drift_detected,
+        reconcileRanAt: reconcile.ran_at,
+        nav: nav?.nav ?? null,
+        navRecordedAt: nav?.recorded_at ?? null,
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Trader: cohort broker evidence unavailable; scorecard remains blocked')
+    }
+    const scorecards = refreshCohortScorecards(deps.db, nowMs, operations)
+    for (const scorecard of scorecards) {
+      if (scorecard.passed && scorecard.status === 'running') {
+        await deps.send(
+          `TRADER ALERT: ${scorecard.strategyId} paper cohort passed. ` +
+          `${scorecard.tradeCount} closed trades, $${scorecard.netPnlUsd.toFixed(2)} net P&L, ` +
+          `${(scorecard.maxDrawdownPct * 100).toFixed(2)}% max drawdown. ` +
+          'Strategy paused. Live capital still requires operator approval.',
+        ).catch(() => {})
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Trader: cohort scorecard refresh failed')
+  }
+
   // 7. Push a snapshot of all trader tables to the dashboard server so
   //    the Signal Queue and other cards always show current data. This runs
   //    after every phase so the server sees the latest state. Fire-and-forget
   //    -- a sync failure never stalls the tick or surfaces to the operator.
   try {
-    await checkPaperProgress(deps.db, observedHealth, deps.rawSend ?? deps.send)
+    await checkPaperProgress(deps.db, observedHealth, deps.send)
   } catch (err) {
     logger.warn({ err }, 'Trader: progress report failed; delivery will retry next tick')
   }
+  const tickFinishedAt = Date.now()
+  recordTraderOperationalEvent(deps.db, {
+    sourceTs: tickFinishedAt,
+    recordedAt: tickFinishedAt,
+    source: 'brain.scheduler',
+    stage: 'scheduler',
+    eventType: 'scheduler.tick.completed',
+    state: exitErrors > 0 ? 'warning' : 'completed',
+    metadata: {
+      duration_ms: tickFinishedAt - tickStartedAt,
+      polled,
+      sent,
+      reconciler_halted: reconcilerHalted,
+      closed_out: closedOut,
+      exited,
+      errors: exitErrors,
+      weekly_report_fired: weeklyReportFired,
+    },
+  })
+  tickCompleted = true
   void syncTraderTablesToServer(deps.db)
 
   return { polled, sent, reconcilerHalted, closedOut, exited, exitErrors, weeklyReportFired }
   } finally {
+    if (!tickCompleted) {
+      const tickFailedAt = Date.now()
+      recordTraderOperationalEvent(deps.db, {
+        sourceTs: tickFailedAt,
+        recordedAt: tickFailedAt,
+        source: 'brain.scheduler',
+        stage: 'scheduler',
+        eventType: 'scheduler.tick.failed',
+        state: 'failed',
+        metadata: { duration_ms: tickFailedAt - tickStartedAt },
+      })
+    }
     _tickInProgress = false
   }
 }

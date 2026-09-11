@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
-export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'symbol_cooldown' | 'portfolio_heat' | 'regime' | 'markov_gate' | 'already_held' | 'pending_order' | 'below_min_size'
+export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'symbol_cooldown' | 'portfolio_heat' | 'regime' | 'markov_gate' | 'already_held' | 'pending_order' | 'below_min_size' | 'no_running_cohort' | 'cohort_daily_cap'
 
 export interface SignalSuppressionSnapshot {
   signal_id: string
@@ -58,12 +59,13 @@ export function recordSignalSuppression(
   reason: SuppressionReason,
   suppressedAt = Date.now(),
 ): void {
+  const suppressionId = randomUUID()
   db.prepare(`
     INSERT INTO trader_signal_suppressions
       (id, signal_id, strategy_id, asset, side, reason, raw_score, enrichment_fingerprint, suppressed_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    randomUUID(),
+    suppressionId,
     snapshot.signal_id,
     snapshot.strategy_id,
     snapshot.asset,
@@ -73,6 +75,18 @@ export function recordSignalSuppression(
     fingerprintEnrichment(snapshot.enrichment_json),
     suppressedAt,
   )
+  recordTraderOperationalEvent(db, {
+    eventId: `suppression:${suppressionId}`,
+    sourceTs: suppressedAt,
+    source: 'brain.suppression',
+    stage: 'strategy',
+    eventType: 'strategy.signal.suppressed',
+    state: 'suppressed',
+    asset: snapshot.asset,
+    strategyId: snapshot.strategy_id,
+    signalId: snapshot.signal_id,
+    metadata: { reason, side: snapshot.side, score: snapshot.raw_score },
+  })
 }
 
 export function recordSignalSuppressionBySignalId(

@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
 import { logger } from '../logger.js'
 import type { EngineClient } from './engine-client.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 const SCORE_THRESHOLD = TRADER_SIGNAL_SCORE_THRESHOLD
 
@@ -182,8 +183,30 @@ export async function pollAndStoreSignals(
     const seenThisCycle = new Set<string>()
 
     for (const c of items) {
+      const strategyId = resolveStrategyId(c.strategy, c.asset)
+      const recordEvaluation = (state: 'succeeded' | 'suppressed' | 'skipped', reason: string): void => {
+        recordTraderOperationalEvent(db, {
+          eventId: `strategy-eval:${c.id}:${reason}`,
+          sourceTs: c.generated_at,
+          source: 'brain.signal-poller',
+          stage: 'strategy',
+          eventType: 'strategy.candidate.evaluated',
+          state,
+          asset: c.asset.toUpperCase(),
+          strategyId,
+          signalId: c.id,
+          metadata: {
+            reason,
+            side: c.side,
+            score: c.raw_score,
+            threshold: SCORE_THRESHOLD,
+            horizon_days: c.horizon_days,
+          },
+        })
+      }
       if (Math.abs(c.raw_score) < SCORE_THRESHOLD) {
         filtered += 1
+        recordEvaluation('suppressed', 'below_threshold')
         continue
       }
 
@@ -192,15 +215,16 @@ export async function pollAndStoreSignals(
       const isCrypto = c.asset.includes('/')
       if (!isCrypto && !isEquityMarketHours(c.generated_at)) {
         filtered += 1
+        recordEvaluation('suppressed', 'market_closed')
         continue
       }
 
-      const strategyId = resolveStrategyId(c.strategy, c.asset)
       const key = `${c.asset.toUpperCase()}|${c.side}`
 
       // Skip if already seen in this batch
       if (seenThisCycle.has(key)) {
         deduped += 1
+        recordEvaluation('skipped', 'duplicate_batch')
         continue
       }
 
@@ -209,6 +233,7 @@ export async function pollAndStoreSignals(
       if (existing) {
         deduped += 1
         seenThisCycle.add(key)
+        recordEvaluation('skipped', 'duplicate_pending')
         continue
       }
 
@@ -223,6 +248,7 @@ export async function pollAndStoreSignals(
       )
       seenThisCycle.add(key)
       stored += 1
+      recordEvaluation('succeeded', 'stored')
     }
     return { stored, filtered, deduped }
   })

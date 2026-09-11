@@ -140,10 +140,11 @@ router.get('/api/v1/trader/decisions', async (req: Request, res: Response) => {
   // rejected decisions as if they were still being voted on. An exact
   // status string filters to that status verbatim.
   const status = typeof req.query.status === 'string' ? req.query.status : null
-  const TERMINAL_STATUSES = [
-    'committee_abstain', 'executed', 'filled', 'rejected', 'closed',
-    'approved', 'order_placed', 'cancelled', 'expired', 'failed',
-  ]
+  // Terminal states per DECISION_STATUS in src/trader/order-lifecycle.ts.
+  // server/ has its own rootDir and cannot import that file, so this list
+  // is kept in sync by hand; do not add a status DECISION_STATUS does not
+  // define, or a stuck decision could silently disappear from this list.
+  const TERMINAL_STATUSES = ['executed', 'closed', 'failed', 'committee_abstain']
   let where = ''
   const params: unknown[] = []
   if (status === 'open') {

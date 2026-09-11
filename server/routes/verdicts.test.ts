@@ -82,6 +82,14 @@ beforeAll(async () => {
 
   const app = express()
   app.use(express.json())
+  // Test authorization is mocked out above; stand in for the admin caller
+  // the AUTH header name implies, since the new trader-project-membership
+  // guard reads req.user/req.scope directly rather than going through auth.js.
+  app.use((req, _res, next) => {
+    req.user = { id: 1, email: 'test@test.local', name: 'Test Admin', global_role: 'admin', isAdmin: true }
+    req.scope = { requestedProjectId: null, allowedProjectIds: null, isAdmin: true }
+    next()
+  })
   app.use(traderRouter)
 
   await new Promise<void>((resolve) => {

@@ -12,7 +12,7 @@ function row(over: Partial<OpenExitRow> = {}): OpenExitRow {
     id: 'd1', signal_id: 's1', asset: 'AAPL', action: 'buy',
     entry_price: 100, stop_loss: 92, take_profit: 116,
     horizon_days: 20, decided_at: Date.now(),
-    enrichment_json: null,
+    enrichment_json: null, cohort_id: null,
     ...over,
   }
 }
@@ -145,6 +145,26 @@ describe('runExitSweep', () => {
     expect(closing.signal_id).toBe('s1')
     expect(closing.parent_decision_id).toBe('d1')
     expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  it('never sends another sell when the broker position is unexpectedly short', async () => {
+    const db = makeDb()
+    const submitDecision = vi.fn()
+    const send = vi.fn().mockResolvedValue(undefined)
+    const client = {
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'AAPL', qty: -3, avg_entry_price: 100, market_value: -270, unrealized_pnl: 30, source: 'broker', updated_at: MARKET_OPEN_MS },
+      ]),
+      getPrices: vi.fn().mockResolvedValue([]),
+      submitDecision,
+    } as unknown as EngineClient
+
+    const out = await runExitSweep(db, client, send, { nowMs: MARKET_OPEN_MS })
+
+    expect(out.unsafeShorts).toBe(1)
+    expect(submitDecision).not.toHaveBeenCalled()
+    expect(send).toHaveBeenCalledWith(expect.stringContaining('UNEXPECTED SHORT POSITION'))
+    expect(db.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE parent_decision_id='d1'").get()).toEqual({n: 0})
   })
 
   it('does nothing when the asset has no live position', async () => {

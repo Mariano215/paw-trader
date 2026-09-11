@@ -51,7 +51,7 @@
  * the production engine mid-session. OBSERVE + ANALYZE + REPORT still run
  * ungated at 4, so regression digests keep landing in Telegram automatically.
  *
- * The live row had drifted to 6, so `enforceRetrainRegimeApprovalThreshold`
+ * The live row had drifted to 6, so `enforcePawApprovalThresholds`
  * reconciles it at boot rather than trusting a one-time seed.
  */
 export const TRAIN_REGIME_APPROVAL_THRESHOLD = 4

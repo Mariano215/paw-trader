@@ -54,6 +54,8 @@ describe('runRetrySweep', () => {
     expect(client.submitDecision).toHaveBeenCalledWith(expect.objectContaining({
       entry_price: 100, stop_loss: 92, take_profit: 116, strategy: 'momentum-stocks',
     }))
+    expect(db.prepare("SELECT event_type, state, decision_id, order_id FROM trader_operational_events WHERE decision_id='d1'").get())
+      .toEqual({ event_type: 'broker.order.retry_submitted', state: 'submitted', decision_id: 'd1', order_id: 'boid-2' })
   })
 
   it('does NOT resend when the order already exists at the broker (dedup)', async () => {

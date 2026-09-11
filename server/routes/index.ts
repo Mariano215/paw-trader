@@ -7,6 +7,7 @@
  */
 
 import { Router } from 'express'
+import { requireTraderProjectRead } from './shared.js'
 import statusRoutes from './status.js'
 import strategiesRoutes from './strategies.js'
 import verdictsRoutes from './verdicts.js'
@@ -15,8 +16,11 @@ import auditLogRoutes from './audit-log.js'
 import signalsRoutes from './signals.js'
 import syncRoutes from './sync.js'
 import bypassProgressRoutes from './bypass-progress.js'
+import operationalEventsRoutes from './operational-events.js'
 
 const router = Router()
+
+router.use('/api/v1/trader', requireTraderProjectRead)
 
 router.use(statusRoutes)
 router.use(strategiesRoutes)
@@ -26,5 +30,6 @@ router.use(auditLogRoutes)
 router.use(signalsRoutes)
 router.use(syncRoutes)
 router.use(bypassProgressRoutes)
+router.use(operationalEventsRoutes)
 
 export default router

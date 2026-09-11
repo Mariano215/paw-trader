@@ -20,6 +20,7 @@ import { HARD_CEILING_USD } from './trader-constants.js'
 import type { EngineClient } from './engine-client.js'
 import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
 import type { LadderResult } from './autonomy-ladder.js'
+import { activateCohort, createDraftCohort, COHORT_ENFORCEMENT_KV_KEY } from './evaluation-cohort.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -146,6 +147,68 @@ describe('decision-dispatcher', () => {
     const row = db.prepare("SELECT status, engine_order_id FROM trader_decisions WHERE signal_id = 'sig-auto-1'").get() as any
     expect(row.status).toBe('submitted')
     expect(row.engine_order_id).toBe('boid-9')
+    const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(payload.entry_type).toBe('limit')
+    expect((db.prepare("SELECT entry_type FROM trader_decisions WHERE signal_id = 'sig-auto-1'").get() as any).entry_type).toBe('limit')
+  })
+
+  it('auto-dispatch fails closed before committee work when broker positions are unavailable', async () => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-no-positions', 'momentum-stocks', 'MSFT', 'buy', 0.7, 20, ?, 'pending')
+    `).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee(150))
+    vi.mocked(mockClient.getPositions!).mockRejectedValue(new Error('position feed unavailable'))
+
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: committee },
+      mockClient as EngineClient,
+    )
+
+    expect(committee).not.toHaveBeenCalled()
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-no-positions'").get() as any).status).toBe('pending')
+  })
+
+  it('blocks auto-dispatch before committee when cohort enforcement has no running cohort', async () => {
+    db.exec('CREATE TABLE kv_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+    db.prepare("INSERT OR REPLACE INTO kv_settings (key,value) VALUES (?, '1')").run(COHORT_ENFORCEMENT_KV_KEY)
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-no-cohort','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-no-cohort'").get() as {status:string}).status)
+      .toBe('suppressed_no_running_cohort')
+  })
+
+  it('attributes every submitted auto decision to the running frozen cohort', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-test', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-test', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-cohort','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id:'cohort-client', broker_order_id:'cohort-broker', status:'placed', approved_size_usd:150,
+    })
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: makeApproveCommittee(150)}, mockClient as EngineClient)
+    expect((db.prepare("SELECT status,cohort_id FROM trader_decisions WHERE signal_id='sig-cohort'").get() as
+      {status:string; cohort_id:string})).toEqual({status:'submitted', cohort_id:'stocks-paper-test'})
   })
 
   it('passes committee-sized amount to the engine (not Phase-1 default) when committee returns size_usd', async () => {
@@ -483,11 +546,13 @@ describe('decision-dispatcher', () => {
 
 describe('autoDispatchPendingSignals', () => {
   let testDb: Database.Database
+  let positionSafeClient: EngineClient
 
   beforeEach(() => {
     testDb = new Database(':memory:')
     testDb.pragma('foreign_keys = OFF')
     initTraderTables(testDb)
+    positionSafeClient = {getPositions: vi.fn().mockResolvedValue([])} as unknown as EngineClient
   })
 
   it('marks signal suppressed_committee_abstain when committee abstains', async () => {
@@ -509,7 +574,7 @@ describe('autoDispatchPendingSignals', () => {
         errors: [],
       },
     })
-    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
     const row = testDb.prepare("SELECT status FROM trader_signals WHERE id='auto-s1'").get() as any
     expect(row.status).toBe('suppressed_committee_abstain')
   })
@@ -532,7 +597,7 @@ describe('autoDispatchPendingSignals', () => {
         errors: [],
       },
     })
-    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee, alertOnReject: true })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee, alertOnReject: true }, positionSafeClient)
     expect(send).toHaveBeenCalledTimes(1)
     expect(send.mock.calls[0][0]).toContain('MSFT')
   })
@@ -557,8 +622,8 @@ describe('autoDispatchPendingSignals', () => {
     })
     // Call twice sequentially (not concurrent -- SQLite is single-threaded)
     // First call should process, second should find no pending signals
-    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
-    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
     expect(stubCommittee).toHaveBeenCalledTimes(1)
   })
 
@@ -600,7 +665,7 @@ describe('autoDispatchPendingSignals', () => {
         errors: [],
       },
     })
-    const fakeEngine = { submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
+    const fakeEngine = { getPositions: vi.fn().mockResolvedValue([]), submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
 
     await autoDispatchPendingSignals(
       testDb,
@@ -643,7 +708,7 @@ describe('autoDispatchPendingSignals', () => {
         errors: [],
       },
     })
-    const fakeEngine = { submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
+    const fakeEngine = { getPositions: vi.fn().mockResolvedValue([]), submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
     const deps = { send: async () => {}, runCommittee: stubCommittee as any, runAgent: (async () => '') as any }
 
     await autoDispatchPendingSignals(testDb, deps, fakeEngine)
@@ -696,7 +761,7 @@ describe('autoDispatchPendingSignals', () => {
       runAgent: async () => ({ text: null }),
     }
 
-    await autoDispatchPendingSignals(testDb, deps)
+    await autoDispatchPendingSignals(testDb, deps, positionSafeClient)
 
     const sig = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-outer'`).get() as { status: string }
     expect(sig.status).toBe('failed')

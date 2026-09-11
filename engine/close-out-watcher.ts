@@ -36,6 +36,7 @@ import {
   type AgentAttribution,
 } from './verdict-engine.js'
 import type { CommitteeTranscript } from './committee.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 interface StrategyRow {
   asset_class: string
@@ -55,6 +56,7 @@ export interface OpenDecisionRow {
    *  an aggregate close across every open decision for the asset. */
   filled_qty: number | null
   filled_avg_price: number | null
+  cohort_id?: string | null
 }
 
 interface SignalRow {
@@ -107,7 +109,7 @@ export function findOpenDecisions(db: Database.Database): OpenDecisionRow[] {
   // reconciler on filled_qty>0). The submit-ACK no longer lands here.
   return db.prepare(`
     SELECT id, signal_id, asset, action, size_usd, thesis, decided_at, committee_transcript_id,
-           filled_qty, filled_avg_price
+           filled_qty, filled_avg_price, cohort_id
     FROM trader_decisions
     WHERE status = 'executed'
       AND id NOT IN (SELECT decision_id FROM trader_verdicts)
@@ -393,6 +395,23 @@ export function processClosure(
   )
 
   db.prepare(`UPDATE trader_decisions SET status = 'closed' WHERE id = ?`).run(decision.id)
+  recordTraderOperationalEvent(db, {
+    eventId: `verdict:${verdictId}`,
+    sourceTs: canonicalOutcome.closedAtMs,
+    source: 'brain.verdict-engine',
+    stage: 'verdict',
+    eventType: 'verdict.trade.committed',
+    state: 'completed',
+    asset: decision.asset,
+    signalId: decision.signal_id,
+    decisionId: decision.id,
+    cohortId: decision.cohort_id ?? null,
+    metadata: {
+      pnl_net: canonicalOutcome.pnlNet,
+      thesis_grade: canonicalOutcome.thesisGrade,
+      returns_backfilled: returnsBackfilled === 1,
+    },
+  })
 
   // ReasoningBank insert + track-record recompute. Both must NOT roll
   // back the verdict on failure -- the verdict is the source of truth
@@ -545,6 +564,19 @@ function closeUngraded(
     SET status = 'closed', ungraded_at = ?, ungraded_reason = ?
     WHERE id = ?
   `).run(nowMs, reason, decision.id)
+  recordTraderOperationalEvent(db, {
+    eventId: `ungraded:${decision.id}:${reason}`,
+    sourceTs: nowMs,
+    source: 'brain.verdict-engine',
+    stage: 'verdict',
+    eventType: 'verdict.trade.ungraded',
+    state: 'warning',
+    asset: decision.asset,
+    signalId: decision.signal_id,
+    decisionId: decision.id,
+    cohortId: decision.cohort_id ?? null,
+    metadata: { reason },
+  })
   try {
     recomputeRealizedPnlForAsset(db, decision.asset)
   } catch (err) {

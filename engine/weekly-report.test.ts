@@ -1058,11 +1058,12 @@ describe('ungraded closures', () => {
     reason: string,
     at: number,
     sizeUsd = 1000,
+    cohortId: string | null = 'test-paper-cohort',
   ) {
     insertSignal(db, `sig-${decisionId}`, 'momentum-stocks', 'AAPL', 'buy')
     insertDecision(db, decisionId, `sig-${decisionId}`, 'AAPL', sizeUsd, at - 60_000)
-    db.prepare("UPDATE trader_decisions SET status='closed', ungraded_at=?, ungraded_reason=? WHERE id=?")
-      .run(at, reason, decisionId)
+    db.prepare("UPDATE trader_decisions SET status='closed', ungraded_at=?, ungraded_reason=?, cohort_id=? WHERE id=?")
+      .run(at, reason, cohortId, decisionId)
   }
 
   it('counts in-window ungraded closures with their notional', () => {
@@ -1079,21 +1080,17 @@ describe('ungraded closures', () => {
     expect(u.allTime).toBe(2)
   })
 
-  it('keeps the migration backlog out of the in-window count', () => {
-    // Migration 7 stamped legacy rows with decided_at, so some land inside a
-    // window by accident. Counting them as this week's failures would make an
-    // old backlog look like a fresh outbreak.
+  it('keeps pre-cohort legacy closures out of current and all-time counts', () => {
     const db = makeDb()
     const { weekStartMs, weekEndMs } = computeWeekBoundary(SUN_APR_19_9AM_UTC)
     const inside = weekStartMs + 86_400_000
-    stampUngraded(db, 'dec-old', 'legacy-backfill', inside, 900)
+    stampUngraded(db, 'dec-old', 'legacy-backfill', inside, 900, null)
     stampUngraded(db, 'dec-new', 'no-fill-data', inside, 100)
 
     const u = summarizeUngraded(db, weekStartMs, weekEndMs)
     expect(u.inWindow).toBe(1)
     expect(u.notionalUsd).toBe(100)
-    // Still visible in the lifetime figure -- hidden from the week, not erased.
-    expect(u.allTime).toBe(2)
+    expect(u.allTime).toBe(1)
   })
 
   it('excludes ungraded closures from outside the window', () => {

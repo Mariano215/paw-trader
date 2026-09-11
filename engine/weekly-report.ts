@@ -127,14 +127,14 @@ export interface KillSwitchLogEntry {
 
 /**
  * Closures that reached a terminal state with no verdict, grouped by reason.
- * `legacy-backfill` rows are the pre-2026-08-17 backlog stamped at migration
- * time; they are counted separately so they never look like fresh activity.
+ * Only prospective cohort-linked closures are counted. Pre-cohort rows remain
+ * in the DB for audit but cannot describe the active paper evaluation.
  */
 export interface UngradedSummary {
   inWindow: number
   notionalUsd: number
   byReason: Array<{ reason: string; count: number; notionalUsd: number }>
-  /** Verdict-less closures across all time, including the pre-tracking backlog. */
+  /** Verdict-less prospective cohort closures across all time. */
   allTime: number
 }
 
@@ -546,12 +546,7 @@ export function summarizeUngraded(
              COALESCE(SUM(size_usd), 0)              AS notional
       FROM trader_decisions
       WHERE ungraded_at >= ? AND ungraded_at <= ?
-        -- Migration 7 stamped the pre-tracking backlog with decided_at, so
-        -- some of those rows fall inside a report window by accident. They
-        -- are old closures discovered late, not activity from this week, and
-        -- counting them as in-window would overstate the current failure rate.
-        -- They stay visible in the all-time line below.
-        AND COALESCE(ungraded_reason, '') <> 'legacy-backfill'
+        AND cohort_id IS NOT NULL
       GROUP BY reason
       ORDER BY count DESC
     `).all(weekStartMs, weekEndMs) as Array<{ reason: string; count: number; notional: number }>
@@ -560,6 +555,7 @@ export function summarizeUngraded(
       SELECT COUNT(*) AS c
       FROM trader_decisions
       WHERE status = 'closed'
+        AND cohort_id IS NOT NULL
         AND id NOT IN (SELECT decision_id FROM trader_verdicts)
     `).get() as { c: number }).c
 
@@ -999,10 +995,11 @@ function renderMoneySummary(report: WeeklyReport): string {
  *   position-drift    -- broker flat, entry older than the /orders window
  *   no-realized-lots  -- broker flat, no FIFO lot matched this decision
  *   partial-stale     -- exit fills never covered the entry, past terminal age
- *   legacy-backfill   -- pre-2026-08-17 backlog, stamped at migration time
+ * Pre-cohort closures are retained in the DB for forensic audit and excluded
+ * from this prospective-cohort report.
  */
 function renderUngradedSection(u: UngradedSummary): string {
-  const backlog = `<div class="muted">${u.allTime} verdict-less closures across all time, including the pre-tracking backlog.</div>`
+  const backlog = `<div class="muted">${u.allTime} verdict-less prospective closures across all cohorts.</div>`
   if (u.inWindow === 0) {
     return `<div class="muted">Every closure this window produced a verdict.</div>${backlog}`
   }

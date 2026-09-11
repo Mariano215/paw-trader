@@ -39,6 +39,9 @@ import {
   explainUnexpectedFailure,
 } from './plain-english.js'
 import { HARD_CEILING_USD } from './trader-constants.js'
+import { findUnexpectedShortPositions, notifyUnexpectedShortPositions } from './position-safety.js'
+import { countCohortEntriesToday, guardRunningCohort } from './evaluation-cohort.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 
 export interface AutoDispatchResult {
   signalId:  string
@@ -185,6 +188,21 @@ export async function dispatchApproval(
     return 'Error: signal not found. Trade not placed.'
   }
 
+  // Once prospective cohort enforcement is enabled, no manual approval may
+  // spend committee budget or reach the broker outside its frozen experiment.
+  const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
+  if (!cohortGuard.ok) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_no_running_cohort' WHERE id=?").run(signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, 'no_running_cohort')
+    return `Trade blocked: ${cohortGuard.reason}. No order placed.`
+  }
+  const cohort = cohortGuard.cohort
+  if (cohort && countCohortEntriesToday(db, cohort.id) >= cohort.daily_trade_cap) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_cohort_daily_cap' WHERE id=?").run(signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
+    return `Cohort daily trade cap reached (${cohort.daily_trade_cap}). No order placed.`
+  }
+
   const decisionId = randomUUID()
   const now = Date.now()
 
@@ -293,15 +311,15 @@ export async function dispatchApproval(
   if (committeeResult.decision === 'abstain') {
     db.prepare(`
       INSERT INTO trader_decisions
-        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, committee_transcript_id, decided_at, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, committee_transcript_id, decided_at, status, cohort_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       decisionId, signal.id, 'abstain', signal.asset,
       0, 'none',
       committeeResult.thesis,
       committeeResult.confidence,
       committeeResult.transcript_id,
-      now, 'committee_abstain',
+      now, 'committee_abstain', cohort?.id ?? null,
     )
     recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', now)
     db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
@@ -342,7 +360,18 @@ export async function dispatchApproval(
       )
       return null
     })
-    const manualSizePositions = await engineClient!.getPositions().catch(() => [] as EnginePosition[])
+    let manualSizePositions: EnginePosition[]
+    try {
+      manualSizePositions = await engineClient!.getPositions()
+    } catch (err) {
+      logger.warn({err}, 'Manual dispatch blocked: broker positions unavailable')
+      return 'Trade blocked: broker positions are unavailable. No order placed.'
+    }
+    const manualShorts = findUnexpectedShortPositions(manualSizePositions)
+    if (manualShorts.length > 0) {
+      return `Trade blocked: unexpected short position ${manualShorts.map(p => `${p.asset} ${p.qty}`).join(', ')}. ` +
+        'Flatten it at the broker and reconcile fills before placing another entry.'
+    }
 
     const stratRow = db
       .prepare('SELECT max_size_usd FROM trader_strategies WHERE id = ?')
@@ -495,8 +524,8 @@ export async function dispatchApproval(
 
     db.prepare(`
       INSERT INTO trader_decisions
-        (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status, engine_order_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status, engine_order_id, cohort_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       decisionId, signal.id,
       committeeResult.action ?? signal.side,
@@ -510,9 +539,29 @@ export async function dispatchApproval(
       committeeResult.transcript_id,
       now, 'submitted',
       result.broker_order_id ?? null,
+      cohort?.id ?? null,
     )
 
     db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
+    recordTraderOperationalEvent(db, {
+      eventId: `submission:${decisionId}`,
+      sourceTs: now,
+      source: 'brain.dispatcher',
+      stage: 'broker',
+      eventType: 'broker.order.submitted',
+      state: 'submitted',
+      asset: signal.asset,
+      strategyId: signal.strategy_id,
+      signalId: signal.id,
+      decisionId,
+      cohortId: cohort?.id ?? null,
+      orderId: result.broker_order_id ?? result.client_order_id,
+      metadata: {
+        side: committeeResult.action ?? signal.side,
+        size_usd: result.approved_size_usd,
+        status: result.status,
+      },
+    })
     // Close any pending duplicates for the same asset+side -- trade already placed.
     closeSiblingPendingSignals(db, signal.id, signal.strategy_id, signal.asset, signal.side, now)
 
@@ -575,9 +624,18 @@ export async function autoDispatchPendingSignals(
     }
     brokerPositions = await engineClient.getPositions()
   } catch (err) {
-    // Engine unreachable: leave undefined so the guard falls back to DB rows.
-    // Conservative direction (may over-suppress, never over-trades).
-    logger.warn({ err }, 'auto-dispatch: broker positions unavailable, re-entry guard falls back to DB state')
+    // Current broker exposure is required before adding risk. Leave pending
+    // signals untouched so they can resume after the position feed recovers.
+    logger.warn({ err }, 'auto-dispatch blocked: broker positions unavailable')
+    return []
+  }
+  const unexpectedShorts = await notifyUnexpectedShortPositions(db, brokerPositions, deps.send)
+  if (unexpectedShorts.length > 0) {
+    logger.error(
+      {shorts: unexpectedShorts.map(p => ({asset: p.asset, qty: p.qty}))},
+      'auto-dispatch blocked: unexpected short position',
+    )
+    return []
   }
 
   for (const signal of pending) {
@@ -595,6 +653,24 @@ export async function autoDispatchPendingSignals(
       if (!strategy || strategy.status === 'paused') {
         db.prepare("UPDATE trader_signals SET status = 'suppressed_strategy_paused' WHERE id = ?")
           .run(signal.id)
+        continue
+      }
+
+      // Prospective evidence boundary. This runs before every costly or
+      // mutating gate. A config mismatch invalidates the cohort and pauses the
+      // strategy atomically inside guardRunningCohort.
+      const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
+      if (!cohortGuard.ok) {
+        logger.warn({signalId: signal.id, strategyId: signal.strategy_id, reason: cohortGuard.reason},
+          'auto-dispatch blocked: no valid running cohort')
+        db.prepare("UPDATE trader_signals SET status='suppressed_no_running_cohort' WHERE id=?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'no_running_cohort')
+        continue
+      }
+      const cohort = cohortGuard.cohort
+      if (cohort && countCohortEntriesToday(db, cohort.id) >= cohort.daily_trade_cap) {
+        db.prepare("UPDATE trader_signals SET status='suppressed_cohort_daily_cap' WHERE id=?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
         continue
       }
 
@@ -1009,19 +1085,19 @@ export async function autoDispatchPendingSignals(
         // leaving the row in a state that triggers a duplicate next tick.
         db.prepare(`
           INSERT INTO trader_decisions
-            (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status, cohort_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           decisionId, signal.id,
           committeeResult.action ?? signal.side,
-          signal.asset, sizeUsd, 'market',
+          signal.asset, sizeUsd, 'limit',
           entryRef,
           exits.stopLoss,
           exits.takeProfit,
           committeeResult.thesis,
           committeeResult.confidence,
           committeeResult.transcript_id,
-          now, 'submitting',
+          now, 'submitting', cohort?.id ?? null,
         )
 
         let engineResult: Awaited<ReturnType<EngineClient['submitDecision']>>
@@ -1031,7 +1107,7 @@ export async function autoDispatchPendingSignals(
             asset:        signal.asset,
             side:         committeeResult.action ?? signal.side,
             size_usd:     sizeUsd,
-            entry_type:   'market',
+            entry_type:   'limit',
             entry_price:  entryRef,
             ...(exits.stopLoss != null ? { stop_loss: exits.stopLoss } : {}),
             ...(exits.takeProfit != null ? { take_profit: exits.takeProfit } : {}),
@@ -1075,6 +1151,25 @@ export async function autoDispatchPendingSignals(
         db.prepare("UPDATE trader_decisions SET status = 'submitted', engine_order_id = ? WHERE id = ?")
           .run(engineResult.broker_order_id ?? null, decisionId)
         db.prepare("UPDATE trader_signals SET status = 'submitted' WHERE id = ?").run(signal.id)
+        recordTraderOperationalEvent(db, {
+          eventId: `submission:${decisionId}`,
+          sourceTs: now,
+          source: 'brain.dispatcher',
+          stage: 'broker',
+          eventType: 'broker.order.submitted',
+          state: 'submitted',
+          asset: signal.asset,
+          strategyId: signal.strategy_id,
+          signalId: signal.id,
+          decisionId,
+          cohortId: cohort?.id ?? null,
+          orderId: engineResult.broker_order_id ?? engineResult.client_order_id,
+          metadata: {
+            side: committeeResult.action ?? signal.side,
+            size_usd: sizeUsd,
+            status: engineResult.status,
+          },
+        })
 
         const result: AutoDispatchResult = {
           signalId: signal.id,

@@ -7,6 +7,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import {
   recordFill, listFillsForDecision, computeSlippageUsd,
+  upsertCumulativeOrderFill,
   matchLotsFifo, recomputeRealizedPnl, recomputeRealizedPnlForAsset, LOT_MATCH_RULE,
   type FillRow,
 } from './audit-log.js'
@@ -74,6 +75,52 @@ describe('recordFill immutability', () => {
     recordFill(db, base, 3000, 'pinned-1')
     recordFill(db, base, 3000, 'pinned-1')
     expect(listFillsForDecision(db, 'd1')).toHaveLength(1)
+  })
+})
+
+describe('upsertCumulativeOrderFill', () => {
+  it('replaces a smaller partial snapshot instead of summing cumulative quantities', () => {
+    const db = makeDb()
+    const base = {
+      decisionId: 'exit-1', clientOrderId: 'client-1', brokerOrderId: 'broker-1',
+      asset: 'IWM', side: 'sell' as const, fillPrice: 100, fillTsMs: 2000,
+    }
+    recordFill(db, {...base, fillQty: 3}, 2000, 'broker-1:3')
+
+    upsertCumulativeOrderFill(db, {...base, fillQty: 6, fillPrice: 101, fillTsMs: 3000}, 3000)
+
+    const rows = listFillsForDecision(db, 'exit-1')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].fill_qty).toBe(6)
+    expect(rows[0].fill_price).toBe(101)
+  })
+
+  it('does not let an older smaller snapshot roll a final quantity backward', () => {
+    const db = makeDb()
+    const base = {
+      decisionId: 'entry-1', clientOrderId: 'client-1', brokerOrderId: 'broker-1',
+      asset: 'DBC', side: 'buy' as const, fillPrice: 30, fillTsMs: 3000,
+    }
+    upsertCumulativeOrderFill(db, {...base, fillQty: 65}, 3000)
+    upsertCumulativeOrderFill(db, {...base, fillQty: 62, fillTsMs: 2000}, 4000)
+
+    expect(listFillsForDecision(db, 'entry-1')).toEqual([
+      expect.objectContaining({fill_qty: 65, fill_ts_ms: 3000}),
+    ])
+  })
+
+  it('does not rewrite an unchanged cumulative snapshot', () => {
+    const db = makeDb()
+    const input = {
+      decisionId: 'entry-1', clientOrderId: 'client-1', brokerOrderId: 'broker-1',
+      asset: 'DBC', side: 'buy' as const, fillQty: 65, fillPrice: 30, fillTsMs: 3000,
+    }
+    upsertCumulativeOrderFill(db, input, 3000)
+    upsertCumulativeOrderFill(db, input, 4000)
+
+    expect(listFillsForDecision(db, 'entry-1')).toEqual([
+      expect.objectContaining({fill_qty: 65, fill_ts_ms: 3000, recorded_at: 3000}),
+    ])
   })
 })
 

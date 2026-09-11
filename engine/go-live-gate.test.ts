@@ -102,6 +102,23 @@ describe('computeBrokerTruth', () => {
     expect(t.realizedTotal).toBe(0)
   })
 
+  it('excludes autonomous short-cover repairs from strategy P&L', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_fills
+      (id, decision_id, client_order_id, broker_order_id, asset, side, fill_qty, fill_price, fill_ts_ms, fee_usd, slippage_usd, recorded_at)
+      VALUES ('repair-fill', 'repair-cover-old', 'repair-cover-old', 'repair-broker-old', 'IWM', 'buy', 3, 200, 1, 0, 0, 1)`).run()
+    const t = await computeBrokerTruth(mockClient([
+      order({
+        asset: 'IWM', source: 'auto-repair', decision_id: 'repair-cover-new',
+        client_order_id: 'repair-cover-new', broker_order_id: 'repair-broker-new',
+        filled_qty: 3, filled_avg_price: 201,
+      }),
+    ]), db)
+    expect(t.roundTrips).toBe(0)
+    expect(t.realizedTotal).toBe(0)
+    expect(t.perAsset).toEqual([])
+  })
+
   it('adds fills from trader_fills that the engine order window no longer carries, without double counting', async () => {
     const db = makeDb()
     const ins = db.prepare(`INSERT INTO trader_fills
@@ -119,6 +136,31 @@ describe('computeBrokerTruth', () => {
     const t = await computeBrokerTruth(client, db)
     expect(t.roundTrips).toBe(2)
     expect(t.realizedTotal).toBeCloseTo(200 + 100)
+  })
+
+  it('uses full paginated history and repairs an older cumulative fill snapshot', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('s-old','momentum-stocks','SPY','buy',0.8,20,1,'executed')`).run()
+    db.prepare(`INSERT INTO trader_decisions
+      (id,signal_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status,engine_order_id)
+      VALUES ('d-old','s-old','buy','SPY',1000,'limit','old',0.8,1,'closed','b-old')`).run()
+    db.prepare(`INSERT INTO trader_fills
+      (id,decision_id,client_order_id,broker_order_id,asset,side,fill_qty,fill_price,fill_ts_ms,fee_usd,slippage_usd,recorded_at)
+      VALUES ('b-old:3','d-old','c-old','b-old','SPY','buy',3,100,1,0,0,1)`).run()
+    const full = [order({
+      client_order_id: 'c-old', broker_order_id: 'b-old', decision_id: 'd-old',
+      filled_qty: 6, filled_avg_price: 101, updated_at: 2,
+    })]
+    const client = mockClient([])
+    client.getAllOrders = vi.fn().mockResolvedValue(full)
+
+    await computeBrokerTruth(client, db)
+
+    expect(client.getAllOrders).toHaveBeenCalledTimes(1)
+    expect(db.prepare("SELECT count(*) AS n,max(fill_qty) AS qty FROM trader_fills WHERE broker_order_id='b-old'").get())
+      .toEqual({n: 1, qty: 6})
   })
 })
 

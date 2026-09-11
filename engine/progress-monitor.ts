@@ -82,7 +82,7 @@ export function renderProgressReport(snapshot: ProgressSnapshot, previousEntries
   const delta = snapshot.completed_entries != null && typeof previousEntries === 'number' && Number.isFinite(previousEntries)
     ? snapshot.completed_entries - previousEntries : null
   const lines = [
-    `PAWTRADER DAILY READINESS — ${eastern(snapshot.checked_at).date}`,
+    `PAWTRADER DAILY READINESS, ${eastern(snapshot.checked_at).date}`,
     `Mode: ${snapshot.mode}. Broker: ${snapshot.broker_connected == null ? 'unknown' : snapshot.broker_connected ? 'connected' : 'offline'}.`,
     `Completed entries: ${snapshot.completed_entries ?? 'unavailable'}${delta == null ? '' : ` (${delta >= 0 ? '+' : ''}${delta} since prior report; reconciliations can revise counts)`}.`,
     `Realized P&L, recorded fees only: ${snapshot.realized_recorded_fees == null ? 'unavailable/stale' : `$${snapshot.realized_recorded_fees.toFixed(2)}`}. Not verified net live returns.`,
@@ -107,6 +107,8 @@ export async function checkPaperProgress(
   if (slot.hour < 17 || (typeof previous?.date === 'string' && previous.date >= slot.date) || sending.has(db)) return {sent: false, snapshot}
   sending.add(db)
   try {
+    // Precondition: Phase 1 Task 10 quiet-hours buffer (notify_quiet_buffer)
+    // is the owner-facing gate; this call goes through the trader digest first.
     await send(renderProgressReport(snapshot, previous?.completed_entries))
     save(db, PROGRESS_DELIVERY_KEY, {date: slot.date, delivered_at: nowMs, completed_entries: snapshot.completed_entries})
     return {sent: true, snapshot}

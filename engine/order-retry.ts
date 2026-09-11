@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
 import { DECISION_STATUS, MAX_SUBMIT_RETRIES, matchesBrokerOrder, isTerminalSubmitError } from './order-lifecycle.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
 import { logger } from '../logger.js'
 
 export interface RetrySweepSummary {
@@ -108,6 +109,7 @@ export async function runRetrySweep(
       : row.strategy_status !== 'active' ? 'strategy is not active'
       : !Number.isFinite(row.generated_at) || now < row.generated_at || now - row.generated_at > MAX_RETRY_SIGNAL_AGE_MS ? 'signal expired'
       : row.action !== 'buy' ? 'entry retry does not support this side'
+      : row.entry_type !== 'limit' ? 'entry retry is not a limit order'
       : !(row.entry_price != null && Number.isFinite(row.entry_price) && row.entry_price > 0 &&
           row.stop_loss != null && Number.isFinite(row.stop_loss) && row.stop_loss > 0 && row.stop_loss < row.entry_price &&
           row.take_profit != null && Number.isFinite(row.take_profit) && row.take_profit > row.entry_price)
@@ -124,7 +126,7 @@ export async function runRetrySweep(
         asset: row.asset,
         side: row.action as 'buy' | 'sell',
         size_usd: row.size_usd,
-        entry_type: row.entry_type,
+        entry_type: 'limit',
         entry_price: row.entry_price!,
         stop_loss: row.stop_loss!,
         take_profit: row.take_profit!,
@@ -134,6 +136,20 @@ export async function runRetrySweep(
       db.prepare(
         "UPDATE trader_decisions SET status = ?, engine_order_id = ?, submit_attempts = submit_attempts + 1 WHERE id = ?",
       ).run(DECISION_STATUS.SUBMITTED, res.broker_order_id ?? null, row.id)
+      recordTraderOperationalEvent(db, {
+        eventId: `retry-submitted:${row.id}:${row.submit_attempts + 1}`,
+        sourceTs: now,
+        source: 'brain.order-retry',
+        stage: 'broker',
+        eventType: 'broker.order.retry_submitted',
+        state: 'submitted',
+        asset: row.asset,
+        strategyId: row.strategy_id,
+        signalId: row.signal_id,
+        decisionId: row.id,
+        orderId: res.broker_order_id ?? null,
+        metadata: { side: row.action, size_usd: row.size_usd, status: res.status },
+      })
       summary.resubmitted++
     } catch (err) {
       if (isTerminalSubmitError(err)) {

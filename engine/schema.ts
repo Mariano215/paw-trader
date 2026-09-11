@@ -344,6 +344,154 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
         ON trader_decisions(ungraded_at)`)
     },
   },
+  {
+    version: 8,
+    description: 'Prospective paper evaluation cohorts with immutable configuration, lifecycle audit, and decision attribution',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS trader_evaluation_cohorts (
+          id                    TEXT PRIMARY KEY,
+          strategy_id           TEXT NOT NULL REFERENCES trader_strategies(id),
+          asset_class           TEXT NOT NULL CHECK(asset_class IN ('stocks', 'crypto')),
+          status                TEXT NOT NULL CHECK(status IN ('draft', 'running', 'closed', 'invalidated', 'passed')),
+          config_json           TEXT NOT NULL,
+          config_fingerprint    TEXT NOT NULL,
+          universe_json         TEXT NOT NULL,
+          data_venue            TEXT NOT NULL,
+          execution_venue       TEXT NOT NULL,
+          mode                  TEXT NOT NULL CHECK(mode IN ('paper', 'live')),
+          fee_bps_per_side      REAL NOT NULL CHECK(fee_bps_per_side >= 0),
+          slippage_bps_per_side REAL NOT NULL CHECK(slippage_bps_per_side >= 0),
+          benchmark_asset       TEXT NOT NULL,
+          max_position_usd      REAL NOT NULL CHECK(max_position_usd > 0),
+          daily_trade_cap       INTEGER NOT NULL CHECK(daily_trade_cap BETWEEN 1 AND 20),
+          min_closed_trades     INTEGER NOT NULL DEFAULT 100 CHECK(min_closed_trades >= 100),
+          min_regimes           INTEGER NOT NULL DEFAULT 2 CHECK(min_regimes >= 2),
+          max_drawdown_pct      REAL NOT NULL DEFAULT 0.20 CHECK(max_drawdown_pct > 0 AND max_drawdown_pct <= 0.20),
+          min_deflated_sharpe   REAL NOT NULL DEFAULT 0.95 CHECK(min_deflated_sharpe >= 0.95 AND min_deflated_sharpe <= 1),
+          min_backtest_ratio    REAL NOT NULL DEFAULT 0.50 CHECK(min_backtest_ratio >= 0.50),
+          claudepaw_revision    TEXT NOT NULL,
+          engine_revision       TEXT NOT NULL,
+          backtest_sharpe       REAL,
+          backtest_trade_count  INTEGER,
+          backtest_max_drawdown_pct REAL,
+          backtest_fingerprint  TEXT,
+          backtest_evaluated_at INTEGER,
+          backtest_report_json  TEXT,
+          no_retune             INTEGER NOT NULL DEFAULT 1 CHECK(no_retune IN (0, 1)),
+          legacy_quarantined_at INTEGER,
+          created_at            INTEGER NOT NULL,
+          started_at            INTEGER,
+          ended_at              INTEGER,
+          invalidated_at        INTEGER,
+          invalidation_reason   TEXT
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trader_cohort_running_strategy
+          ON trader_evaluation_cohorts(strategy_id)
+          WHERE status = 'running';
+
+        CREATE INDEX IF NOT EXISTS idx_trader_cohort_status
+          ON trader_evaluation_cohorts(status, asset_class, created_at);
+
+        CREATE TABLE IF NOT EXISTS trader_cohort_events (
+          id         TEXT PRIMARY KEY,
+          cohort_id  TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          detail_json TEXT NOT NULL,
+          actor      TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trader_cohort_events
+          ON trader_cohort_events(cohort_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS trader_cohort_scorecards (
+          cohort_id              TEXT PRIMARY KEY,
+          trade_count            INTEGER NOT NULL,
+          win_count              INTEGER NOT NULL,
+          net_pnl_usd            REAL NOT NULL,
+          expectancy             REAL NOT NULL,
+          sharpe                 REAL NOT NULL,
+          deflated_sharpe        REAL NOT NULL,
+          max_drawdown_pct       REAL NOT NULL,
+          benchmark_return       REAL,
+          excess_return          REAL,
+          failure_rate           REAL NOT NULL,
+          regimes_json           TEXT NOT NULL,
+          evidence_complete      INTEGER NOT NULL CHECK(evidence_complete IN (0, 1)),
+          passed                 INTEGER NOT NULL CHECK(passed IN (0, 1)),
+          criteria_json          TEXT NOT NULL,
+          computed_at            INTEGER NOT NULL
+        );
+      `)
+      // Nullable by design: every historical decision predates prospective
+      // cohorts and must stay visibly unassigned instead of being backfilled.
+      addColumn(db, 'trader_decisions', 'cohort_id', 'TEXT')
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_trader_decisions_cohort
+        ON trader_decisions(cohort_id, decided_at)`)
+    },
+  },
+  {
+    version: 9,
+    description: 'One running prospective cohort per asset-class sleeve',
+    up: (db) => {
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_trader_cohort_running_asset_class
+        ON trader_evaluation_cohorts(asset_class)
+        WHERE status = 'running'`)
+    },
+  },
+  {
+    version: 10,
+    description: 'Append-only operational event ledger with stable cross-process IDs and local cursors',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS trader_operational_events (
+          seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id      TEXT NOT NULL UNIQUE,
+          project_id    TEXT NOT NULL,
+          source_ts     INTEGER NOT NULL,
+          recorded_at   INTEGER NOT NULL,
+          source        TEXT NOT NULL,
+          stage         TEXT NOT NULL,
+          event_type    TEXT NOT NULL,
+          state         TEXT NOT NULL,
+          asset         TEXT,
+          strategy_id   TEXT,
+          signal_id     TEXT,
+          decision_id   TEXT,
+          cohort_id     TEXT,
+          order_id      TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trader_operational_events_cursor
+          ON trader_operational_events(project_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_trader_operational_events_source_time
+          ON trader_operational_events(project_id, source_ts, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trader_operational_events_no_update
+        BEFORE UPDATE ON trader_operational_events
+        BEGIN
+          SELECT RAISE(ABORT, 'trader_operational_events is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trader_operational_events_no_delete
+        BEFORE DELETE ON trader_operational_events
+        BEGIN
+          SELECT RAISE(ABORT, 'trader_operational_events is append-only');
+        END;
+      `)
+    },
+  },
+  {
+    version: 11,
+    description: 'Keep rejected Bitcoin candidate families paused',
+    up: (db) => {
+      db.prepare(`UPDATE trader_strategies SET status='paused', updated_at=?
+        WHERE id IN ('momentum-crypto','mean-reversion-hourly-crypto','trend-4h-crypto')`).run(Date.now())
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {
@@ -360,7 +508,7 @@ export const TRADER_SCHEMA_VERSION = Math.max(...TRADER_MIGRATIONS.map((m) => m.
 export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_strategies: ['id', 'name', 'asset_class', 'tier', 'status', 'params_json', 'created_at', 'updated_at', 'max_size_usd'],
   trader_signals: ['id', 'strategy_id', 'asset', 'side', 'raw_score', 'horizon_days', 'enrichment_json', 'generated_at', 'status'],
-  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id', 'ungraded_at', 'ungraded_reason'],
+  trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id', 'ungraded_at', 'ungraded_reason', 'cohort_id'],
   trader_committee_transcripts: ['id', 'signal_id', 'transcript_json', 'rounds', 'total_tokens', 'total_cost_usd', 'created_at'],
   trader_approvals: ['id', 'decision_id', 'sent_at', 'responded_at', 'response', 'override_size'],
   trader_verdicts: ['id', 'decision_id', 'pnl_gross', 'pnl_net', 'bench_return', 'hold_drawdown', 'thesis_grade', 'agent_attribution_json', 'embedding_id', 'closed_at', 'returns_backfilled', 'excluded_at'],
@@ -372,6 +520,10 @@ export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_alert_state: ['alert_id', 'last_alerted_at'],
   trader_fills: ['id', 'decision_id', 'client_order_id', 'broker_order_id', 'asset', 'side', 'fill_qty', 'fill_price', 'intended_price', 'intended_ts_ms', 'fill_ts_ms', 'fee_usd', 'slippage_usd', 'entry_thesis', 'exit_reason', 'recorded_at'],
   trader_realized_pnl: ['id', 'decision_id', 'asset', 'qty', 'entry_price', 'exit_price', 'entry_ts_ms', 'exit_ts_ms', 'fees_usd', 'pnl_gross', 'pnl_net', 'lot_match_rule', 'computed_at'],
+  trader_evaluation_cohorts: ['id', 'strategy_id', 'asset_class', 'status', 'config_json', 'config_fingerprint', 'universe_json', 'data_venue', 'execution_venue', 'mode', 'fee_bps_per_side', 'slippage_bps_per_side', 'benchmark_asset', 'max_position_usd', 'daily_trade_cap', 'min_closed_trades', 'min_regimes', 'max_drawdown_pct', 'min_deflated_sharpe', 'min_backtest_ratio', 'claudepaw_revision', 'engine_revision', 'backtest_sharpe', 'backtest_trade_count', 'backtest_max_drawdown_pct', 'backtest_fingerprint', 'backtest_evaluated_at', 'backtest_report_json', 'no_retune', 'legacy_quarantined_at', 'created_at', 'started_at', 'ended_at', 'invalidated_at', 'invalidation_reason'],
+  trader_cohort_events: ['id', 'cohort_id', 'event_type', 'detail_json', 'actor', 'created_at'],
+  trader_cohort_scorecards: ['cohort_id', 'trade_count', 'win_count', 'net_pnl_usd', 'expectancy', 'sharpe', 'deflated_sharpe', 'max_drawdown_pct', 'benchmark_return', 'excess_return', 'failure_rate', 'regimes_json', 'evidence_complete', 'passed', 'criteria_json', 'computed_at'],
+  trader_operational_events: ['seq', 'event_id', 'project_id', 'source_ts', 'recorded_at', 'source', 'stage', 'event_type', 'state', 'asset', 'strategy_id', 'signal_id', 'decision_id', 'cohort_id', 'order_id', 'metadata_json'],
 }
 
 /**

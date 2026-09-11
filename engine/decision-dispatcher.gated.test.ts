@@ -37,12 +37,13 @@ describe('autoDispatchPendingSignals under a gate refusal', () => {
     seedPending(db, 'sig-b', 'QQQ')
 
     const runCommittee = vi.fn().mockRejectedValue(new CommitteeGatedError('kill-switch active'))
+    const engine = {getPositions: vi.fn().mockResolvedValue([])} as never
     const results = await autoDispatchPendingSignals(db, {
       send: vi.fn().mockResolvedValue(undefined),
       alertOnReject: false,
       runCommittee: runCommittee as unknown as (...args: unknown[]) => Promise<CommitteeResult>,
       runAgent: vi.fn() as never,
-    } as never)
+    } as never, engine)
 
     // Loop halted after the FIRST gated refusal -- not one call per signal.
     expect(runCommittee).toHaveBeenCalledTimes(1)
@@ -63,12 +64,13 @@ describe('autoDispatchPendingSignals under a gate refusal', () => {
     seedPending(db, 'sig-b', 'QQQ')
 
     const runCommittee = vi.fn().mockRejectedValue(new Error('LLM timeout'))
+    const engine = {getPositions: vi.fn().mockResolvedValue([])} as never
     await autoDispatchPendingSignals(db, {
       send: vi.fn().mockResolvedValue(undefined),
       alertOnReject: false,
       runCommittee: runCommittee as unknown as (...args: unknown[]) => Promise<CommitteeResult>,
       runAgent: vi.fn() as never,
-    } as never)
+    } as never, engine)
 
     // Plain errors keep iterating: both signals attempted.
     expect(runCommittee).toHaveBeenCalledTimes(2)

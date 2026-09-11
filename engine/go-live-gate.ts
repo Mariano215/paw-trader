@@ -18,18 +18,20 @@
  */
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
-import { matchLotsFifo, type FillRow, type RealizedLot } from './audit-log.js'
+import { archiveCumulativeOrderFills, matchLotsFifo, type FillRow, type RealizedLot } from './audit-log.js'
 import { evaluateGate, type GateResult } from './validation-gate.js'
 import type { EquityPoint } from './metrics.js'
 import { logger } from '../logger.js'
 import { createHash } from 'node:crypto'
 import type { EngineOrder } from './types.js'
+import { readCompleteOrderHistory } from './engine-client.js'
+import { currentFingerprintMatches, type EvaluationCohortRow } from './evaluation-cohort.js'
 
 export const GATE_KV_KEY = 'trader.gate.last'
 export const GATE_REGIMES_KV_KEY = 'trader.gate.regimes_seen'
 const GATE_RUN_KV_KEY = 'trader.gate.last_run_ms'
 export const GATE_RUN_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000 // weekly
-export const GATE_VERSION = 2
+export const GATE_VERSION = 3
 export const ACCOUNTING_KV_KEY = 'trader.accounting.last'
 export const REQUIRED_GATE_CRITERIA = ['closed_trades', 'market_regimes', 'out_of_sample_no_retune',
   'deflated_sharpe', 'positive_expectancy', 'max_drawdown_kill', 'live_vs_backtest_degradation', 'evaluation_cohort'] as const
@@ -51,13 +53,20 @@ export interface BrokerTruth {
 export function mergeBrokerFills(orders: EngineOrder[], archived: FillRow[]): FillRow[] {
   const merged = new Map<string, FillRow>()
   const keyOf = (f: FillRow): string => f.broker_order_id || f.client_order_id || f.id
+  const isRepairFill = (f: Pick<FillRow, 'client_order_id' | 'decision_id'>): boolean =>
+    f.client_order_id.startsWith('repair-cover-') || f.decision_id.startsWith('repair-cover-')
   for (const f of archived) {
+    // Corrective short covers restore the long-only invariant. They are not
+    // strategy entries and must not improve or distort strategy P&L.
+    if (isRepairFill(f)) continue
     if (!(Number.isFinite(f.fill_qty) && f.fill_qty > 0 && Number.isFinite(f.fill_price) && f.fill_price > 0)) continue
     const key = keyOf(f)
     const prev = merged.get(key)
     if (!prev || f.fill_qty > prev.fill_qty || (f.fill_qty === prev.fill_qty && f.fee_usd > prev.fee_usd)) merged.set(key, f)
   }
   for (const o of orders) {
+    if (o.source === 'auto-repair' || o.client_order_id.startsWith('repair-cover-') ||
+        o.decision_id?.startsWith('repair-cover-')) continue
     // A canceled or expired partially-filled order still owns real fills.
     if (!(Number.isFinite(o.filled_qty) && o.filled_qty > 0 && o.filled_avg_price != null &&
         Number.isFinite(o.filled_avg_price) && o.filled_avg_price > 0)) continue
@@ -78,13 +87,20 @@ export function mergeBrokerFills(orders: EngineOrder[], archived: FillRow[]): Fi
 
 /**
  * Realized P&L from engine filled orders (FIFO per asset) + open MTM from
- * engine positions. Read-only; throws when the engine is unreachable so
- * callers never mistake "engine down" for "zero P&L".
+ * engine positions. When a DB is supplied, also repairs the cumulative fill
+ * archive from complete engine history. Throws when the engine is unreachable
+ * so callers never mistake "engine down" for "zero P&L".
  */
 export async function computeBrokerTruth(client: EngineClient, db?: Database.Database): Promise<BrokerTruth> {
-  const [orders, positions] = await Promise.all([client.getOrders(), client.getPositions()])
+  // Keep awaits sequential so an incomplete/rolling-deploy client cannot
+  // create an unhandled rejected promise while a second missing method throws.
+  const orders = await readCompleteOrderHistory(client)
+  const positions = await client.getPositions()
   let archived: FillRow[] = []
-  if (db) archived = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms, recorded_at').all() as FillRow[]
+  if (db) {
+    archiveCumulativeOrderFills(db, orders)
+    archived = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms, recorded_at').all() as FillRow[]
+  }
   const merged = mergeBrokerFills(orders, archived)
   const byAsset = new Map<string, FillRow[]>()
   for (const f of merged) {
@@ -151,12 +167,42 @@ export async function refreshAccountingSnapshot(db: Database.Database, client: E
 
 export function gateConfigFingerprint(db: Database.Database): string {
   const strategies = db.prepare('SELECT id, status, params_json, max_size_usd FROM trader_strategies ORDER BY id').all()
+  const cohorts = db.prepare(`SELECT c.id,c.asset_class,c.status,c.config_fingerprint,c.no_retune,
+      s.passed,s.evidence_complete,s.computed_at
+    FROM trader_evaluation_cohorts c
+    LEFT JOIN trader_cohort_scorecards s ON s.cohort_id=c.id
+    ORDER BY c.id`).all()
   let knobs: unknown = null
   try { knobs = db.prepare("SELECT knobs FROM project_settings WHERE project_id='trader'").get() ?? null } catch { /* fresh standalone DB */ }
   // Explicit allowlist: never include credentials in evaluation fingerprints.
   const env = ['TRADER_SIGNAL_SCORE_THRESHOLD', 'TRADER_COMMITTEE_BYPASS', 'TRADER_DAILY_TRADE_CAP',
     'TRADER_STRATEGY_GATE_ENABLED', 'TRADER_BLIND_SIGNAL_SCORE_THRESHOLD'].map(k => [k, process.env[k] ?? null])
-  return createHash('sha256').update(JSON.stringify({version: GATE_VERSION, strategies, knobs, env})).digest('hex')
+  return createHash('sha256').update(JSON.stringify({version: GATE_VERSION, strategies, cohorts, knobs, env})).digest('hex')
+}
+
+export interface CohortReadiness {
+  passed: boolean
+  detail: string
+}
+
+/** Require independently passed, still-frozen stock and Bitcoin cohorts. */
+export function readCohortReadiness(db: Database.Database): CohortReadiness {
+  try {
+    const rows = db.prepare(`SELECT c.*,s.passed AS score_passed,s.evidence_complete
+      FROM trader_evaluation_cohorts c
+      JOIN trader_cohort_scorecards s ON s.cohort_id=c.id
+      WHERE c.status='passed' AND s.passed=1 AND s.evidence_complete=1`).all() as
+      Array<EvaluationCohortRow & {score_passed: number; evidence_complete: number}>
+    const valid = rows.filter(row => row.no_retune === 1 && row.mode === 'paper' && currentFingerprintMatches(db, row))
+    const stocks = valid.some(row => row.asset_class === 'stocks')
+    const bitcoin = valid.some(row => row.asset_class === 'crypto' && row.universe_json === '["BTC/USD"]')
+    return {
+      passed: stocks && bitcoin,
+      detail: `stocks=${stocks ? 'passed' : 'blocked'} bitcoin=${bitcoin ? 'passed' : 'blocked'}; both frozen prospective cohorts required`,
+    }
+  } catch {
+    return {passed: false, detail: 'cohort evidence unavailable'}
+  }
 }
 
 export function gateAuthorizesLive(db: Database.Database, nowMs = Date.now()): boolean {
@@ -248,6 +294,7 @@ export async function runGoLiveGate(
 ): Promise<StoredGateResult> {
   const truth = await computeBrokerTruth(client, db)
   const regimes = await accumulateRegimes(db, client)
+  const cohortReadiness = readCohortReadiness(db)
 
   // Per-trade fractional net returns on cost basis.
   const closedReturns = truth.closedReturns
@@ -312,14 +359,12 @@ export async function runGoLiveGate(
     equityCurve,
     regimesObserved: regimes.length,
     variantsTested: Math.max(1, variantsTested),
-    outOfSampleNoRetune: false, // no versioned prospective evaluation cohort exists yet
+    outOfSampleNoRetune: cohortReadiness.passed,
     backtestSharpe,
     liveReconReturns: closedReturns,
   })
-  // These inputs cannot be inferred from an all-time aggregate. Surface the
-  // missing evidence rather than silently certifying an unfrozen strategy.
-  result.criteria.push({name: 'evaluation_cohort', passed: false,
-    detail: 'Create a versioned prospective evaluation with matched paper/backtest rules, costs and trade-linked regimes. Historical aggregate is diagnostic only.'})
+  result.criteria.push({name: 'evaluation_cohort', passed: cohortReadiness.passed,
+    detail: cohortReadiness.detail})
   result.passed = result.criteria.every(c => c.passed)
   result.warnings.push(...truth.warnings, 'Trade-return scores use per-trade observations; they are not annualized daily portfolio Sharpe ratios.')
 

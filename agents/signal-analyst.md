@@ -1,9 +1,18 @@
 ---
-id: analyst
+id: signal-analyst
 name: Signal Analyst
 emoji: 📊
 role: Trading Signal Intelligence & Threshold Optimization
 mode: active
+aliases:
+  - analyst
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash
+  - WebSearch
+  - WebFetch
 keywords:
   - signal
   - telemetry

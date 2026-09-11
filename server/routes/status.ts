@@ -1,11 +1,10 @@
 /**
  * trader-routes/status.ts
  *
- * Seven engine-fronted endpoints: status, positions, orders, risk, halt,
- * clear-breaker, nav-snapshots.  All are thin proxies over the Paw Trader
- * engine REST API.  Read routes return empty/offline shapes on engine
- * failure so the dashboard renders "offline" rather than a hard error;
- * mutation routes (halt, clear-breaker) surface engine failures with 5xx.
+ * Engine-fronted status, position, order, risk, control, NAV, accounting,
+ * and strategy-state endpoints. Read contracts preserve the distinction
+ * between confirmed empty state and unavailable broker state. Mutations are
+ * admin-only and proxy through the server so engine credentials stay private.
  */
 
 import { Router, type Request, type Response } from 'express'
@@ -55,6 +54,8 @@ router.get('/api/v1/trader/status', async (_req: Request, res: Response) => {
       // field (older build); the frontend hides the Coinbase pill in
       // that case rather than showing "Coinbase ERROR".
       coinbase_connected: health.coinbase_connected ?? null,
+      crypto_enabled: (health as { crypto_enabled?: boolean }).crypto_enabled ?? null,
+      trade_updates_alive: health.trade_updates_alive ?? null,
       reconciler_halted: (health as { reconciler_halted?: boolean }).reconciler_halted ?? false,
       halt_reason: (health as { halt_reason?: string | null }).halt_reason ?? null,
       last_reconcile: reconcile,
@@ -91,39 +92,88 @@ router.get('/api/v1/trader/positions', async (_req: Request, res: Response) => {
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/trader/orders
+// Failed reads are unavailable, never a confirmed empty blotter. Pagination
+// stays within the engine contract so the dashboard cannot request an
+// unbounded ledger scan.
 // ---------------------------------------------------------------------------
 
-router.get('/api/v1/trader/orders', async (_req: Request, res: Response) => {
+router.get('/api/v1/trader/orders', async (req: Request, res: Response) => {
   const cfg = getEngineConfig()
   if (!cfg) {
-    res.json([])
+    res.status(503).json({ error: 'orders unavailable' })
+    return
+  }
+  const rawLimit = Number(req.query.limit)
+  const rawOffset = Number(req.query.offset)
+  const requestedStatus = String(req.query.status ?? 'all')
+  const status = ['open', 'closed', 'all'].includes(requestedStatus) ? requestedStatus : 'all'
+  const limit = Number.isInteger(rawLimit) && rawLimit >= 1
+    ? Math.min(rawLimit, 500)
+    : 200
+  const offset = Number.isInteger(rawOffset) && rawOffset >= 0
+    ? Math.min(rawOffset, 1_000_000)
+    : 0
+  try {
+    const orders = await engineFetch<unknown[]>(cfg, `/orders?status=${status}&limit=${limit}&offset=${offset}`)
+    if (!Array.isArray(orders)) throw new Error('invalid orders response')
+    res.json(orders)
+  } catch (err) {
+    logger.warn({ err }, 'trader: orders query failed')
+    res.status(503).json({ error: 'orders unavailable' })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/trader/orders/:clientOrderId/cancel
+// Admin-only individual cancellation. The engine credential remains on this
+// server; browsers send only their normal dashboard session.
+// ---------------------------------------------------------------------------
+
+const CLIENT_ORDER_ID = /^[A-Za-z0-9._:-]{1,128}$/
+
+router.post('/api/v1/trader/orders/:clientOrderId/cancel', requireAdmin, async (req: Request, res: Response) => {
+  const rawClientOrderId = req.params.clientOrderId
+  const clientOrderId = Array.isArray(rawClientOrderId) ? (rawClientOrderId[0] ?? '') : rawClientOrderId
+  if (!CLIENT_ORDER_ID.test(clientOrderId)) {
+    res.status(400).json({ error: 'invalid client order id' })
+    return
+  }
+  const cfg = getEngineConfig()
+  if (!cfg) {
+    res.status(503).json({ error: 'order cancellation unavailable' })
     return
   }
   try {
-    const orders = await engineFetch<unknown[]>(cfg, '/orders')
-    res.json(orders)
-  } catch {
-    res.json([])
+    const result = await engineFetch<{
+      client_order_id: string
+      status: string
+      submitted: boolean
+    }>(cfg, `/orders/${encodeURIComponent(clientOrderId)}/cancel`, { method: 'POST' })
+    res.json(result)
+  } catch (err) {
+    logger.error({ err, clientOrderId }, 'trader: order cancellation failed')
+    res.status(502).json({ error: 'order cancellation failed' })
   }
 })
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/trader/risk
 // Returns { tripped: string[], details: Array<{ rule, tripped_at, reason }> }
-// Always returns 200. Returns { tripped: [], details: [] } on engine error.
+// Unavailable risk state is an error, never an empty/clear breaker list.
 // ---------------------------------------------------------------------------
 
 router.get('/api/v1/trader/risk', async (_req: Request, res: Response) => {
   const cfg = getEngineConfig()
   if (!cfg) {
-    res.json({ tripped: [], details: [] })
+    res.status(503).json({ error: 'risk state unavailable' })
     return
   }
   try {
     const risk = await engineFetch<{ tripped: string[]; details: unknown[] }>(cfg, '/risk/state')
     res.json(risk)
-  } catch {
-    res.json({ tripped: [], details: [] })
+  } catch (err) {
+    logger.warn({ err }, 'trader: risk query failed')
+    res.status(503).json({ error: 'risk state unavailable' })
   }
 })
 
@@ -252,6 +302,103 @@ router.get('/api/v1/trader/broker-pnl', (_req: Request, res: Response) => {
     res.json({...snapshot, stale: age < 0 || age >= 15 * 60 * 1000})
   } catch {
     res.json({available: false, error: 'accounting snapshot unavailable'})
+  }
+})
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/trader/strategy-status
+// Small operational projection used by Mission Control. Parameter blobs stay
+// out of the response; this reports only whether each stock/crypto strategy is
+// allowed to run.
+// ---------------------------------------------------------------------------
+
+router.get('/api/v1/trader/strategy-status', (_req: Request, res: Response) => {
+  try {
+    const db = getBotDb()
+    if (!db) {
+      res.status(503).json({ error: 'strategy status unavailable' })
+      return
+    }
+    const strategies = db.prepare(
+      `SELECT id, name, asset_class, tier, status, updated_at
+       FROM trader_strategies ORDER BY asset_class, id`,
+    ).all()
+    let cohorts: unknown[] = []
+    let cohortsAvailable = true
+    let bitcoinOrderFlowCollection: Record<string, unknown> | null = null
+    try {
+      cohorts = db.prepare(`SELECT
+          c.id,c.strategy_id,c.asset_class,c.status,c.config_fingerprint,c.universe_json,
+          c.max_position_usd,c.daily_trade_cap,c.min_closed_trades,c.min_deflated_sharpe,
+          c.max_drawdown_pct,c.created_at,c.started_at,c.ended_at,c.invalidation_reason,
+          sc.trade_count,sc.win_count,sc.net_pnl_usd,sc.expectancy,sc.sharpe,
+          sc.deflated_sharpe,sc.max_drawdown_pct AS observed_max_drawdown_pct,
+          sc.excess_return,sc.failure_rate,sc.regimes_json,sc.evidence_complete,
+          sc.passed,sc.criteria_json,sc.computed_at
+        FROM trader_evaluation_cohorts c
+        LEFT JOIN trader_cohort_scorecards sc ON sc.cohort_id=c.id
+        ORDER BY c.created_at DESC,c.id`).all()
+    } catch {
+      // One sync cycle may briefly put an older bot DB behind a newer server.
+      cohortsAvailable = false
+    }
+    try {
+      const row = db.prepare("SELECT value FROM kv_settings WHERE key='trader.bitcoin_order_flow.collection'")
+        .get() as {value?: string} | undefined
+      const raw = row?.value ? JSON.parse(row.value) as unknown : null
+      if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+        const candidate = raw as Record<string, unknown>
+        const states = new Set(['starting', 'connected', 'reconnecting', 'stopped', 'disabled', 'error'])
+        if (candidate.product_id === 'BTC-USD' && typeof candidate.state === 'string' && states.has(candidate.state)) {
+          const safe: Record<string, unknown> = {state: candidate.state, product_id: 'BTC-USD'}
+          for (const key of [
+            'started_at', 'connected_at', 'last_message_at', 'last_heartbeat_at',
+            'last_trade_at', 'last_l2_at', 'last_bar_end_at', 'trades_stored',
+            'l2_updates_stored', 'bars_completed', 'sequence_gap_count',
+            'reconnect_count', 'rejected_messages', 'updated_at',
+            'storage_error_count', 'declaration_at', 'collection_through_at',
+            'eligible_bars_total', 'ineligible_bars_total',
+            'collection_days_completed', 'minimum_forward_days',
+            'earliest_evaluation_at',
+            'evaluation_completed_at', 'evaluation_holdout_uses',
+            'evaluation_trade_count',
+          ]) {
+            const value = candidate[key]
+            if (value === null || (Number.isSafeInteger(value) && Number(value) >= 0)) safe[key] = value
+          }
+          if (typeof candidate.last_bar_eligible === 'boolean' || candidate.last_bar_eligible === null) {
+            safe.last_bar_eligible = candidate.last_bar_eligible
+          }
+          if (typeof candidate.collection_mature === 'boolean') {
+            safe.collection_mature = candidate.collection_mature
+          }
+          const evaluationStates = new Set([
+            'awaiting_collection', 'rejected_pre_holdout', 'rejected', 'passed', 'error',
+          ])
+          if (typeof candidate.evaluation_status === 'string' &&
+              evaluationStates.has(candidate.evaluation_status)) {
+            safe.evaluation_status = candidate.evaluation_status
+          }
+          if (candidate.last_bar_reason === null ||
+              (typeof candidate.last_bar_reason === 'string' && /^[a-z0-9_,]{1,240}$/.test(candidate.last_bar_reason))) {
+            safe.last_bar_reason = candidate.last_bar_reason
+          }
+          bitcoinOrderFlowCollection = safe
+        }
+      }
+    } catch {
+      // Status projection is optional during rollout or before first sync.
+    }
+    res.json({
+      available: true,
+      strategies,
+      cohorts_available: cohortsAvailable,
+      cohorts,
+      bitcoin_order_flow_collection: bitcoinOrderFlowCollection,
+    })
+  } catch (err) {
+    logger.warn({ err }, 'trader: strategy status query failed')
+    res.status(503).json({ error: 'strategy status unavailable' })
   }
 })
 

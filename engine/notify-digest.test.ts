@@ -68,6 +68,12 @@ describe('shouldFireDigest', () => {
 })
 
 describe('renderDigest', () => {
+  it('lists a repeated routine line once', () => {
+    const rows = [1, 2, 3].map(id => ({ id, text: 'Go-live gate: 3/8 criteria (234 closed round-trips)\nP&L: x', created_at: id }))
+    const out = renderDigest(rows, new Date(2026, 5, 30, 8, 0).getTime())
+    expect(out.split('Go-live gate').length - 1).toBe(1)
+  })
+
   it('summarises trades in plain English with no tickers-only jargon', () => {
     const rows = [
       { id: 1, text: 'EXECUTED: BUY QQQ $200 @ market\nStrategy: momentum', created_at: 1 },

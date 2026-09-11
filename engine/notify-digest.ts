@@ -191,7 +191,7 @@ export function renderDigest(rows: BufferRow[], nowMs: number): string {
     if (other.length > 0) {
       parts.push('')
       parts.push('Other updates:')
-      for (const o of other) parts.push(`  - ${o}`)
+      for (const o of new Set(other)) parts.push(`  - ${o}`)
     }
   }
 

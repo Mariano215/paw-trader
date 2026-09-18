@@ -151,6 +151,7 @@ function initTraderPage() {
   ensureTraderPageDOM();
   closeStrategyDetail();
   closeKillSwitchLogPage();
+  closeStrategiesPage();
 
   // Initial renders
   var refreshers = [refreshTraderKPI_nav, refreshTraderKPI_engine, refreshTraderKPI_brokerPnl,
@@ -3747,6 +3748,7 @@ function closeStrategyDetail() {
   Array.prototype.forEach.call(page.children, function(child) {
     if (child.id === 'strategy-detail-container') return;
     if (child.id === 'kill-switch-log-container') return;
+    if (child.id === 'strategies-container') return;
     child.style.display = '';
   });
   _strategyDetailState.strategyId = null;
@@ -3778,8 +3780,132 @@ function closeKillSwitchLogPage() {
   Array.prototype.forEach.call(page.children, function(child) {
     if (child.id === 'strategy-detail-container') return;
     if (child.id === 'kill-switch-log-container') return;
+    if (child.id === 'strategies-container') return;
     child.style.display = '';
   });
+}
+
+// ---------------------------------------------------------------------------
+// Strategies page at #trader/strategies. Status of every strategy from
+// GET /api/v1/trader/strategy-status, then the track-record table (which
+// only lists strategies that have closed trades). Rows click through to
+// #trader/strategy/:id.
+// ---------------------------------------------------------------------------
+
+function closeStrategiesPage() {
+  var page = document.getElementById('page-trader');
+  if (!page) return;
+  var container = document.getElementById('strategies-container');
+  if (container) container.style.display = 'none';
+  Array.prototype.forEach.call(page.children, function(child) {
+    if (child.id === 'strategy-detail-container') return;
+    if (child.id === 'kill-switch-log-container') return;
+    if (child.id === 'strategies-container') return;
+    child.style.display = '';
+  });
+}
+
+function renderStrategiesPage() {
+  ensureTraderPageDOM();
+  var page = document.getElementById('page-trader');
+  if (!page) return;
+  Array.prototype.forEach.call(page.children, function(child) {
+    if (child.id !== 'strategies-container' && child.className !== 'page-heading-row') {
+      child.style.display = 'none';
+    }
+  });
+
+  var container = document.getElementById('strategies-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'strategies-container';
+    page.appendChild(container);
+  }
+  container.style.display = '';
+  while (container.firstChild) container.removeChild(container.firstChild);
+
+  var topBar = document.createElement('div');
+  topBar.style.cssText = 'margin-bottom:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;';
+  var backBtn = document.createElement('button');
+  backBtn.className = 'btn btn--sm btn--ghost';
+  backBtn.textContent = 'Back to Trader';
+  backBtn.onclick = function() {
+    location.hash = '#trader';
+    closeStrategiesPage();
+  };
+  topBar.appendChild(backBtn);
+  var title = document.createElement('div');
+  title.style.cssText = 'font-weight:600;font-size:1.05rem;';
+  title.textContent = 'Strategies';
+  topBar.appendChild(title);
+  container.appendChild(topBar);
+
+  var statusCard = document.createElement('div');
+  statusCard.className = 'stat-card';
+  statusCard.style.cssText = 'margin-bottom:14px;';
+  statusCard.appendChild(cpSkeleton(4));
+  container.appendChild(statusCard);
+
+  var recordsCard = document.createElement('div');
+  recordsCard.className = 'stat-card';
+  recordsCard.appendChild(cpSkeleton(3));
+  container.appendChild(recordsCard);
+
+  fetchFromAPI('/api/v1/trader/strategy-status').then(function(data) {
+    renderStrategyStatusTable(statusCard, (data && data.strategies) || [], (data && data.cohorts) || []);
+  }).catch(function(err) {
+    while (statusCard.firstChild) statusCard.removeChild(statusCard.firstChild);
+    statusCard.appendChild(cpErrorCard('Strategy status', err));
+  });
+  fetchFromAPI('/api/v1/trader/track-records').then(function(data) {
+    renderTraderTrackRecords((data && data.track_records) || [], recordsCard);
+  }).catch(function(err) {
+    while (recordsCard.firstChild) recordsCard.removeChild(recordsCard.firstChild);
+    recordsCard.appendChild(cpErrorCard('Track records', err));
+  });
+}
+
+function renderStrategyStatusTable(card, strategies, cohorts) {
+  while (card.firstChild) card.removeChild(card.firstChild);
+  var heading = document.createElement('div');
+  heading.style.cssText = 'font-weight:600;margin-bottom:10px;';
+  heading.textContent = 'Strategy status (' + strategies.length + ')';
+  card.appendChild(heading);
+  if (!strategies.length) { card.appendChild(cpEmpty('No strategies registered.')); return; }
+
+  var runningByStrategy = {};
+  cohorts.forEach(function(c) { if (c.status === 'running') runningByStrategy[c.strategy_id] = c; });
+
+  var table = document.createElement('table');
+  table.className = 'trader-table';
+  var thead = document.createElement('thead');
+  var hr = document.createElement('tr');
+  ['Strategy', 'Asset class', 'Status', 'Running cohort', 'Universe'].forEach(function(h) {
+    var th = document.createElement('th'); th.textContent = h; hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tbody = document.createElement('tbody');
+  strategies.forEach(function(st) {
+    var tr = document.createElement('tr');
+    tr.className = 'trader-decision-row';
+    tr.title = 'Click to open strategy detail';
+    tr.addEventListener('click', function() {
+      location.hash = '#trader/strategy/' + encodeURIComponent(st.id);
+    });
+    var cohort = runningByStrategy[st.id];
+    var universe = '';
+    if (cohort) { try { universe = JSON.parse(cohort.universe_json).join(', '); } catch (e) { universe = ''; } }
+    [st.name || st.id, st.asset_class, st.status, cohort ? cohort.id : 'none', universe || '-'].forEach(function(v, i) {
+      var td = document.createElement('td');
+      td.textContent = String(v);
+      if (i === 2) td.style.color = st.status === 'active' ? 'var(--color-success)' : 'var(--color-text-muted, inherit)';
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  card.appendChild(table);
 }
 
 function renderKillSwitchLogPage() {

@@ -117,6 +117,8 @@ export interface CohortGuardResult {
   ok: boolean
   cohort: EvaluationCohortRow | null
   reason: string | null
+  /** Ledger label for a block. 'outside_cohort_universe' means a cohort IS running; the engine scored an asset it does not cover. */
+  suppression: 'no_running_cohort' | 'outside_cohort_universe' | null
 }
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,127}$/
@@ -373,19 +375,21 @@ export function invalidateCohort(db: Database.Database, cohortId: string, reason
 }
 
 export function guardRunningCohort(db: Database.Database, strategyId: string, asset: string): CohortGuardResult {
-  if (!cohortEnforcementEnabled(db)) return {ok: true, cohort: null, reason: null}
+  if (!cohortEnforcementEnabled(db)) return {ok: true, cohort: null, reason: null, suppression: null}
   const cohort = db.prepare("SELECT * FROM trader_evaluation_cohorts WHERE strategy_id=? AND status='running'")
     .get(strategyId) as EvaluationCohortRow | undefined
-  if (!cohort) return {ok: false, cohort: null, reason: 'no running evaluation cohort'}
-  if (cohort.mode !== 'paper') return {ok: false, cohort, reason: 'evaluation cohort is not paper mode'}
+  if (!cohort) return {ok: false, cohort: null, reason: 'no running evaluation cohort', suppression: 'no_running_cohort'}
+  if (cohort.mode !== 'paper') return {ok: false, cohort, reason: 'evaluation cohort is not paper mode', suppression: 'no_running_cohort'}
   let universe: unknown
   try { universe = JSON.parse(cohort.universe_json) } catch { universe = null }
-  if (!Array.isArray(universe) || !universe.includes(asset)) return {ok: false, cohort, reason: `asset ${asset} is outside the frozen cohort universe`}
+  if (!Array.isArray(universe) || !universe.includes(asset)) {
+    return {ok: false, cohort, reason: `asset ${asset} is outside the frozen cohort universe`, suppression: 'outside_cohort_universe'}
+  }
   if (!currentFingerprintMatches(db, cohort)) {
     invalidateCohort(db, cohort.id, 'runtime configuration fingerprint changed')
-    return {ok: false, cohort: null, reason: 'cohort invalidated by configuration drift'}
+    return {ok: false, cohort: null, reason: 'cohort invalidated by configuration drift', suppression: 'no_running_cohort'}
   }
-  return {ok: true, cohort, reason: null}
+  return {ok: true, cohort, reason: null, suppression: null}
 }
 
 export function countCohortEntriesToday(db: Database.Database, cohortId: string, nowMs = Date.now()): number {

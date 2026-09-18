@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import { recordTraderOperationalEvent } from './operational-events.js'
 
-export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'symbol_cooldown' | 'portfolio_heat' | 'regime' | 'markov_gate' | 'already_held' | 'pending_order' | 'below_min_size' | 'no_running_cohort' | 'cohort_daily_cap'
+export type SuppressionReason = 'skip' | 'timeout' | 'committee_abstain' | 'cluster_cap' | 'symbol_cap' | 'symbol_cooldown' | 'portfolio_heat' | 'regime' | 'markov_gate' | 'already_held' | 'pending_order' | 'below_min_size' | 'no_running_cohort' | 'outside_cohort_universe' | 'cohort_daily_cap'
 
 export interface SignalSuppressionSnapshot {
   signal_id: string

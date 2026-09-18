@@ -185,6 +185,33 @@ describe('decision-dispatcher', () => {
       .toBe('suppressed_no_running_cohort')
   })
 
+  it('labels an asset outside the running cohort universe distinctly from no cohort', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-narrow', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-narrow', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-outside','momentum-stocks','IEF','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-outside'").get() as {status:string}).status)
+      .toBe('suppressed_outside_cohort_universe')
+    expect((db.prepare("SELECT reason FROM trader_signal_suppressions WHERE signal_id='sig-outside'").get() as {reason:string}).reason)
+      .toBe('outside_cohort_universe')
+  })
+
   it('attributes every submitted auto decision to the running frozen cohort', async () => {
     createDraftCohort(db, {
       id:'stocks-paper-test', strategyId:'momentum-stocks', assetClass:'stocks',

@@ -192,8 +192,9 @@ export async function dispatchApproval(
   // spend committee budget or reach the broker outside its frozen experiment.
   const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
   if (!cohortGuard.ok) {
-    db.prepare("UPDATE trader_signals SET status='suppressed_no_running_cohort' WHERE id=?").run(signal.id)
-    recordSignalSuppressionBySignalId(db, signal.id, 'no_running_cohort')
+    const label = cohortGuard.suppression ?? 'no_running_cohort'
+    db.prepare("UPDATE trader_signals SET status=? WHERE id=?").run(`suppressed_${label}`, signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, label)
     return `Trade blocked: ${cohortGuard.reason}. No order placed.`
   }
   const cohort = cohortGuard.cohort
@@ -661,10 +662,11 @@ export async function autoDispatchPendingSignals(
       // strategy atomically inside guardRunningCohort.
       const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
       if (!cohortGuard.ok) {
-        logger.warn({signalId: signal.id, strategyId: signal.strategy_id, reason: cohortGuard.reason},
-          'auto-dispatch blocked: no valid running cohort')
-        db.prepare("UPDATE trader_signals SET status='suppressed_no_running_cohort' WHERE id=?").run(signal.id)
-        recordSignalSuppressionBySignalId(db, signal.id, 'no_running_cohort')
+        const label = cohortGuard.suppression ?? 'no_running_cohort'
+        logger.warn({signalId: signal.id, strategyId: signal.strategy_id, reason: cohortGuard.reason, label},
+          'auto-dispatch blocked by cohort guard')
+        db.prepare("UPDATE trader_signals SET status=? WHERE id=?").run(`suppressed_${label}`, signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, label)
         continue
       }
       const cohort = cohortGuard.cohort

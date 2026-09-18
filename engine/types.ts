@@ -230,3 +230,32 @@ export interface BacktestResult {
   computed_at_ms: number;
   elapsed_ms: number;
 }
+
+/** One strategy block of the engine's sweep + walk-forward report (scripts/run_backtest_gate.py). */
+export interface BacktestGateStrategy {
+  live_params: { min_score: number; horizon_days: number };
+  fixed_rule: BacktestResult;
+  sweep: { n_trials: number; sharpe_variance_per_period: number | null; best: unknown; trials: unknown[] };
+  walk_forward: {
+    oos_sharpe: number | null;
+    oos_n_trades: number;
+    oos_expectancy: number | null;
+    oos_max_drawdown: number | null;
+    oos_win_rate: number | null;
+    folds: unknown[];
+    train_bars: number;
+    test_bars: number;
+    step: number;
+    method: string;
+  };
+}
+
+/** GET /backtest/report. Keys of `strategies` are ClaudePaw strategy ids. */
+export interface BacktestGateReport {
+  version: number;
+  computed_at_ms: number;
+  engine_revision: string | null;
+  days: number;
+  universe: string[];
+  strategies: Record<string, BacktestGateStrategy>;
+}

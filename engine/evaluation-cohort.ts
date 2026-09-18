@@ -317,9 +317,11 @@ export function activateCohort(
     return cohort
   }
   if (cohort.status !== 'draft') throw new Error('only a draft cohort can start')
-  const runningSleeve = db.prepare(`SELECT id FROM trader_evaluation_cohorts
-    WHERE asset_class=? AND status='running' AND id<>? LIMIT 1`).get(cohort.asset_class, cohort.id) as {id: string} | undefined
-  if (runningSleeve) throw new Error(`asset-class sleeve already has running cohort ${runningSleeve.id}`)
+  // One running cohort per strategy. Several strategies may run side by side
+  // in one asset-class sleeve; each keeps its own frozen config and cap.
+  const runningSame = db.prepare(`SELECT id FROM trader_evaluation_cohorts
+    WHERE strategy_id=? AND status='running' AND id<>? LIMIT 1`).get(cohort.strategy_id, cohort.id) as {id: string} | undefined
+  if (runningSame) throw new Error(`strategy already has running cohort ${runningSame.id}`)
   if (cohort.mode !== 'paper' || preflight.engineMode !== 'paper') throw new Error('paper engine mode required')
   if (preflight.brokerConnected !== true) throw new Error('broker connection required')
   if (preflight.dataVenueConnected !== true) throw new Error('strategy data venue connection required')
@@ -344,9 +346,12 @@ export function activateCohort(
   if (cohortFingerprint(currentWithoutSize) !== cohort.config_fingerprint) throw new Error('cohort configuration mismatch')
 
   const start = db.transaction(() => {
-    // One candidate per sleeve. Starting Bitcoin must not pause the stock
-    // cohort, and starting stocks must not stop 24/7 Bitcoin collection.
-    db.prepare("UPDATE trader_strategies SET status='paused',updated_at=? WHERE asset_class=? AND id<>?")
+    // Pause siblings in this sleeve that have no running cohort of their own.
+    // Starting Bitcoin must not pause the stock cohorts, and a second stock
+    // cohort must not pause the first.
+    db.prepare(`UPDATE trader_strategies SET status='paused',updated_at=?
+      WHERE asset_class=? AND id<>?
+        AND id NOT IN (SELECT strategy_id FROM trader_evaluation_cohorts WHERE status='running')`)
       .run(nowMs, cohort.asset_class, cohort.strategy_id)
     db.prepare("UPDATE trader_strategies SET status='active',max_size_usd=?,updated_at=? WHERE id=?")
       .run(cohort.max_position_usd, nowMs, cohort.strategy_id)

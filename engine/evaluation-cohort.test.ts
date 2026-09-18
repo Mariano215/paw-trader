@@ -76,7 +76,7 @@ describe('prospective evaluation cohorts', () => {
     expect(currentFingerprintMatches(db, started)).toBe(true)
   })
 
-  it('allows only one running cohort in each asset-class sleeve', () => {
+  it('allows one running cohort per strategy and several per asset-class sleeve', () => {
     createDraftCohort(db, cryptoDraft)
     activateCohort(db, cryptoDraft.id, clean, 'admin')
     const now=Date.now()
@@ -85,8 +85,15 @@ describe('prospective evaluation cohorts', () => {
       VALUES ('alternate-crypto','Alternate Crypto','crypto',0,'paused','{"basket":["BTC/USD"]}',?,?,NULL)`).run(now,now)
     createDraftCohort(db, {...cryptoDraft,id:'btc-paper-v2',strategyId:'alternate-crypto'})
 
-    expect(() => activateCohort(db,'btc-paper-v2',clean,'admin')).toThrow(/asset-class sleeve/)
-    expect(db.prepare("SELECT status FROM trader_evaluation_cohorts WHERE id='btc-paper-v2'").get())
+    // A sibling strategy starts alongside; the first cohort's strategy stays active.
+    activateCohort(db,'btc-paper-v2',clean,'admin')
+    expect(db.prepare("SELECT status FROM trader_strategies WHERE id='momentum-crypto'").get()).toEqual({status:'active'})
+    expect(db.prepare("SELECT status FROM trader_strategies WHERE id='alternate-crypto'").get()).toEqual({status:'active'})
+
+    // A second cohort for a strategy that already has one running is refused.
+    createDraftCohort(db, {...cryptoDraft,id:'btc-paper-v3'})
+    expect(() => activateCohort(db,'btc-paper-v3',clean,'admin')).toThrow(/strategy already has running cohort/)
+    expect(db.prepare("SELECT status FROM trader_evaluation_cohorts WHERE id='btc-paper-v3'").get())
       .toEqual({status:'draft'})
   })
 

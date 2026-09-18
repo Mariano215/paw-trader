@@ -3,7 +3,8 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
 import type { EngineClient } from './engine-client.js'
-import { computeBrokerTruth, runGoLiveGate, readLastGateResult, gateRunDue, renderGateSummary, gateAuthorizesLive, gateConfigFingerprint, GATE_VERSION, GATE_RUN_INTERVAL_MS, refreshAccountingSnapshot, REQUIRED_GATE_CRITERIA } from './go-live-gate.js'
+import { createDraftCohort } from './evaluation-cohort.js'
+import { startNewEpoch, readEpochStartMs, readCohortReadiness, computeBrokerTruth, runGoLiveGate, readLastGateResult, gateRunDue, renderGateSummary, gateAuthorizesLive, gateConfigFingerprint, GATE_VERSION, GATE_RUN_INTERVAL_MS, refreshAccountingSnapshot, REQUIRED_GATE_CRITERIA } from './go-live-gate.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -274,5 +275,104 @@ describe('gateConfigFingerprint', () => {
     expect(gateConfigFingerprint(db)).toBe(before)
     db.exec('UPDATE trader_cohort_scorecards SET passed=1')
     expect(gateConfigFingerprint(db)).not.toBe(before)
+  })
+})
+
+
+describe('epoch', () => {
+  it('broker truth ignores orders and fills before the epoch', async () => {
+    const db = makeDb()
+    startNewEpoch(db, 1_000)
+    const truth = await computeBrokerTruth(mockClient([
+      order({ broker_order_id: 'old-buy', client_order_id: 'old-buy', filled_qty: 10, filled_avg_price: 100, updated_at: 500 }),
+      order({ broker_order_id: 'old-sell', client_order_id: 'old-sell', side: 'sell', filled_qty: 10, filled_avg_price: 120, updated_at: 600 }),
+      order({ broker_order_id: 'new-buy', client_order_id: 'new-buy', filled_qty: 5, filled_avg_price: 100, updated_at: 2_000 }),
+      order({ broker_order_id: 'new-sell', client_order_id: 'new-sell', side: 'sell', filled_qty: 5, filled_avg_price: 110, updated_at: 3_000 }),
+    ]), db)
+    expect(truth.roundTrips).toBe(1)
+    expect(truth.realizedTotal).toBeCloseTo(50, 6)
+  })
+
+  it('startNewEpoch resets the regime set and the stored gate', () => {
+    const db = makeDb()
+    db.prepare('CREATE TABLE IF NOT EXISTS kv_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)').run()
+    db.prepare("INSERT INTO kv_settings (key,value) VALUES ('trader.gate.regimes_seen','[\"bull\",\"bear\"]')").run()
+    db.prepare("INSERT INTO kv_settings (key,value) VALUES ('trader.gate.last','{\"passed\":true}')").run()
+    startNewEpoch(db, 42)
+    expect(readEpochStartMs(db)).toBe(42)
+    expect(db.prepare("SELECT value FROM kv_settings WHERE key='trader.gate.regimes_seen'").get()).toEqual({ value: '[]' })
+    expect(db.prepare("SELECT value FROM kv_settings WHERE key='trader.gate.last'").get()).toBeUndefined()
+  })
+
+  it('a new epoch changes the gate config fingerprint', () => {
+    const db = makeDb()
+    const before = gateConfigFingerprint(db)
+    startNewEpoch(db, 42)
+    expect(gateConfigFingerprint(db)).not.toBe(before)
+  })
+})
+
+
+function insertPassedStocksCohort(db: ReturnType<typeof makeDb>, id = 'stocks-passed') {
+  createDraftCohort(db, {
+    id, strategyId: 'momentum-stocks', assetClass: 'stocks', universe: ['SPY'],
+    dataVenue: 'alpaca', executionVenue: 'alpaca', feeBpsPerSide: 0, slippageBpsPerSide: 5,
+    benchmarkAsset: 'SPY', maxPositionUsd: 500, dailyTradeCap: 5,
+    claudepawRevision: '3f9b897', engineRevision: '4656022',
+  }, 'test')
+  db.prepare("UPDATE trader_strategies SET max_size_usd=500 WHERE id='momentum-stocks'").run()
+  db.prepare("UPDATE trader_evaluation_cohorts SET status='passed', started_at=1, ended_at=2 WHERE id=?").run(id)
+  db.prepare(`INSERT INTO trader_cohort_scorecards
+    (cohort_id,trade_count,win_count,net_pnl_usd,expectancy,sharpe,deflated_sharpe,max_drawdown_pct,benchmark_return,excess_return,
+     failure_rate,regimes_json,evidence_complete,passed,criteria_json,computed_at)
+    VALUES (?,120,70,900,0.004,1.4,1.1,0.05,0.01,0.02,0,'["bull","choppy"]',1,1,'[]',3)`).run(id)
+}
+
+describe('readCohortReadiness', () => {
+  it('a passed stocks cohort authorizes stocks without a Bitcoin cohort', () => {
+    const db = makeDb()
+    insertPassedStocksCohort(db)
+    const r = readCohortReadiness(db)
+    expect(r.passed).toBe(true)
+    expect(r.detail).toContain('stocks=passed')
+    expect(r.detail).toContain('bitcoin=research')
+  })
+
+  it('blocks without a passed stock cohort', () => {
+    const r = readCohortReadiness(makeDb())
+    expect(r.passed).toBe(false)
+    expect(r.detail).toContain('stocks=blocked')
+  })
+})
+
+describe('gate with the engine backtest report', () => {
+  it('uses the report for variants, trial variance and OOS Sharpe when present', async () => {
+    const db = makeDb()
+    const client = mockClient([]) as unknown as Record<string, unknown>
+    client.getMomentumBacktest = async () => { throw new Error('should not be called when the report exists') }
+    client.getBacktestReport = async () => ({
+      version: 1, computed_at_ms: 1, engine_revision: 'abc', days: 1260, universe: ['SPY'],
+      strategies: {
+        'momentum-stocks': {
+          live_params: { min_score: 0.7, horizon_days: 20 },
+          fixed_rule: { sharpe: 3.3, n_trades: 93 },
+          sweep: { n_trials: 8, sharpe_variance_per_period: 0.002, best: null, trials: [] },
+          walk_forward: { oos_sharpe: 0.9, oos_n_trades: 60, oos_expectancy: 0.004, oos_max_drawdown: 0.1, oos_win_rate: 0.55, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf' },
+        },
+        'mean-reversion-stocks': {
+          live_params: { min_score: 0.05, horizon_days: 10 },
+          fixed_rule: { sharpe: 1.0, n_trades: 40 },
+          sweep: { n_trials: 6, sharpe_variance_per_period: 0.001, best: null, trials: [] },
+          walk_forward: { oos_sharpe: 0.4, oos_n_trades: 30, oos_expectancy: 0.001, oos_max_drawdown: 0.2, oos_win_rate: 0.5, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf' },
+        },
+      },
+    })
+    const stored = await runGoLiveGate(db, client as unknown as EngineClient, 1_000)
+    const dsr = stored.criteria.find(c => c.name === 'deflated_sharpe')!
+    expect(dsr.detail).toContain('14 variants tested')
+    expect(dsr.detail).not.toContain('missing measured trial Sharpe variance')
+    expect(stored.backtest?.source).toBe('walk_forward_oos')
+    expect(stored.backtest?.sharpe).toBe(0.9)
+    expect(stored.backtest?.n_trials).toBe(14)
   })
 })

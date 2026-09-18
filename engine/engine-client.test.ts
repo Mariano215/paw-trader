@@ -31,6 +31,20 @@ describe("EngineClient", () => {
     expect(health?.alpaca_connected).toBe(true);
   });
 
+  it("getBacktestReport reads /backtest/report", async () => {
+    const report = { version: 1, computed_at_ms: 1, engine_revision: "abc", days: 1260, universe: ["SPY"], strategies: {} };
+    mockFetch.mockReturnValueOnce(mockResp(report));
+    const out = await client.getBacktestReport();
+    expect(out.version).toBe(1);
+    expect(mockFetch.mock.calls[0][0]).toBe("http://your-engine-host:8200/backtest/report");
+  });
+
+  it("getMeanReversionBacktest passes horizon_days when given", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({ strategy: "mean-reversion", n_trades: 0, sharpe: null }));
+    await client.getMeanReversionBacktest(600, 5);
+    expect(mockFetch.mock.calls[0][0]).toBe("http://your-engine-host:8200/backtest/mean-reversion?days=600&horizon_days=5");
+  });
+
   it("getHealth throws on 401", async () => {
     mockFetch.mockReturnValueOnce(mockResp({ error: "unauthorized" }, 401));
     await expect(client.getHealth()).rejects.toThrow("Engine API error 401");

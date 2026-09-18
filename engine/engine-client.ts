@@ -16,6 +16,7 @@ import type {
   SignalTelemetrySummary,
   MarkovRegimePayload,
   BacktestResult,
+  BacktestGateReport,
 } from "./types.js";
 import { getCredential } from "../credentials.js";
 import { logger } from "../logger.js";
@@ -412,6 +413,20 @@ export class EngineClient {
     // the default 10s client timeout would abort it every time.
     return this.request<BacktestResult>(
       `/backtest/momentum?days=${days}`,
+      { signal: AbortSignal.timeout(120_000) },
+    );
+  }
+
+  /** Engine-side sweep + walk-forward report written by scripts/run_backtest_gate.py. */
+  async getBacktestReport(): Promise<BacktestGateReport> {
+    return this.request<BacktestGateReport>('/backtest/report');
+  }
+
+  /** Historical simulation of the live mean-reversion rule; horizon override is a sensitivity study. */
+  async getMeanReversionBacktest(days = 1260, horizonDays?: number): Promise<BacktestResult> {
+    const qs = `days=${days}` + (horizonDays != null ? `&horizon_days=${horizonDays}` : '');
+    return this.request<BacktestResult>(
+      `/backtest/mean-reversion?${qs}`,
       { signal: AbortSignal.timeout(120_000) },
     );
   }

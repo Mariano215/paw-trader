@@ -23,7 +23,7 @@ import { evaluateGate, type GateResult } from './validation-gate.js'
 import type { EquityPoint } from './metrics.js'
 import { logger } from '../logger.js'
 import { createHash } from 'node:crypto'
-import type { EngineOrder } from './types.js'
+import type { BacktestGateReport, EngineOrder } from './types.js'
 import { readCompleteOrderHistory } from './engine-client.js'
 import { currentFingerprintMatches, type EvaluationCohortRow } from './evaluation-cohort.js'
 
@@ -33,6 +33,22 @@ const GATE_RUN_KV_KEY = 'trader.gate.last_run_ms'
 export const GATE_RUN_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000 // weekly
 export const GATE_VERSION = 3
 export const ACCOUNTING_KV_KEY = 'trader.accounting.last'
+export const TRADER_EPOCH_KV_KEY = 'trader.epoch_start_ms'
+
+/** Start of the current paper record. Everything the global gate scores is filtered to it. 0 when never set. */
+export function readEpochStartMs(db: Database.Database): number {
+  const raw = readKv(db, TRADER_EPOCH_KV_KEY)
+  const n = raw == null ? 0 : Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/** Operator action after a paper-account reset: count from now. Pre-epoch rows stay for audit. */
+export function startNewEpoch(db: Database.Database, nowMs = Date.now()): number {
+  writeKv(db, TRADER_EPOCH_KV_KEY, String(nowMs))
+  writeKv(db, GATE_REGIMES_KV_KEY, '[]')
+  db.prepare('DELETE FROM kv_settings WHERE key IN (?, ?)').run(GATE_KV_KEY, GATE_RUN_KV_KEY)
+  return nowMs
+}
 export const REQUIRED_GATE_CRITERIA = ['closed_trades', 'market_regimes', 'out_of_sample_no_retune',
   'deflated_sharpe', 'positive_expectancy', 'max_drawdown_kill', 'live_vs_backtest_degradation', 'evaluation_cohort'] as const
 
@@ -94,12 +110,14 @@ export function mergeBrokerFills(orders: EngineOrder[], archived: FillRow[]): Fi
 export async function computeBrokerTruth(client: EngineClient, db?: Database.Database): Promise<BrokerTruth> {
   // Keep awaits sequential so an incomplete/rolling-deploy client cannot
   // create an unhandled rejected promise while a second missing method throws.
-  const orders = await readCompleteOrderHistory(client)
+  const epoch = db ? readEpochStartMs(db) : 0
+  const orders = (await readCompleteOrderHistory(client)).filter(o => o.updated_at >= epoch)
   const positions = await client.getPositions()
   let archived: FillRow[] = []
   if (db) {
     archiveCumulativeOrderFills(db, orders)
-    archived = db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms, recorded_at').all() as FillRow[]
+    archived = (db.prepare('SELECT * FROM trader_fills ORDER BY fill_ts_ms, recorded_at').all() as FillRow[])
+      .filter(f => f.fill_ts_ms >= epoch)
   }
   const merged = mergeBrokerFills(orders, archived)
   const byAsset = new Map<string, FillRow[]>()
@@ -177,7 +195,7 @@ export function gateConfigFingerprint(db: Database.Database): string {
   // Explicit allowlist: never include credentials in evaluation fingerprints.
   const env = ['TRADER_SIGNAL_SCORE_THRESHOLD', 'TRADER_COMMITTEE_BYPASS', 'TRADER_DAILY_TRADE_CAP',
     'TRADER_STRATEGY_GATE_ENABLED', 'TRADER_BLIND_SIGNAL_SCORE_THRESHOLD'].map(k => [k, process.env[k] ?? null])
-  return createHash('sha256').update(JSON.stringify({version: GATE_VERSION, strategies, cohorts, knobs, env})).digest('hex')
+  return createHash('sha256').update(JSON.stringify({version: GATE_VERSION, epoch: readEpochStartMs(db), strategies, cohorts, knobs, env})).digest('hex')
 }
 
 export interface CohortReadiness {
@@ -196,9 +214,11 @@ export function readCohortReadiness(db: Database.Database): CohortReadiness {
     const valid = rows.filter(row => row.no_retune === 1 && row.mode === 'paper' && currentFingerprintMatches(db, row))
     const stocks = valid.some(row => row.asset_class === 'stocks')
     const bitcoin = valid.some(row => row.asset_class === 'crypto' && row.universe_json === '["BTC/USD"]')
+    // 2026-09-18: stocks go live on stock evidence alone. Bitcoin is research
+    // until a candidate passes its own frozen cohort; it is reported, not required.
     return {
-      passed: stocks && bitcoin,
-      detail: `stocks=${stocks ? 'passed' : 'blocked'} bitcoin=${bitcoin ? 'passed' : 'blocked'}; both frozen prospective cohorts required`,
+      passed: stocks,
+      detail: `stocks=${stocks ? 'passed' : 'blocked'} bitcoin=${bitcoin ? 'passed' : 'research'}; a passed frozen stock cohort is required`,
     }
   } catch {
     return {passed: false, detail: 'cohort evidence unavailable'}
@@ -254,6 +274,9 @@ export interface StoredGateResult {
    * two-minute simulation.
    */
   backtest?: {
+    /** walk_forward_oos: engine sweep + walk-forward report. fixed_rule: legacy in-sample momentum simulation. */
+    source: 'walk_forward_oos' | 'fixed_rule'
+    n_trials: number | null
     sharpe: number | null
     n_trades: number
     max_drawdown: number | null
@@ -303,55 +326,75 @@ export async function runGoLiveGate(
   let equityCurve: EquityPoint[] = []
   try {
     const snaps = await client.getNavSnapshots(365)
+    const epoch = readEpochStartMs(db)
     equityCurve = snaps
       .map((s) => ({ ts_ms: s.recorded_at, equity: s.nav }))
+      .filter((p) => p.ts_ms >= epoch)
       .sort((a, b) => a.ts_ms - b.ts_ms)
   } catch {
     logger.warn('Go-live gate: NAV snapshots unavailable; drawdown criterion blocked')
   }
 
-  // Every strategy ever tried counts as a trial, not just the ones still
-  // running. deflatedSharpe penalises the observed Sharpe by how many variants
-  // we searched over, so filtering to status='active' hid exactly the variants
-  // that make the penalty necessary: the ones tested and then paused or retired
-  // because they underperformed. Excluding them undercounts trials and inflates
-  // the deflated Sharpe, which biases the gate toward passing.
-  //
-  // Counting all rows still understates the true search: params tuned in place
-  // on one strategy row leave no trace here. Under-counting is the direction we
-  // can live with; under-counting AND discarding the failures is not.
-  const variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies").get() as { c: number }).c
+  // Which stock strategy is under evaluation: the running stocks cohort's, else momentum.
+  const runningStocks = db.prepare(`SELECT strategy_id FROM trader_evaluation_cohorts
+    WHERE status='running' AND asset_class='stocks' ORDER BY started_at DESC LIMIT 1`)
+    .get() as { strategy_id: string } | undefined
+  const gateStrategyId = runningStocks?.strategy_id ?? 'momentum-stocks'
 
-  // backtestSharpe from the engine's trade-level simulator, which imports the
-  // production _momentum_score directly so the backtested rule cannot drift
-  // from the traded one.
-  //
-  // This used to be a hardcoded 0. Because evaluateGate ANDs every criterion
-  // and live_vs_backtest_degradation returns false for any non-positive
-  // backtest Sharpe, that single constant made the gate incapable of passing
-  // no matter how the strategy performed. It was described as an honest
-  // blocker, and it was, but it also meant nobody could tell a blocked gate
-  // from a failing strategy.
-  //
-  // On failure we fall back to 0, which restores the old permanent block. That
-  // is the correct direction to fail: an unreachable backtest must never be
-  // read as a passing one.
-  let backtestSharpe = 0
-  let backtest: Awaited<ReturnType<typeof client.getMomentumBacktest>> | null = null
+  // Prefer the engine's sweep + walk-forward report. Every grid point across
+  // every stock strategy counts as a trial, and the cross-trial Sharpe variance
+  // is what the Deflated Sharpe formula needs. The recorded backtest Sharpe is
+  // the walk-forward OUT-OF-SAMPLE number, never the in-sample fixed rule.
+  // Fall back to the old inputs when the report is absent so an engine without
+  // it still produces a gate run (and stays blocked, never passes by accident).
+  let report: BacktestGateReport | null = null
   try {
-    backtest = await client.getMomentumBacktest()
-    // null sharpe means fewer than two closed trades, i.e. no answer. Leaving
-    // it at 0 keeps the gate blocked rather than inventing a verdict.
-    if (backtest.sharpe != null && Number.isFinite(backtest.sharpe)) {
-      backtestSharpe = backtest.sharpe
-    } else {
-      logger.warn(
-        { nTrades: backtest.n_trades, warnings: backtest.warnings },
-        'Go-live gate: backtest returned no Sharpe (too few trades), degradation criterion stays blocked',
-      )
-    }
+    const maybe = client as EngineClient & { getBacktestReport?: () => Promise<BacktestGateReport> }
+    report = typeof maybe.getBacktestReport === 'function' ? await maybe.getBacktestReport() : null
   } catch (err) {
-    logger.warn({ err }, 'Go-live gate: backtest unavailable, degradation criterion stays blocked')
+    logger.warn({ err }, 'Go-live gate: backtest report unavailable, falling back to fixed-rule momentum backtest')
+  }
+  const entry = report?.strategies?.[gateStrategyId] ?? null
+
+  let variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies").get() as { c: number }).c
+  let trialSharpeVariance: number | undefined
+  let backtestSharpe = 0
+  let backtestSnapshot: StoredGateResult['backtest'] = null
+  if (report && entry) {
+    variantsTested = Object.values(report.strategies).reduce((sum, b) => sum + (b.sweep?.n_trials ?? 0), 0)
+    trialSharpeVariance = entry.sweep.sharpe_variance_per_period ?? undefined
+    const oos = entry.walk_forward.oos_sharpe
+    if (oos != null && Number.isFinite(oos)) backtestSharpe = oos
+    backtestSnapshot = {
+      source: 'walk_forward_oos', n_trials: variantsTested,
+      sharpe: oos, n_trades: entry.walk_forward.oos_n_trades, max_drawdown: entry.walk_forward.oos_max_drawdown,
+      win_rate: entry.walk_forward.oos_win_rate, start: '', end: '', min_score: entry.live_params.min_score,
+      warnings: [`engine_revision ${report.engine_revision ?? 'unknown'}; computed ${new Date(report.computed_at_ms).toISOString()}`],
+    }
+  } else {
+    // Legacy path: in-sample fixed-rule momentum simulation from the engine's
+    // trade-level simulator. On failure backtestSharpe stays 0, which keeps
+    // the degradation criterion blocked: an unreachable backtest must never be
+    // read as a passing one.
+    try {
+      const backtest = await client.getMomentumBacktest()
+      if (backtest.sharpe != null && Number.isFinite(backtest.sharpe)) {
+        backtestSharpe = backtest.sharpe
+      } else {
+        logger.warn(
+          { nTrades: backtest.n_trades, warnings: backtest.warnings },
+          'Go-live gate: backtest returned no Sharpe (too few trades), degradation criterion stays blocked',
+        )
+      }
+      backtestSnapshot = {
+        source: 'fixed_rule', n_trials: null,
+        sharpe: backtest.sharpe, n_trades: backtest.n_trades, max_drawdown: backtest.max_drawdown,
+        win_rate: backtest.win_rate, start: backtest.start, end: backtest.end, min_score: backtest.min_score,
+        warnings: backtest.warnings,
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Go-live gate: backtest unavailable, degradation criterion stays blocked')
+    }
   }
 
   const result = evaluateGate({
@@ -359,6 +402,7 @@ export async function runGoLiveGate(
     equityCurve,
     regimesObserved: regimes.length,
     variantsTested: Math.max(1, variantsTested),
+    trialSharpeVariance,
     outOfSampleNoRetune: cohortReadiness.passed,
     backtestSharpe,
     liveReconReturns: closedReturns,
@@ -371,16 +415,7 @@ export async function runGoLiveGate(
   const stored: StoredGateResult = {
     version: GATE_VERSION,
     configFingerprint: gateConfigFingerprint(db),
-    backtest: backtest && {
-      sharpe: backtest.sharpe,
-      n_trades: backtest.n_trades,
-      max_drawdown: backtest.max_drawdown,
-      win_rate: backtest.win_rate,
-      start: backtest.start,
-      end: backtest.end,
-      min_score: backtest.min_score,
-      warnings: backtest.warnings,
-    },
+    backtest: backtestSnapshot,
     passed: result.passed,
     criteria: result.criteria,
     warnings: result.warnings,

@@ -492,6 +492,13 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
         WHERE id IN ('momentum-crypto','mean-reversion-hourly-crypto','trend-4h-crypto')`).run(Date.now())
     },
   },
+  {
+    version: 12,
+    description: 'Several running cohorts per asset-class sleeve; one per strategy stays unique',
+    up: (db) => {
+      db.exec('DROP INDEX IF EXISTS idx_trader_cohort_running_asset_class')
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {

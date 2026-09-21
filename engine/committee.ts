@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto'
+import { jevShadowJudge, type JevShadow } from './jev-judge.js'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
@@ -131,6 +132,8 @@ export interface CommitteeTranscript {
   risk_officer: RiskVerdict
   trader: TraderVerdict
   errors: string[]
+  /** Jev shadow judge answer, present only when the LLM committee ran and the knob is on. */
+  jev?: JevShadow
 }
 
 export interface CommitteeResult {
@@ -471,7 +474,7 @@ async function callAgent(
  * refined thesis/confidence/size and the caller (decision-dispatcher) plugs
  * those into the engine submit call.
  */
-export async function runCommittee(
+async function runCommitteeInner(
   signal: CommitteeSignalInput,
   deps: CommitteeDeps,
 ): Promise<CommitteeResult> {
@@ -875,4 +878,22 @@ export function storeTranscript(
   } catch (err) {
     logger.error({ err, transcriptId: result.transcript_id }, 'Failed to persist committee transcript')
   }
+}
+
+/**
+ * runCommittee = the committee above, plus the Jev shadow judge when the
+ * LLM panel actually ran (round 1 produced opinions or parse errors). The
+ * deterministic gate paths are skipped: nothing to compare against.
+ */
+export async function runCommittee(
+  ...args: Parameters<typeof runCommitteeInner>
+): ReturnType<typeof runCommitteeInner> {
+  const result = await runCommitteeInner(...args)
+  const t = result.transcript
+  const llmRan = t.round_1.length > 0 || t.errors.some((e) => e.startsWith('round1:'))
+  if (llmRan) {
+    const jev = await jevShadowJudge(buildSignalContext(args[0]), args[0].side)
+    if (jev) t.jev = jev
+  }
+  return result
 }

@@ -366,6 +366,9 @@ export function listOpenPositions(db: Database.Database): OpenPositionRow[] {
  * executed yet. exit_submitted counts too -- re-entering while the close is in
  * flight is the whipsaw we are trying to stop.
  */
+/** How long a fresh holding decision outranks a flat broker snapshot. Matches the engine's stale-entry cancel window. */
+export const HOLD_SETTLE_MS = 30 * 60 * 1000
+
 const HOLDING_STATUSES = [
   'submitting', 'submitted', 'pending_fill', 'executed', 'exit_submitted',
 ] as const
@@ -403,16 +406,11 @@ export function isAssetHeld(
      */
     positions?: Array<{ asset: string; qty: number }>
   },
+  nowMs: number = Date.now(),
 ): boolean {
-  if (params.positions) {
-    const flatAtBroker = !params.positions.some(
-      (p) => p.asset === params.asset && Math.abs(p.qty) > 1e-9,
-    )
-    if (flatAtBroker) return false
-  }
   const placeholders = HOLDING_STATUSES.map(() => '?').join(', ')
   const row = db.prepare(`
-    SELECT 1
+    SELECT MAX(d.decided_at) AS latest
     FROM trader_decisions d
     JOIN trader_signals s ON s.id = d.signal_id
     LEFT JOIN trader_verdicts v ON v.decision_id = d.id
@@ -421,9 +419,22 @@ export function isAssetHeld(
       AND s.strategy_id = ?
       AND d.status IN (${placeholders})
       AND v.decision_id IS NULL
-    LIMIT 1
-  `).get(params.asset, params.side, params.strategyId, ...HOLDING_STATUSES)
-  return row !== undefined
+  `).get(params.asset, params.side, params.strategyId, ...HOLDING_STATUSES) as { latest: number | null } | undefined
+  const latestHold = row?.latest ?? null
+  if (latestHold == null) return false
+  if (params.positions) {
+    const flatAtBroker = !params.positions.some(
+      (p) => p.asset === params.asset && Math.abs(p.qty) > 1e-9,
+    )
+    // Broker truth wins, except inside the settling window. The positions
+    // snapshot comes from the engine's reconcile (every 5 minutes in RTH), so
+    // for a few minutes after a fill the broker reads flat while the lot is
+    // real. On 2026-09-18 that opened AAPL and DBC twice each within 15
+    // minutes of the first fill. A fresh holding decision therefore counts as
+    // held even when the snapshot is flat; a stale one still defers to the broker.
+    if (flatAtBroker && nowMs - latestHold > HOLD_SETTLE_MS) return false
+  }
+  return true
 }
 
 /**

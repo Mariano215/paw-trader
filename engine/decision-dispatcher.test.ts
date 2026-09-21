@@ -1032,7 +1032,7 @@ describe('autoDispatchPendingSignals', () => {
     testDb.prepare(`INSERT INTO trader_decisions
       (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
        committee_transcript_id, decided_at, status)
-      VALUES ('dec-stale','sig-stale','buy','QQQ',2008.03,'limit','t',0.7,NULL,?,'executed')`).run(Date.now())
+      VALUES ('dec-stale','sig-stale','buy','QQQ',2008.03,'limit','t',0.7,NULL,?,'executed')`).run(Date.now() - 3 * 86_400_000) // decided days ago, well past the fill settling window
     testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
       VALUES ('sig-new','momentum-stocks','QQQ','buy',0.7,20,?,'pending')`).run(Date.now())
 

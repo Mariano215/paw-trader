@@ -374,6 +374,28 @@ describe('isAssetHeld (re-entry guard)', () => {
     expect(held()).toBe(false)
   })
 
+  // 2026-09-18: the engine positions snapshot lags fills by up to a reconcile
+  // tick, so "broker flat" right after a fill is stale, not truth. A fresh
+  // holding decision must still count as held; an old one defers to the broker.
+  it('stays true when the broker reads flat within the settling window after a fill', () => {
+    seedPosition({ id: 'd-fresh', status: 'executed' })
+    db.prepare("UPDATE trader_decisions SET decided_at = ? WHERE id = 'd-fresh'").run(1_000_000)
+    const flat = [{ asset: 'TLT', qty: 0 }]
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: flat }, 1_000_000 + 5 * 60_000)).toBe(true)
+  })
+
+  it('defers to a flat broker once the settling window has passed', () => {
+    seedPosition({ id: 'd-stale', status: 'executed' })
+    db.prepare("UPDATE trader_decisions SET decided_at = ? WHERE id = 'd-stale'").run(1_000_000)
+    const flat = [{ asset: 'TLT', qty: 0 }]
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: flat }, 1_000_000 + 2 * 3_600_000)).toBe(false)
+  })
+
+  it('is true when the broker holds the asset, whatever the decision age', () => {
+    seedPosition({ id: 'd-held', status: 'executed' })
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: [{ asset: 'TLT', qty: 3 }] }, Date.now() + 9 * 3_600_000)).toBe(true)
+  })
+
   it('is false for a failed decision, which never reached the book', () => {
     seedPosition({ id: 'd-failed', status: 'failed' })
     expect(held()).toBe(false)

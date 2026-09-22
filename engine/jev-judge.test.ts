@@ -54,3 +54,15 @@ describe('jevShadowJudge', () => {
     expect(jevQuestions('sell').action.criteria.enter).toMatch(/short/)
   })
 })
+
+import { jevGateVerdict } from './jev-judge.js'
+
+describe('jevGateVerdict', () => {
+  it('vetoes on abstain, halves on size_half, fails open on error or missing', () => {
+    expect(jevGateVerdict({ latency_ms: 1, action: 'abstain', p_enter: 0.3 }).veto).toBe(true)
+    expect(jevGateVerdict({ latency_ms: 1, action: 'enter', size_half: 0.6 })).toMatchObject({ veto: false, halve: true })
+    expect(jevGateVerdict({ latency_ms: 1, action: 'enter', size_half: 0.2 })).toMatchObject({ veto: false, halve: false })
+    expect(jevGateVerdict({ latency_ms: 1, action: 'abstain', error: 'HTTP 500' }).veto).toBe(false)
+    expect(jevGateVerdict(null).veto).toBe(false)
+  })
+})

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { jevShadowJudge, type JevShadow } from './jev-judge.js'
+import { jevShadowJudge, jevGateOn, jevGateVerdict, type JevShadow } from './jev-judge.js'
 import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
@@ -881,7 +881,8 @@ export function storeTranscript(
 }
 
 /**
- * runCommittee = the committee above, plus the Jev shadow judge when the
+ * runCommittee = the committee above, plus the Jev judge (shadow, or a
+ * veto-only gate with the jev_gate knob) when the
  * LLM panel actually ran (round 1 produced opinions or parse errors). The
  * deterministic gate paths are skipped: nothing to compare against.
  */
@@ -894,6 +895,17 @@ export async function runCommittee(
   if (llmRan) {
     const jev = await jevShadowJudge(buildSignalContext(args[0]), args[0].side)
     if (jev) t.jev = jev
+    if (jev && jevGateOn() && result.decision === 'approve') {
+      const g = jevGateVerdict(jev)
+      if (g.veto) {
+        t.errors.push(`jev_gate: ${g.reason}`)
+        return { ...result, decision: 'abstain', action: null, size_usd: 0, thesis: `${g.reason}. ${result.thesis}` }
+      }
+      if (g.halve) {
+        t.errors.push(`jev_gate: ${g.reason}, size halved`)
+        return { ...result, size_usd: result.size_usd / 2 }
+      }
+    }
   }
   return result
 }

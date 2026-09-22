@@ -1,7 +1,9 @@
 // Jev shadow judge. Asks TypeSafe's Jev model the same question the LLM
 // committee answers, in one typed call (about 300 ms), and records the
-// answer next to the committee transcript. Decides nothing. Turn on with
-// the trader knob `jev_shadow` = true; needs TYPESAFE_API_KEY in .env.
+// answer next to the committee transcript. With `jev_shadow` it decides
+// nothing. With `jev_gate` it can veto an approval or halve its size, never
+// approve on its own; any Jev error leaves the committee result as is.
+// Needs TYPESAFE_API_KEY in .env.
 import { logger } from '../logger.js'
 import { traderKnob } from './knobs.js'
 
@@ -44,7 +46,23 @@ export function jevQuestions(side: 'buy' | 'sell') {
 }
 
 export function jevEnabled(): boolean {
-  return traderKnob('jev_shadow', false) && Boolean(process.env.TYPESAFE_API_KEY)
+  return (traderKnob('jev_shadow', false) || jevGateOn()) && Boolean(process.env.TYPESAFE_API_KEY)
+}
+
+export function jevGateOn(): boolean {
+  return traderKnob('jev_gate', false)
+}
+
+export interface JevGateVerdict { veto: boolean; halve: boolean; reason?: string }
+
+/** Veto-only: Jev can block or shrink an approval, never create one. Errors fail open. */
+export function jevGateVerdict(jev: JevShadow | null | undefined): JevGateVerdict {
+  if (!jev || jev.error) return { veto: false, halve: false }
+  if (jev.action === 'abstain') {
+    return { veto: true, halve: false, reason: `Jev abstain (p_enter=${jev.p_enter?.toFixed(2) ?? '?'})` }
+  }
+  const halve = (jev.size_half ?? 0) >= 0.5
+  return { veto: false, halve, reason: halve ? `Jev size_half=${jev.size_half?.toFixed(2)}` : undefined }
 }
 
 /** Never throws. Returns null when disabled, `{ error }` on any failure. */

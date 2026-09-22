@@ -12,6 +12,7 @@
  *   - target:   last price reached the stored take_profit
  *   - time:     now - decided_at exceeded horizon_days (time-stop)
  *   - momentum: 20d momentum flipped against a long / short
+ *   - earnings: a single stock reports today or tomorrow (see earnings.ts)
  *
  * Hot-path rules (mirrors close-out-watcher):
  *   - One positions round-trip per sweep; historical data only when a
@@ -32,6 +33,7 @@ import { DECISION_STATUS } from './order-lifecycle.js'
 import { isEquityMarketHours } from './signal-poller.js'
 import { notifyUnexpectedShortPositions, POSITION_QTY_EPSILON } from './position-safety.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
+import { daysToEarnings } from './earnings.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 export const EXIT_MARK_MAX_AGE_MS = 5 * 60 * 1000
@@ -57,7 +59,7 @@ export interface OpenExitRow {
   cohort_id: string | null
 }
 
-export type ExitReason = 'stop' | 'target' | 'time' | 'momentum' | 'hold'
+export type ExitReason = 'stop' | 'target' | 'time' | 'momentum' | 'earnings' | 'hold'
 
 export interface ExitDecision {
   exit: boolean
@@ -247,6 +249,11 @@ export async function runExitSweep(
       const last = Number.isFinite(mark) && mark > 0 && Number.isFinite(pos.updated_at) &&
         nowMs >= pos.updated_at && nowMs - pos.updated_at <= EXIT_MARK_MAX_AGE_MS ? mark : null
       let verdict = evaluateExit(row, {lastPrice: last, nowMs})
+      // A stop cannot protect across an overnight earnings gap. Leave first.
+      if (!verdict.exit && !isCrypto) {
+        const d = await daysToEarnings(row.asset, nowMs)
+        if (d != null && d <= 1) verdict = { exit: true, reason: 'earnings', side: verdict.side }
+      }
       // Stops and time exits do not wait on historical market-data requests.
       if (!verdict.exit) {
         try {

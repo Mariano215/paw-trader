@@ -892,7 +892,9 @@ export async function runCommittee(
   const result = await runCommitteeInner(...args)
   const t = result.transcript
   const llmRan = t.round_1.length > 0 || t.errors.some((e) => e.startsWith('round1:'))
-  if (llmRan) {
+  // Shadow mode compares only real LLM panels. The gate also checks
+  // approvals from the deterministic path, which had no second opinion.
+  if (llmRan || (jevGateOn() && result.decision === 'approve')) {
     const jev = await jevShadowJudge(buildSignalContext(args[0]), args[0].side)
     if (jev) t.jev = jev
     if (jev && jevGateOn() && result.decision === 'approve') {

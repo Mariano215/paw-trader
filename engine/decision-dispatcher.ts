@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
+import { daysToEarnings, earningsBlackoutDays } from './earnings.js'
 import {
   runCommittee,
   storeTranscript,
@@ -694,7 +695,14 @@ export async function autoDispatchPendingSignals(
       // only covers pending/dispatching signals, so a re-emitted candidate
       // would open a second identical lot on the very next tick. Costs one
       // indexed query and saves the whole committee call.
-      if (isAssetHeld(db, {
+      // One position per symbol across ALL strategies: the broker holding the
+      // asset in this direction blocks a new lot even if another strategy
+      // opened it. Two strategies share one broker position, so one
+      // strategy's exit would sell the other's shares.
+      const brokerHolds = brokerPositions?.some(
+        (p) => p.asset === signal.asset && (signal.side === 'buy' ? p.qty > 1e-9 : p.qty < -1e-9),
+      ) ?? false
+      if (brokerHolds || isAssetHeld(db, {
         asset: signal.asset,
         side: signal.side,
         strategyId: signal.strategy_id,
@@ -706,6 +714,15 @@ export async function autoDispatchPendingSignals(
         )
         db.prepare("UPDATE trader_signals SET status = 'suppressed_already_held' WHERE id = ?").run(signal.id)
         recordSignalSuppressionBySignalId(db, signal.id, 'already_held')
+        continue
+      }
+
+      // Gate -0.5: earnings blackout for single stocks (knob earnings_blackout_days).
+      const earnDays = await daysToEarnings(signal.asset)
+      if (earnDays != null && earnDays <= earningsBlackoutDays()) {
+        logger.info({ event: 'trader.gate.earnings', signalId: signal.id, asset: signal.asset, earnDays }, 'earnings inside blackout window, suppressing entry')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_earnings' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'earnings')
         continue
       }
 

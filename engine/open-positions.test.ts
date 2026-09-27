@@ -54,6 +54,14 @@ describe('listOpenPositions', () => {
     expect(open.find(o => o.decision_id === 'dec-open-1')!.cost_basis_usd).toBe(100)
   })
 
+  it('uses filled notional as cost basis when fills are known', () => {
+    // 2026-09-18: $500 requested, 1 AAPL share filled at 336.71. The report
+    // showed $500 cost next to a ~$337 market value.
+    seedExecuted(db, 'dec-filled', 'AAPL', 500)
+    db.prepare('UPDATE trader_decisions SET filled_qty = 1, filled_avg_price = 336.71 WHERE id = ?').run('dec-filled')
+    expect(listOpenPositions(db)[0].cost_basis_usd).toBeCloseTo(336.71)
+  })
+
   it('ignores non-executed decisions', () => {
     seedExecuted(db, 'dec-open-1', 'AAPL', 100)
     db.prepare(`

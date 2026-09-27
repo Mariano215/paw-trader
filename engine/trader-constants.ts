@@ -14,7 +14,9 @@
  *  decision) so the risk model owns sizing for the paper evaluation: 1%
  *  equity risk / 8% stop suggests ~$12.5k on a $100k NAV, the NAV*2%
  *  fallback cap clamps to ~$2k, and this ceiling is the absolute backstop.
+ *  Lifted to $10000 on 2026-09-27: sizing is 0.5% NAV risk over the real
+ *  stop distance (~$8.3k at a 6% stop on $100k).
  *  MUST move in lockstep with the engine's per-trade cap (trader-engine
  *  src/trader_engine/risk/position_sizer.py DEFAULT_SIZE_USD) -- the engine
  *  silently clips anything above its own cap. */
-export const HARD_CEILING_USD = 2500
+export const HARD_CEILING_USD = 10000

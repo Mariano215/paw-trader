@@ -11,7 +11,7 @@ import { recordTraderOperationalEvent, type TraderOperationalState } from './ope
 
 export const COHORT_ENFORCEMENT_KV_KEY = 'trader.cohorts.enforced'
 export const COHORT_CONFIG_VERSION = 1
-export const STOCK_PAPER_MAX_POSITION_USD = 500
+export const STOCK_PAPER_MAX_POSITION_USD = 10000
 export const CRYPTO_PAPER_MAX_POSITION_USD = 200
 export const PAPER_MAX_DAILY_TRADES = 5
 

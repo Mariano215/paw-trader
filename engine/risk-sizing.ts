@@ -1,7 +1,8 @@
 import type { EnginePosition } from './types.js'
 
-/** Default per-trade risk as a fraction of equity (1%). Range 0.5%-2%. */
-export const DEFAULT_RISK_PCT = 0.01
+/** Default per-trade risk as a fraction of equity (0.5%). Range 0.5%-2%.
+ *  Operators override it with the trader knob risk_pct (percent units). */
+export const DEFAULT_RISK_PCT = 0.005
 
 /** Default stop distance as a fraction of entry when no ATR/stop is provided.
  *  8% is a conservative momentum stop; tighten per-strategy later. */
@@ -103,6 +104,14 @@ export function computeRiskBasedSize(input: RiskSizingInput): RiskSizingResult {
       ? `portfolio heat ${(heatBeforePct * 100).toFixed(1)}% at/over ceiling ${(MAX_PORTFOLIO_HEAT_PCT * 100).toFixed(0)}%; size 0`
       : `risk ${(riskPct * 100).toFixed(2)}% of NAV / stop ${(stopDistancePct * 100).toFixed(0)}% -> $${sizeUsd}`,
   }
+}
+
+/** Stop distance as a fraction of entry, from the exit-calculator's stop.
+ *  undefined when either price is unusable, so sizing falls back to the default. */
+export function stopDistanceFromExits(entryPrice: number | null, stopLoss: number | null): number | undefined {
+  if (entryPrice == null || stopLoss == null || !(entryPrice > 0) || !(stopLoss > 0)) return undefined
+  const pct = Math.abs(entryPrice - stopLoss) / entryPrice
+  return pct > 0 && Number.isFinite(pct) ? pct : undefined
 }
 
 /** Derive the stop price the brain would set, given entry and stop distance.

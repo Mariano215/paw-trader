@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { computeRiskBasedSize, deriveStopPrice, MAX_PORTFOLIO_HEAT_PCT, DEFAULT_STOP_DISTANCE_PCT } from './risk-sizing.js'
+import { computeRiskBasedSize, deriveStopPrice, stopDistanceFromExits, MAX_PORTFOLIO_HEAT_PCT, DEFAULT_STOP_DISTANCE_PCT } from './risk-sizing.js'
 import type { EnginePosition } from './types.js'
 
 function pos(mv: number): EnginePosition {
@@ -9,20 +9,20 @@ function pos(mv: number): EnginePosition {
 describe('risk-based sizing', () => {
   it('sizes off risk% and stop distance', () => {
     // nav 10000, risk 1% = $100 risk, stop 8% -> size 100 / 0.08 = 1250, capped at 2000
-    const r = computeRiskBasedSize({ nav: 10000, positions: [], capUsd: 2000, floorUsd: 50 })
+    const r = computeRiskBasedSize({ nav: 10000, riskPct: 0.01, positions: [], capUsd: 2000, floorUsd: 50 })
     expect(r.sizeUsd).toBe(1250)
     expect(r.riskUsd).toBe(100)
   })
 
   it('clamps to the per-strategy cap', () => {
-    const r = computeRiskBasedSize({ nav: 10000, positions: [], capUsd: 500, floorUsd: 50 })
+    const r = computeRiskBasedSize({ nav: 10000, riskPct: 0.01, positions: [], capUsd: 500, floorUsd: 50 })
     expect(r.sizeUsd).toBe(500)
   })
 
   it('blocks new risk when portfolio heat is at the ceiling', () => {
     // committed heat = market_value * stop 8%. To hit 6% of 10000 = $600 heat,
     // need market_value 600 / 0.08 = 7500.
-    const r = computeRiskBasedSize({ nav: 10000, positions: [pos(7500)], capUsd: 2000, floorUsd: 50 })
+    const r = computeRiskBasedSize({ nav: 10000, riskPct: 0.01, positions: [pos(7500)], capUsd: 2000, floorUsd: 50 })
     expect(r.riskUsd).toBe(0)
     expect(r.sizeUsd).toBe(0)
   })
@@ -38,7 +38,7 @@ describe('risk-based sizing', () => {
 
   it('reports heatBeforePct correctly', () => {
     // market_value 1000, stop 8% -> heat 80. nav 10000 -> heatBeforePct 0.0080
-    const r = computeRiskBasedSize({ nav: 10000, positions: [pos(1000)], capUsd: 2000, floorUsd: 50 })
+    const r = computeRiskBasedSize({ nav: 10000, riskPct: 0.01, positions: [pos(1000)], capUsd: 2000, floorUsd: 50 })
     expect(r.heatBeforePct).toBe(0.008)
     // headroom: ceiling 600 - 80 = 520 heat left -> riskUsd = min(100, 520) = 100 -> size = 1250
     expect(r.sizeUsd).toBe(1250)
@@ -74,7 +74,7 @@ describe('risk-based sizing', () => {
   it('cap always wins over floor: floor never overrides the per-strategy cap', () => {
     // capUsd=150, floorUsd=200. Risk sizing would want to floor up to 200,
     // but the cap must always win -> sizeUsd must be <= 150.
-    const r = computeRiskBasedSize({ nav: 10000, positions: [], capUsd: 150, floorUsd: 200 })
+    const r = computeRiskBasedSize({ nav: 10000, riskPct: 0.01, positions: [], capUsd: 150, floorUsd: 200 })
     expect(r.sizeUsd).toBeLessThanOrEqual(150)
   })
 
@@ -87,5 +87,21 @@ describe('risk-based sizing', () => {
       floorUsd: 200,
     })
     expect(r.sizeUsd).toBe(0)
+  })
+})
+
+describe('stopDistanceFromExits', () => {
+  it('returns the fractional distance for a long stop', () => {
+    expect(stopDistanceFromExits(100, 94)).toBeCloseTo(0.06)
+  })
+  it('returns undefined when a price is missing or zero', () => {
+    expect(stopDistanceFromExits(null, 94)).toBeUndefined()
+    expect(stopDistanceFromExits(100, null)).toBeUndefined()
+    expect(stopDistanceFromExits(0, 94)).toBeUndefined()
+  })
+  it('sizes a $100k book at 0.5% risk and a 6% stop to ~$8.3k', () => {
+    const r = computeRiskBasedSize({ nav: 100_000, positions: [], capUsd: 10_000, floorUsd: 200,
+      stopDistancePct: stopDistanceFromExits(100, 94) })
+    expect(r.sizeUsd).toBe(8333.33)
   })
 })

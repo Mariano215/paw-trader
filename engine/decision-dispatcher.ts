@@ -886,10 +886,34 @@ export async function autoDispatchPendingSignals(
       } else {
         autoCapUsd = Math.min(autoNavUsable ? autoNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD, HARD_CEILING_USD)
       }
-      const { computeRiskBasedSize } = await import('./risk-sizing.js')
+      const decisionId = randomUUID()
+      const now        = Date.now()
+
+      // Resolve an entry reference price so the exit-calculator can size
+      // stop/target off it. entry_price stays 0 on the wire when unknown
+      // (the engine resolves via market price), but exits need a concrete
+      // number: null entry -> null exits -> a position with no stop, which
+      // was 152 of 350 buys over the 60 days to 2026-07-22. Enrichment first,
+      // engine close as fallback. Computed before sizing so the size is set
+      // off the real stop distance, not a flat 8% guess.
+      const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
+      const entryRef = await resolveEntryReferencePrice(
+        engineClient, signal.asset, signal.enrichment_json, now,
+      )
+      const exits = computeExits({
+        side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
+        entryPrice: entryRef,
+        horizonDays: signal.horizon_days,
+        enrichment: signal.enrichment_json ?? null,
+      })
+
+      const { computeRiskBasedSize, stopDistanceFromExits, DEFAULT_RISK_PCT } = await import('./risk-sizing.js')
       const autoSizePositions = brokerPositions ?? await engineClient.getPositions().catch(() => [] as EnginePosition[])
       const autoRiskSize = computeRiskBasedSize({
         nav: autoNavForSize,
+        // Knob is a percent of NAV (0.5 = 0.5%).
+        riskPct: traderKnob('risk_pct', DEFAULT_RISK_PCT * 100) / 100,
+        stopDistancePct: stopDistanceFromExits(entryRef, exits.stopLoss),
         positions: autoSizePositions,
         capUsd: autoCapUsd,
         floorUsd: DEFAULT_SIZE_USD,
@@ -902,25 +926,6 @@ export async function autoDispatchPendingSignals(
         continue
       }
       let sizeUsd      = autoRiskSize.sizeUsd
-      const decisionId = randomUUID()
-      const now        = Date.now()
-
-      // Resolve an entry reference price so the exit-calculator can size
-      // stop/target off it. entry_price stays 0 on the wire when unknown
-      // (the engine resolves via market price), but exits need a concrete
-      // number: null entry -> null exits -> a position with no stop, which
-      // was 152 of 350 buys over the 60 days to 2026-07-22. Enrichment first,
-      // engine close as fallback.
-      const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
-      const entryRef = await resolveEntryReferencePrice(
-        engineClient, signal.asset, signal.enrichment_json, now,
-      )
-      const exits = computeExits({
-        side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
-        entryPrice: entryRef,
-        horizonDays: signal.horizon_days,
-        enrichment: signal.enrichment_json ?? null,
-      })
 
       // Correlation-cluster exposure gate (deterministic, pre-submit). Uses the
       // already-fetched positions and NAV from the risk-sizing step above.

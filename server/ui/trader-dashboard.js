@@ -1886,7 +1886,14 @@ function _renderCol3SignalFunnel(col, data) {
     var fillColor = i === 0 ? 'var(--accent, var(--color-primary))' :
                     i === 2 ? (s.pct < 5 ? 'var(--color-danger)' : 'var(--color-success)') :
                     'var(--accent, var(--color-primary))';
-    fill.style.cssText = 'width:' + s.pct + '%;background:' + fillColor;
+    // .trader-role-bar-fill carries `transition: width 0.3s ease`, but this
+    // node is created fresh on every render, so it is born at its final width
+    // and the transition never fires. Start at zero and set the real width on
+    // the next frame so the browser has a value to animate from.
+    fill.style.cssText = 'width:0%;background:' + fillColor;
+    (function (el, pct) {
+      requestAnimationFrame(function () { el.style.width = pct + '%'; });
+    })(fill, s.pct);
     track.appendChild(fill);
 
     row.appendChild(labelRow);

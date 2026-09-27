@@ -34,7 +34,7 @@ interface VerdictForRollup {
   pnl_gross: number
   pnl_net: number
   closed_at: number
-  cost_basis_usd: number  // computed via decision.size_usd; used for pnl_pct
+  cost_basis_usd: number  // filled notional, else requested size_usd; used for pnl_pct
 }
 
 /**
@@ -55,7 +55,7 @@ function getVerdictsForStrategy(
 ): VerdictForRollup[] {
   return db.prepare(`
     SELECT v.pnl_gross, v.pnl_net, v.closed_at,
-           COALESCE(d.size_usd, 0) AS cost_basis_usd
+           COALESCE(d.filled_qty * d.filled_avg_price, d.size_usd, 0) AS cost_basis_usd
     FROM trader_verdicts v
     JOIN trader_decisions d ON d.id = v.decision_id
     JOIN trader_signals   s ON s.id = d.signal_id
@@ -347,7 +347,7 @@ export function listOpenPositions(db: Database.Database): OpenPositionRow[] {
       d.asset       AS asset,
       s.side        AS side,
       s.strategy_id AS strategy_id,
-      COALESCE(d.size_usd, 0) AS cost_basis_usd,
+      COALESCE(d.filled_qty * d.filled_avg_price, d.size_usd, 0) AS cost_basis_usd,
       d.decided_at  AS decided_at
     FROM trader_decisions d
     JOIN trader_signals s ON s.id = d.signal_id

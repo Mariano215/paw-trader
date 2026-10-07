@@ -248,6 +248,16 @@ export interface BacktestGateStrategy {
     step: number;
     method: string;
   };
+  /** Report v2+: OOS at 2x costs and OOS split by market type (engine regime_stress.py). */
+  stress?: BacktestStress;
+}
+
+export interface BacktestBucket { n: number; expectancy: number; win_rate: number; sharpe: number | null }
+
+export interface BacktestStress {
+  cost_x2: { oos_n_trades: number; oos_sharpe: number | null; oos_expectancy: number | null };
+  vol: Record<string, BacktestBucket>;
+  trend: Record<string, BacktestBucket>;
 }
 
 /** GET /backtest/report. Keys of `strategies` are ClaudePaw strategy ids. */

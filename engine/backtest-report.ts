@@ -8,6 +8,9 @@ import type { CohortBacktestEvidence } from './evaluation-cohort.js'
 /** Engine default_universe() as of 2026-09-18, frozen here so the cohort covers every symbol the engine scores. */
 export const V2_STOCK_UNIVERSE = ['SPY', 'QQQ', 'IWM', 'VTI', 'AAPL', 'MSFT', 'TLT', 'IEF', 'GLD', 'DBC', 'EFA', 'EEM']
 
+/** Engine default_universe() as of 2026-10-07: V2 plus the nine US sector SPDRs. */
+export const V4_STOCK_UNIVERSE = [...V2_STOCK_UNIVERSE, 'XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLP', 'XLU', 'XLY', 'XLB']
+
 export function backtestEvidenceFromReport(report: BacktestGateReport, strategyId: string, configFingerprint: string): CohortBacktestEvidence {
   const entry = report.strategies?.[strategyId]
   if (!entry) throw new Error(`no report entry for ${strategyId}`)

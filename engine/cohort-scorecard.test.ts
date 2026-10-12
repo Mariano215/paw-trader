@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { createDraftCohort } from './evaluation-cohort.js'
-import { evaluateCohort, refreshCohortScorecards } from './cohort-scorecard.js'
+import { cohortDailyReturns, evaluateCohort, refreshCohortScorecards } from './cohort-scorecard.js'
+import { sharpe } from './metrics.js'
 
 function setup() {
   const db = new Database(':memory:')
@@ -106,5 +107,37 @@ describe('cohort scorecard', () => {
     expect(db.prepare("SELECT trade_count,passed FROM trader_cohort_scorecards WHERE cohort_id='btc-v1'").get())
       .toEqual({trade_count:1,passed:0})
     expect(db.prepare("SELECT status FROM trader_evaluation_cohorts WHERE id='btc-v1'").get()).toEqual({status:'running'})
+  })
+
+  it('scores Sharpe on daily cohort returns over fixed capital, with flat days at zero', () => {
+    const day = 86_400_000
+    addRoundTrip(db,'a',100,110,1_000_000+day,'btc-v1')
+    addRoundTrip(db,'b',100,95,1_000_000+3*day,'btc-v1')
+    const now = 1_000_000+5*day
+    const daily = cohortDailyReturns(db,'btc-v1',now)
+    expect(daily.length).toBeGreaterThanOrEqual(5)
+    expect(daily.filter(r => r !== 0)).toHaveLength(2)
+    // Capital is max position x 10 = $2,000. Trade a nets about $9.27 after 35 bps per leg.
+    expect(daily.find(r => r > 0)).toBeCloseTo((10 - 210*0.0035)/2000, 6)
+    const score = evaluateCohort(db,'btc-v1',now)
+    expect(score.sharpe).toBeCloseTo(sharpe(daily), 10)
+    expect(score.tradeCount).toBe(2)
+  })
+
+  it('runs the Deflated Sharpe check on the recorded daily backtest, not on paper', () => {
+    const blob = {report_version:3,n_trials:4,sharpe_variance_per_period:0.0001,
+      walk_forward:{oos_sharpe:1.5,oos_n_days:1000,oos_daily_skew:0,oos_daily_kurtosis:3}}
+    db.prepare('UPDATE trader_evaluation_cohorts SET backtest_report_json=? WHERE id=?').run(JSON.stringify(blob),'btc-v1')
+    addRoundTrip(db,'cohort',100,102,20,'btc-v1')
+    const score = evaluateCohort(db,'btc-v1',100)
+    expect(score.deflatedSharpe).toBeGreaterThan(0.95)
+    expect(score.criteria.find(c=>c.name==='deflated_sharpe')).toMatchObject({passed:true})
+    expect(score.criteria.find(c=>c.name==='deflated_sharpe')?.detail).toContain('5 trials')
+
+    db.prepare('UPDATE trader_evaluation_cohorts SET backtest_report_json=? WHERE id=?')
+      .run(JSON.stringify({...blob,report_version:2}),'btc-v1')
+    const v2 = evaluateCohort(db,'btc-v1',100)
+    expect(v2.deflatedSharpe).toBe(0)
+    expect(v2.criteria.find(c=>c.name==='deflated_sharpe')?.detail).toContain('no daily v3 backtest')
   })
 })

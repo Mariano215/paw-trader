@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { bypassesScoreThreshold } from './backtest-report.js'
 import { logger } from '../logger.js'
 import type { EngineClient } from './engine-client.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
@@ -164,12 +165,14 @@ export async function pollAndStoreSignals(
     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'pending')
   `)
 
-  // Check if a pending signal already exists for this asset+side.
+  // Check if a pending signal already exists for this asset+side+strategy.
   // Prevents the engine from flooding the queue with duplicate signals in
-  // one poll cycle or across cycles when the user has not acted yet.
+  // one poll cycle or across cycles when the user has not acted yet. Keyed
+  // per strategy so one strategy's stuck signal never blocks another; the
+  // dispatcher's already_held gate still allows one position per symbol.
   const hasPending = db.prepare(`
     SELECT 1 FROM trader_signals
-    WHERE asset = ? AND side = ? AND status = 'pending'
+    WHERE asset = ? AND side = ? AND strategy_id = ? AND status = 'pending'
     LIMIT 1
   `)
 
@@ -177,7 +180,7 @@ export async function pollAndStoreSignals(
     let stored = 0
     let filtered = 0
     let deduped = 0
-    // Track which asset+side slots we have already inserted this
+    // Track which asset+side+strategy slots we have already inserted this
     // cycle to handle batches where the engine returns multiple IDs for the
     // same opportunity.
     const seenThisCycle = new Set<string>()
@@ -204,7 +207,8 @@ export async function pollAndStoreSignals(
           },
         })
       }
-      if (Math.abs(c.raw_score) < SCORE_THRESHOLD) {
+      // Binary-entry strategies (rsi2, ibs) take any positive score, as their backtest does.
+      if (bypassesScoreThreshold(strategyId) ? !(Math.abs(c.raw_score) > 0) : Math.abs(c.raw_score) < SCORE_THRESHOLD) {
         filtered += 1
         recordEvaluation('suppressed', 'below_threshold')
         continue
@@ -219,7 +223,7 @@ export async function pollAndStoreSignals(
         continue
       }
 
-      const key = `${c.asset.toUpperCase()}|${c.side}`
+      const key = `${c.asset.toUpperCase()}|${c.side}|${strategyId}`
 
       // Skip if already seen in this batch
       if (seenThisCycle.has(key)) {
@@ -229,7 +233,7 @@ export async function pollAndStoreSignals(
       }
 
       // Skip if a pending signal already exists in the DB for this slot
-      const existing = hasPending.get(c.asset.toUpperCase(), c.side)
+      const existing = hasPending.get(c.asset.toUpperCase(), c.side, strategyId)
       if (existing) {
         deduped += 1
         seenThisCycle.add(key)

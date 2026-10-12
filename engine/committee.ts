@@ -8,6 +8,7 @@ import { logger } from '../logger.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
+import { bypassesScoreThreshold, isMeanReversionFamily } from './backtest-report.js'
 import { rollupRecentOutcomes, type AssetClass } from './reasoning-bank.js'
 import type { MarkovRegimePayload } from './types.js'
 import type { SignalEnrichment } from './enrichment-fetcher.js'
@@ -344,7 +345,7 @@ function applyDeterministicRiskGate(
   // Mean-reversion strategies skip the Markov conflict veto: a bear/oversold
   // regime is the entry condition, not a contraindication. Mirrors the pre-gate
   // bypass in decision-dispatcher.ts.
-  const isMeanReversion = (strategyId ?? '').startsWith('mean-reversion')
+  const isMeanReversion = isMeanReversionFamily(strategyId ?? '')
 
   if (markov !== null) {
     const markovSignal = markov.markov_signal
@@ -407,8 +408,10 @@ export function buildSignalContext(signal: CommitteeSignalInput): string {
     `side: ${signal.side}`,
     `raw_score: ${signal.raw_score}`,
     `abs_raw_score: ${absRawScore}`,
-    `score_threshold: ${TRADER_SIGNAL_SCORE_THRESHOLD}`,
-    `score_multiple_of_threshold: ${scoreMultiple.toFixed(2)}`,
+    // A binary rule's score is setup depth, not strength; a threshold multiple would mislead the panel.
+    ...(bypassesScoreThreshold(signal.strategy_id)
+      ? ['entry_rule: binary; the strategy entry rule fired, so any positive score is a valid entry']
+      : [`score_threshold: ${TRADER_SIGNAL_SCORE_THRESHOLD}`, `score_multiple_of_threshold: ${scoreMultiple.toFixed(2)}`]),
     `horizon_days: ${signal.horizon_days}`,
     `enrichment: ${enrichment}`,
   ].join('\n')
@@ -510,7 +513,8 @@ async function runCommitteeInner(
   // Deterministic momentum gate: clean, strong buys on lean assets skip the
   // LLM panel entirely (faster, cheaper, no parse-failure abstains). Only
   // ambiguous cases ('escalate') fall through to the committee below.
-  if (isLeanAsset && signal.side === 'buy') {
+  // Binary-entry strategies (rsi2, ibs) skip it: their score is not a strength threshold.
+  if (isLeanAsset && signal.side === 'buy' && !bypassesScoreThreshold(signal.strategy_id)) {
     const { evaluateMomentumGate } = await import('./momentum-gate.js')
     const gate = evaluateMomentumGate(signal as typeof signal & { side: 'buy' })
     if (gate.outcome === 'deterministic-approve') {

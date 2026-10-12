@@ -116,6 +116,23 @@ describe('prospective evaluation cohorts', () => {
     expect((db.prepare('SELECT count(*) n FROM trader_cohort_events WHERE cohort_id=?').get(cryptoDraft.id) as {n:number}).n).toBe(2)
   })
 
+  it('sweeps pending signals of every strategy it pauses', () => {
+    const now = Date.now()
+    db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at,max_size_usd)
+      VALUES ('other-crypto','Other','crypto',0,'active','{}',?,?,NULL)`).run(now, now)
+    const add = db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES (?,?,'BTC/USD','buy',0.9,5,NULL,1,'pending')`)
+    add.run('sib', 'other-crypto')
+    add.run('own', 'momentum-crypto')
+    createDraftCohort(db, cryptoDraft)
+    activateCohort(db, cryptoDraft.id, clean, 'admin')
+    const status = (id: string) => (db.prepare('SELECT status FROM trader_signals WHERE id=?').get(id) as {status: string}).status
+    expect(status('sib')).toBe('suppressed_strategy_paused')
+    expect(status('own')).toBe('pending')
+    invalidateCohort(db, cryptoDraft.id, 'test', 'admin')
+    expect(status('own')).toBe('suppressed_strategy_paused')
+  })
+
   it('accepts only bounded backtest evidence tied to the exact cohort fingerprint', () => {
     const cohort = createDraftCohort(db, cryptoDraft, 'test', 100)
     expect(() => recordCohortBacktest(db, cohort.id, {

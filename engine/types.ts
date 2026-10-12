@@ -128,6 +128,9 @@ export interface PricePoint {
   date: string;            // 'YYYY-MM-DD'
   close: number;
   ts_ms: number;           // ms
+  /** Present only when the engine /prices route returns them (needed for the IBS exit). */
+  high?: number;
+  low?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +245,12 @@ export interface BacktestGateStrategy {
     oos_expectancy: number | null;
     oos_max_drawdown: number | null;
     oos_win_rate: number | null;
+    /** Report v3+: daily-portfolio moments for the backtest DSR. Kurtosis is non-excess. */
+    oos_n_days?: number;
+    oos_daily_skew?: number | null;
+    oos_daily_kurtosis?: number | null;
+    n_signal_days?: number;
+    per_trade_sharpe_unannualized?: number | null;
     folds: unknown[];
     train_bars: number;
     test_bars: number;

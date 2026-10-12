@@ -18,6 +18,11 @@ function edgyReturns(n: number): number[] {
   return out
 }
 
+/** Daily paper returns: mostly flat days, some trade days. Annualized Sharpe well above 1. */
+function edgyDaily(n: number): number[] {
+  return Array.from({ length: n }, (_, i) => (i % 4 === 0 ? 0.004 : i % 4 === 1 ? -0.001 : i % 4 === 2 ? 0.001 : 0))
+}
+
 /** A gently rising equity curve with a shallow (under-kill) dip. */
 function healthyCurve(): EquityPoint[] {
   return [
@@ -36,7 +41,8 @@ function baseInput(over: Partial<GateInput> = {}): GateInput {
     regimesObserved: 3,
     variantsTested: 1,
     outOfSampleNoRetune: true,
-    backtestSharpe: 2.0,
+    backtest: { sharpe: 1.5, nDays: 1000, skew: 0, kurtosis: 3 },
+    paperDailyReturns: edgyDaily(120),
     liveReconReturns: edgyReturns(40),
     ...over,
   }
@@ -88,15 +94,27 @@ describe('evaluateGate', () => {
     expect(deepDip[2].equity / deepDip[1].equity).toBeLessThan(1 - GATE_MAX_DRAWDOWN_KILL)
   })
 
-  it('fails when live Sharpe degrades below half of backtest', () => {
-    const flatLive = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? 0.001 : -0.001))
-    const res = evaluateGate(baseInput({ liveReconReturns: flatLive, backtestSharpe: 5.0 }))
+  it('fails when daily paper Sharpe degrades below half of the daily backtest', () => {
+    const flatDaily = Array.from({ length: 120 }, (_, i) => (i % 2 === 0 ? 0.001 : -0.001))
+    const res = evaluateGate(baseInput({ paperDailyReturns: flatDaily }))
     expect(res.criteria.find((c) => c.name === 'live_vs_backtest_degradation')?.passed).toBe(false)
   })
 
-  it('deflates Sharpe for many tested variants and can fail edge on that alone', () => {
-    const res = evaluateGate(baseInput({ variantsTested: 500 }))
+  it('ignores per-trade returns for the degradation ratio', () => {
+    const res = evaluateGate(baseInput({ liveReconReturns: Array(40).fill(-0.01) }))
+    expect(res.criteria.find((c) => c.name === 'live_vs_backtest_degradation')?.passed).toBe(true)
+  })
+
+  it('runs the Deflated Sharpe on the daily backtest and can fail on trials alone', () => {
+    const res = evaluateGate(baseInput({ variantsTested: 500, trialSharpeVariance: 0.004 }))
     expect(res.criteria.find((c) => c.name === 'deflated_sharpe')?.passed).toBe(false)
+    expect(res.criteria.find((c) => c.name === 'deflated_sharpe')?.detail).toContain('1000 backtest days')
+  })
+
+  it('fails the Deflated Sharpe closed without daily backtest evidence', () => {
+    const res = evaluateGate(baseInput({ backtest: null }))
+    expect(res.criteria.find((c) => c.name === 'deflated_sharpe')?.passed).toBe(false)
+    expect(res.criteria.find((c) => c.name === 'live_vs_backtest_degradation')?.passed).toBe(false)
   })
 
   it('treats sparse live reconciliation as early warning, not a blocker', () => {

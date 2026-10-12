@@ -85,6 +85,17 @@ describe('committee -- helpers', () => {
     expect(parseAgentJson<unknown>('')).toBeNull()
   })
 
+  it('buildSignalContext states a binary entry for rsi2/ibs instead of a score threshold', () => {
+    for (const strategy_id of ['rsi2-stocks', 'ibs-stocks']) {
+      const ctx = buildSignalContext({ ...baseSignal, strategy_id, raw_score: 0.004 })
+      expect(ctx).not.toContain('score_threshold')
+      expect(ctx).not.toContain('score_multiple_of_threshold')
+      expect(ctx).toContain('entry_rule: binary')
+      expect(ctx).toContain('raw_score: 0.004')
+    }
+    expect(buildSignalContext(baseSignal)).toContain('score_threshold')
+  })
+
   it('buildSignalContext packs signal fields with enrichment placeholder', () => {
     const ctx = buildSignalContext({ ...baseSignal, enrichment_json: '{"rsi":45}' })
     expect(ctx).toContain('asset: AAPL')
@@ -714,3 +725,28 @@ describe('committee -- deterministic momentum gate (Task 2)', () => {
     expect(calls).toBeGreaterThan(0)
   })
 })
+
+describe('committee -- reversion family and binary-entry strategies', () => {
+  it.each(['rsi2-stocks', 'ibs-stocks', 'mean-reversion-stocks'])('%s skips the Markov conflict veto (bear regime is the entry)', async (strategyId) => {
+    const signal: CommitteeSignalInput = { ...baseSignal, strategy_id: strategyId, enrichment_json: makeEnrichmentJson(-0.6) }
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"All clear","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('markov_conflict'))).toBe(false)
+  })
+
+  it('a weak rsi2 score on a lean asset is not abstained by the momentum score gate', async () => {
+    let calls = 0
+    const runAgent: CommitteeDeps['runAgent'] = async () => { calls++; return agentResult(null) }
+    const weak: CommitteeSignalInput = {
+      id: 'sig-spy-rsi2', asset: 'SPY', side: 'buy', strategy_id: 'rsi2-stocks',
+      raw_score: TRADER_SIGNAL_SCORE_THRESHOLD * 0.5, horizon_days: 10, enrichment_json: null,
+    }
+    const result = await runCommittee(weak, deps(runAgent, { db: makeDb() }))
+    expect(calls).toBeGreaterThan(0)
+    expect(result.transcript.risk_officer.reason ?? '').not.toContain('below floor')
+  })
+})
+

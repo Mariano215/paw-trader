@@ -212,6 +212,60 @@ describe('decision-dispatcher', () => {
       .toBe('outside_cohort_universe')
   })
 
+  it('caps a cohort at ten concurrent open positions, the backtest slot count', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-slots', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL','MSFT'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-slots', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    // Ten open entries decided on earlier days, so the daily cap does not fire first.
+    for (let i = 0; i < 10; i++) {
+      db.prepare(`INSERT INTO trader_decisions (id,signal_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status,cohort_id)
+        VALUES (?,?,'buy',?,200,'market','t',0.7,1,'executed','stocks-paper-slots')`).run(`open-${i}`, `s-open-${i}`, `X${i}`)
+    }
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-slot','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-slot'").get() as {status:string}).status)
+      .toBe('suppressed_cohort_max_positions')
+
+    // A closed entry frees its slot.
+    db.prepare("UPDATE trader_decisions SET status='closed' WHERE id='open-0'").run()
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-slot2','momentum-stocks','MSFT','buy',0.8,20,?,'pending')`).run(Date.now())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not run the Markov pre-gate on rsi2 or ibs signals (bear regime is their entry)', async () => {
+    const now = Date.now()
+    for (const id of ['rsi2-stocks', 'ibs-stocks']) {
+      db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
+        VALUES (?,?,'stocks',1,'active','{}',?,?)`).run(id, id, now, now)
+    }
+    const bear = JSON.stringify({markov_regime: {markov_signal: -0.5}})
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES ('sig-rsi2','rsi2-stocks','AAPL','buy',0.3,10,?,?,'pending')`).run(bear, now)
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES ('sig-ibs','ibs-stocks','MSFT','buy',0.3,3,?,?,'pending')`).run(bear, now)
+    const committee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).toHaveBeenCalledTimes(2)
+    const statuses = db.prepare("SELECT status FROM trader_signals WHERE id IN ('sig-rsi2','sig-ibs')").all() as Array<{status: string}>
+    expect(statuses.every(r => r.status !== 'suppressed_markov_gate')).toBe(true)
+  })
+
   it('attributes every submitted auto decision to the running frozen cohort', async () => {
     createDraftCohort(db, {
       id:'stocks-paper-test', strategyId:'momentum-stocks', assetClass:'stocks',
@@ -307,6 +361,8 @@ describe('decision-dispatcher', () => {
 
   it('pauses the correct strategy (dynamic, not hardcoded)', async () => {
     const signalId = insertSignal(db)
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-stale', 'momentum-stocks', 'DBC', 'buy', 0.8, 20, 1, 'pending')`).run()
     const msg = await dispatchApproval(
       db,
       { action: 'pause', approvalId: 'ap-1', decisionId: signalId },
@@ -316,6 +372,7 @@ describe('decision-dispatcher', () => {
     const strat = db.prepare("SELECT status FROM trader_strategies WHERE id='momentum-stocks'").get() as any
     expect(strat.status).toBe('paused')
     expect(msg).toContain('momentum-stocks')
+    expect(db.prepare("SELECT status FROM trader_signals WHERE id='sig-stale'").get()).toEqual({status: 'suppressed_strategy_paused'})
   })
 
   it('does not pause an unrelated strategy', async () => {

@@ -499,6 +499,18 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
       db.exec('DROP INDEX IF EXISTS idx_trader_cohort_running_asset_class')
     },
   },
+  {
+    version: 13,
+    description: 'Pending-signal uniqueness per strategy: one strategy no longer blocks another on the same asset',
+    up: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_trader_signals_pending_asset_side;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trader_signals_pending_asset_side_strategy
+          ON trader_signals (asset, side, strategy_id)
+          WHERE status IN ('pending', 'dispatching');
+      `)
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {

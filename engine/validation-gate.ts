@@ -17,7 +17,7 @@
  *  - The 30-trade live reconciliation is EARLY WARNING only and never
  *    contributes to the pass decision.
  */
-import { sharpe, deflatedSharpe, tradeStats, maxDrawdown, type EquityPoint } from './metrics.js'
+import { sharpe, deflatedSharpeFromMoments, tradeStats, maxDrawdown, type EquityPoint } from './metrics.js'
 
 // --- Pre-committed thresholds (review these in code, do not tune per run) ---
 export const GATE_MIN_CLOSED_TRADES = 100
@@ -43,20 +43,26 @@ export const GATE_MIN_LIVE_BACKTEST_RATIO = 0.5
 export const LIVE_RECON_EARLY_WARNING_TRADES = 30
 
 export interface GateInput {
-  /** Per-trade fractional net returns from trader_realized_pnl. */
+  /** Per-trade fractional net returns: trade count, win rate, expectancy. */
   closedReturns: number[]
   /** Paper equity curve over the validation window. */
   equityCurve: EquityPoint[]
   /** Count of distinct market regimes the closed trades span. */
   regimesObserved: number
-  /** Effective independent variants tested, for deflatedSharpe. */
+  /** Effective independent variants tested, for the backtest deflated Sharpe. */
   variantsTested: number
   trialSharpeVariance?: number
   /** Caller asserts the test window had no re-tuning. Cannot be data-proven. */
   outOfSampleNoRetune: boolean
-  /** Backtest Sharpe for the same strategy, for the degradation check. */
-  backtestSharpe: number
-  /** Live (paper) per-trade returns observed so far, for early warning. */
+  /**
+   * Daily-portfolio OOS backtest for the same strategy (report v3): annualized
+   * Sharpe, day count, skew and non-excess kurtosis. Feeds the DSR check and the
+   * degradation ratio. Null (or v1/v2 per-trade evidence) fails both closed.
+   */
+  backtest: { sharpe: number; nDays: number; skew: number; kurtosis: number } | null
+  /** Daily paper returns of the evaluated cohort, flat days 0. Same unit as backtest.sharpe. */
+  paperDailyReturns: number[]
+  /** Live (paper) per-trade returns observed so far, for early warning only. */
   liveReconReturns: number[]
 }
 
@@ -102,13 +108,15 @@ export function evaluateGate(input: GateInput): GateResult {
       : 'NOT asserted out-of-sample; re-tuning on the test set invalidates the gate',
   })
 
-  const observedSharpe = sharpe(input.closedReturns)
-  const dsr = deflatedSharpe(observedSharpe, input.closedReturns, input.variantsTested, input.trialSharpeVariance)
+  // Edge is judged on the long daily backtest; paper is too short to deflate.
+  const bt = input.backtest
+  const dsr = bt ? deflatedSharpeFromMoments(bt.sharpe, bt.nDays, bt.skew, bt.kurtosis, input.variantsTested, input.trialSharpeVariance) : 0
   criteria.push({
     name: 'deflated_sharpe',
     passed: dsr >= GATE_MIN_DEFLATED_SHARPE,
-    detail: `deflated Sharpe ${dsr.toFixed(4)} vs floor ${GATE_MIN_DEFLATED_SHARPE} ` +
-      `(trade-return score ${observedSharpe.toFixed(3)}, ${input.variantsTested} variants tested)` +
+    detail: !bt ? 'no daily v3 backtest evidence; per-trade Sharpe cannot be deflated' :
+      `backtest deflated Sharpe ${dsr.toFixed(4)} vs floor ${GATE_MIN_DEFLATED_SHARPE} ` +
+      `(daily Sharpe ${bt.sharpe.toFixed(3)}, ${bt.nDays} backtest days, ${input.variantsTested} variants tested)` +
       (input.variantsTested > 1 && input.trialSharpeVariance == null ? '; missing measured trial Sharpe variance' : ''),
   })
 
@@ -131,14 +139,16 @@ export function evaluateGate(input: GateInput): GateResult {
       `(duration ${Math.round(dd.durationMs / 86_400_000)}d)`,
   })
 
-  const liveSharpe = sharpe(input.liveReconReturns)
-  const ratio = input.backtestSharpe > 0 ? liveSharpe / input.backtestSharpe : 0
+  const backtestSharpe = bt?.sharpe ?? 0
+  const liveSharpe = sharpe(input.paperDailyReturns)
+  const ratio = backtestSharpe > 0 ? liveSharpe / backtestSharpe : 0
   criteria.push({
     name: 'live_vs_backtest_degradation',
-    passed: Number.isFinite(input.backtestSharpe) && Number.isFinite(ratio) && input.backtestSharpe > 0 && ratio >= GATE_MIN_LIVE_BACKTEST_RATIO,
-    detail: input.backtestSharpe <= 0
-      ? 'backtest Sharpe non-positive; cannot certify live degradation'
-      : `live/backtest Sharpe ratio ${ratio.toFixed(2)} vs floor ${GATE_MIN_LIVE_BACKTEST_RATIO}`,
+    passed: Number.isFinite(backtestSharpe) && Number.isFinite(ratio) && backtestSharpe > 0 && ratio >= GATE_MIN_LIVE_BACKTEST_RATIO,
+    detail: !(backtestSharpe > 0)
+      ? 'daily backtest Sharpe missing or non-positive; cannot certify live degradation'
+      : `daily paper/backtest Sharpe ratio ${ratio.toFixed(2)} vs floor ${GATE_MIN_LIVE_BACKTEST_RATIO} ` +
+        `(paper ${liveSharpe.toFixed(3)} over ${input.paperDailyReturns.length} days)`,
   })
 
   // Early warning only -- never blocks the gate.

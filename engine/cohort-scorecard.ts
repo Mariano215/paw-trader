@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import { matchLotsFifo, type FillRow } from './audit-log.js'
-import { deflatedSharpe, maxDrawdown, sharpe, tradeStats, TRADING_DAYS_PER_YEAR } from './metrics.js'
-import { canonicalJson, currentFingerprintMatches, type EvaluationCohortRow } from './evaluation-cohort.js'
+import { dailyPnlReturns, maxDrawdown, sharpe, tradeStats } from './metrics.js'
+import { backtestDeflatedSharpe, dailyBacktestEvidence } from './backtest-report.js'
+import { canonicalJson, COHORT_MAX_CONCURRENT_POSITIONS, currentFingerprintMatches, type EvaluationCohortRow } from './evaluation-cohort.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
+import { sweepPendingForPausedStrategy } from './strategy-manager.js'
 
 export const COHORT_MAX_FAILURE_RATE = 0.15
 export const COHORT_RECONCILE_MAX_AGE_MS = 10 * 60 * 1000
@@ -121,6 +123,26 @@ function benchmarkEvidence(db: Database.Database, cohortId: string, trades: Comp
   return {value: values.length === trades.length ? values.reduce((growth, value) => growth * (1 + value), 1) - 1 : null, complete: values.length === trades.length}
 }
 
+function dailyReturnsFor(cohort: EvaluationCohortRow, trades: CompletedTrade[], nowMs: number): number[] {
+  // shortcut: realized P&L only, booked on the exit day; open lots are not marked
+  // to market because the brain keeps no historical marks offline. Open-position
+  // swings land on the close day instead. Upgrade when daily marks are stored.
+  return dailyPnlReturns(
+    trades.map(t => ({tsMs: t.exitTsMs, pnlUsd: t.netPnlUsd})),
+    cohort.started_at ?? cohort.created_at,
+    cohort.ended_at ?? nowMs,
+    cohort.max_position_usd * COHORT_MAX_CONCURRENT_POSITIONS,
+    cohort.asset_class === 'stocks',
+  )
+}
+
+/** Daily cohort returns since start: realized net P&L per New York day over cohort capital, flat days 0. */
+export function cohortDailyReturns(db: Database.Database, cohortId: string, nowMs = Date.now()): number[] {
+  const cohort = db.prepare('SELECT * FROM trader_evaluation_cohorts WHERE id=?').get(cohortId) as EvaluationCohortRow | undefined
+  if (!cohort) throw new Error('cohort not found')
+  return dailyReturnsFor(cohort, completedTrades(cohortFills(db, cohortId), cohort), nowMs)
+}
+
 export function evaluateCohort(
   db: Database.Database,
   cohortId: string,
@@ -133,27 +155,23 @@ export function evaluateCohort(
   const trades = completedTrades(fills, cohort)
   const returns = trades.map(t => t.netReturn)
   const stats = tradeStats(returns)
-  const observedSharpe = sharpe(returns)
-  const variantRows = db.prepare(`SELECT c.id,s.sharpe FROM trader_evaluation_cohorts c
-    LEFT JOIN trader_cohort_scorecards s ON s.cohort_id=c.id
-    WHERE c.strategy_id=? ORDER BY c.created_at,c.id`).all(cohort.strategy_id) as Array<{id:string; sharpe:number|null}>
-  const trialSharpes = variantRows.map(row => row.id === cohort.id ? observedSharpe : row.sharpe)
-  const completeTrialEvidence = trialSharpes.every((value): value is number => value != null && Number.isFinite(value))
-  let trialVariance: number | undefined
-  if (variantRows.length > 1 && completeTrialEvidence) {
-    const perPeriod = trialSharpes.map(value => value / Math.sqrt(TRADING_DAYS_PER_YEAR))
-    const mean = perPeriod.reduce((sum, value) => sum + value, 0) / perPeriod.length
-    trialVariance = perPeriod.reduce((sum, value) => sum + (value - mean) ** 2, 0) / perPeriod.length
-  }
-  // A second tuned variant cannot pass until every searched variant has a
-  // measured Sharpe; then DSR uses their observed cross-trial variance.
-  const dsr = deflatedSharpe(observedSharpe, returns, Math.max(1, variantRows.length), trialVariance)
+  // Sharpe, drawdown and the paper/backtest ratio use daily returns, the same
+  // unit as the engine's daily-portfolio backtest Sharpe. Trade counts, win
+  // rate and expectancy stay per trade.
+  const daily = dailyReturnsFor(cohort, trades, nowMs)
+  const observedSharpe = sharpe(daily)
+  // Edge (DSR) is judged on the long backtest; paper is too short to deflate.
+  let recorded: unknown = null
+  try { recorded = cohort.backtest_report_json ? JSON.parse(cohort.backtest_report_json) : null } catch { /* unreadable evidence fails closed */ }
+  const backtestEvidence = dailyBacktestEvidence(recorded)
+  const dsrResult = backtestDeflatedSharpe(db, cohort.strategy_id, backtestEvidence)
+  const dsr = dsrResult.dsr
   const equity = [{ts_ms: cohort.started_at ?? cohort.created_at, equity: 1}]
   let cumulative = 1
-  for (const trade of trades) {
-    cumulative *= Math.max(0.000001, 1 + trade.netReturn)
-    equity.push({ts_ms: trade.exitTsMs, equity: cumulative})
-  }
+  daily.forEach((r, i) => {
+    cumulative += r
+    equity.push({ts_ms: equity[0].ts_ms + (i + 1) * 86_400_000, equity: Math.max(0.000001, cumulative)})
+  })
   const drawdown = maxDrawdown(equity).maxDrawdown
   const regimes = readRegimes(db, cohortId, trades)
   const benchmark = benchmarkEvidence(db, cohortId, trades)
@@ -202,11 +220,13 @@ export function evaluateCohort(
     {name: 'closed_trades', passed: trades.length >= cohort.min_closed_trades, detail: `${trades.length}/${cohort.min_closed_trades} completed round trips`},
     {name: 'trade_linked_regimes', passed: regimes.length >= cohort.min_regimes, detail: `${regimes.length}/${cohort.min_regimes} regimes`},
     {name: 'no_retune', passed: cohort.no_retune === 1, detail: cohort.no_retune === 1 ? 'frozen prospective window' : 'retuning invalidated the window'},
-    {name: 'deflated_sharpe', passed: dsr >= cohort.min_deflated_sharpe, detail: `${dsr.toFixed(4)} vs ${cohort.min_deflated_sharpe.toFixed(2)}`},
+    {name: 'deflated_sharpe', passed: dsr >= cohort.min_deflated_sharpe, detail: backtestEvidence
+      ? `backtest ${dsr.toFixed(4)} vs ${cohort.min_deflated_sharpe.toFixed(2)} (daily Sharpe ${backtestEvidence.sharpe.toFixed(3)}, ${backtestEvidence.nDays} days, ${dsrResult.trials} trials${dsrResult.trials > 1 && dsrResult.variance == null ? ', missing measured trial Sharpe variance' : ''})`
+      : 'no daily v3 backtest evidence; v1/v2 Sharpe is per-trade and inflated'},
     {name: 'positive_expectancy', passed: stats.expectancy > 0, detail: `${stats.expectancy.toFixed(6)} net per trade`},
     {name: 'max_drawdown', passed: drawdown <= cohort.max_drawdown_pct, detail: `${(drawdown * 100).toFixed(2)}% vs ${(cohort.max_drawdown_pct * 100).toFixed(0)}% ceiling`},
     {name: 'matched_backtest', passed: backtestReady, detail: backtestReady ? `Sharpe ${cohort.backtest_sharpe!.toFixed(3)}, ${cohort.backtest_trade_count} trades, ${(cohort.backtest_max_drawdown_pct! * 100).toFixed(2)}% max drawdown` : 'missing qualified current config-bound backtest'},
-    {name: 'paper_backtest_ratio', passed: backtestRatio != null && backtestRatio >= cohort.min_backtest_ratio, detail: backtestRatio == null ? 'unavailable' : `${backtestRatio.toFixed(3)} vs ${cohort.min_backtest_ratio.toFixed(2)}`},
+    {name: 'paper_backtest_ratio', passed: backtestRatio != null && backtestRatio >= cohort.min_backtest_ratio, detail: backtestRatio == null ? 'unavailable' : `daily Sharpe ${backtestRatio.toFixed(3)} vs ${cohort.min_backtest_ratio.toFixed(2)}`},
     {name: 'execution_failures', passed: attempted > 0 && failureRate < COHORT_MAX_FAILURE_RATE, detail: `${(failureRate * 100).toFixed(1)}% vs ${(COHORT_MAX_FAILURE_RATE * 100).toFixed(0)}% ceiling`},
     {name: 'broker_evidence_current', passed: operationalEvidenceCurrent,
       detail: `paper=${operations?.engineMode === 'paper'} broker=${operations?.brokerConnected === true} data=${dataVenueConnected} reconcile=${reconcileFresh && operations?.reconcileDriftDetected === false && operations?.reconcilerHalted === false} nav=${navFresh}`},
@@ -253,6 +273,7 @@ export function refreshCohortScorecards(
         const cohort = db.prepare('SELECT strategy_id FROM trader_evaluation_cohorts WHERE id=?').get(score.cohortId) as {strategy_id: string}
         db.prepare("UPDATE trader_evaluation_cohorts SET status='passed',ended_at=? WHERE id=? AND status='running'").run(nowMs,score.cohortId)
         db.prepare("UPDATE trader_strategies SET status='paused',updated_at=? WHERE id=?").run(nowMs,cohort.strategy_id)
+        sweepPendingForPausedStrategy(db, cohort.strategy_id)
         const cohortEventId = randomUUID()
         db.prepare(`INSERT INTO trader_cohort_events (id,cohort_id,event_type,detail_json,actor,created_at)
           VALUES (?,?, 'passed', ?, 'system', ?)`).run(cohortEventId,score.cohortId,canonicalJson({scorecardComputedAt: nowMs}),nowMs)

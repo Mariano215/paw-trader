@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   cagr, sharpe, sortino, maxDrawdown, calmar, tradeStats,
-  alphaBeta, deflatedSharpe, MS_PER_YEAR, TRADING_DAYS_PER_YEAR,
+  alphaBeta, deflatedSharpe, deflatedSharpeFromMoments, dailyPnlReturns, MS_PER_YEAR, TRADING_DAYS_PER_YEAR,
   type EquityPoint,
 } from './metrics.js'
 
@@ -32,9 +32,9 @@ describe('sharpe', () => {
   it('annualizes mean/stdev by sqrt(252)', () => {
     // returns [0.01, -0.01, 0.02, 0.00]: mean 0.005
     // deviations^2: 0.000025, 0.000225, 0.000225, 0.000025 => sum 0.0005
-    // pop variance = 0.0005/4 = 0.000125, pop stdev = sqrt(0.000125)
+    // sample variance = 0.0005/3 (matches the engine's statistics.stdev)
     const s = sharpe([0.01, -0.01, 0.02, 0.0])
-    expect(s).toBeCloseTo((0.005 / Math.sqrt(0.000125)) * Math.sqrt(252), 6)
+    expect(s).toBeCloseTo((0.005 / Math.sqrt(0.0005 / 3)) * Math.sqrt(252), 6)
   })
   it('returns 0 when all returns are identical', () => {
     expect(sharpe([0.01, 0.01, 0.01])).toBe(0)
@@ -102,7 +102,7 @@ describe('alphaBeta', () => {
 describe('deflatedSharpe', () => {
   it('assigns weak evidence approximately 50%, not 100%, for one trial', () => {
     const r = Array.from({length: 100}, (_, i) => i % 2 ? -0.01 : 0.01001)
-    expect(deflatedSharpe(sharpe(r), r, 1)).toBeCloseTo(0.501984, 5)
+    expect(deflatedSharpe(sharpe(r), r, 1)).toBeCloseTo(0.501974, 5)
     expect(deflatedSharpe(sharpe(r), r, 4)).toBe(0)
   })
 
@@ -180,5 +180,46 @@ describe('sortino additional', () => {
   it('returns 0 gracefully when there is no downside (all-positive series)', () => {
     // No negative excess returns -> downside deviation is 0 -> guard returns 0.
     expect(sortino([0.01, 0.02, 0.03])).toBe(0)
+  })
+})
+
+describe('deflatedSharpeFromMoments', () => {
+  it('matches deflatedSharpe when given the same moments', () => {
+    const r = [0.02, -0.01, 0.03, -0.02, 0.04, -0.01, 0.02, 0.01]
+    const m = r.reduce((a, b) => a + b, 0) / r.length
+    const sd = Math.sqrt(r.reduce((a, x) => a + (x - m) ** 2, 0) / r.length)
+    const skew = r.reduce((a, x) => a + ((x - m) / sd) ** 3, 0) / r.length
+    const kurt = r.reduce((a, x) => a + ((x - m) / sd) ** 4, 0) / r.length
+    expect(deflatedSharpeFromMoments(sharpe(r), r.length, skew, kurt, 3, 0.001))
+      .toBeCloseTo(deflatedSharpe(sharpe(r), r, 3, 0.001), 10)
+  })
+  it('gives a strong daily backtest a high probability and fails closed on bad input', () => {
+    expect(deflatedSharpeFromMoments(1.5, 1000, 0, 3, 1)).toBeGreaterThan(0.99)
+    expect(deflatedSharpeFromMoments(1.5, 1000, 0, 3, 5)).toBe(0) // trials without variance
+    expect(deflatedSharpeFromMoments(Number.NaN, 1000, 0, 3, 1)).toBe(0)
+    expect(deflatedSharpeFromMoments(1.5, 3, 0, 3, 1)).toBe(0)
+  })
+})
+
+describe('dailyPnlReturns', () => {
+  // Mon 2026-10-05 noon ET through Fri 2026-10-09 noon ET.
+  const mon = Date.UTC(2026, 9, 5, 16)
+  const fri = Date.UTC(2026, 9, 9, 16)
+  it('buckets P&L by New York trading day, zero on flat days, over fixed capital', () => {
+    const r = dailyPnlReturns([
+      {tsMs: Date.UTC(2026, 9, 6, 19), pnlUsd: 500},
+      {tsMs: Date.UTC(2026, 9, 6, 20), pnlUsd: -100},
+      {tsMs: Date.UTC(2026, 9, 9, 15), pnlUsd: 1000},
+    ], mon, fri, 100_000, true)
+    expect(r).toEqual([0, 0.004, 0, 0, 0.01])
+  })
+  it('skips weekends for stocks and keeps them for crypto', () => {
+    const nextMon = Date.UTC(2026, 9, 12, 16)
+    expect(dailyPnlReturns([], fri, nextMon, 1000, true)).toHaveLength(2)
+    expect(dailyPnlReturns([], fri, nextMon, 1000, false)).toHaveLength(4)
+  })
+  it('puts an evening ET exit on that ET day, not the next UTC day', () => {
+    const r = dailyPnlReturns([{tsMs: Date.UTC(2026, 9, 7, 2), pnlUsd: 10}], mon, fri, 1000, true) // Tue 22:00 ET
+    expect(r[1]).toBeCloseTo(0.01)
   })
 })

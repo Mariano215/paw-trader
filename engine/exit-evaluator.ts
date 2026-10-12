@@ -11,6 +11,8 @@
  *   - stop:     last price breached the stored stop_loss
  *   - target:   last price reached the stored take_profit
  *   - time:     now - decided_at exceeded horizon_days (time-stop)
+ *   - signal:   the strategy's own exit rule on the last completed daily bar
+ *               (rsi2-stocks: close > SMA5 or RSI(2) > 70; ibs-stocks: IBS > 0.8)
  *   - momentum: 20d momentum flipped against a long / short
  *   - earnings: a single stock reports today or tomorrow (see earnings.ts)
  *
@@ -57,9 +59,12 @@ export interface OpenExitRow {
   decided_at: number
   enrichment_json: string | null
   cohort_id: string | null
+  strategy_id?: string
+  /** First entry fill time; the signal-exit anchor (decided_at can be the signal bar's day). */
+  entry_filled_at?: number | null
 }
 
-export type ExitReason = 'stop' | 'target' | 'time' | 'momentum' | 'earnings' | 'hold'
+export type ExitReason = 'stop' | 'target' | 'signal' | 'time' | 'momentum' | 'earnings' | 'hold'
 
 export interface ExitDecision {
   exit: boolean
@@ -89,7 +94,8 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
   return db.prepare(`
     SELECT d.id, d.signal_id, d.asset, d.action, d.entry_price,
            d.stop_loss, d.take_profit, s.horizon_days, d.decided_at,
-           s.enrichment_json, d.cohort_id
+           s.enrichment_json, d.cohort_id, s.strategy_id,
+           (SELECT MIN(f.fill_ts_ms) FROM trader_fills f WHERE f.decision_id = d.id) AS entry_filled_at
     FROM trader_decisions d
     JOIN trader_signals s ON s.id = d.signal_id
     WHERE d.status = 'executed'
@@ -105,7 +111,7 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
 /** Pure exit decision for one open position given the latest price. */
 export function evaluateExit(
   row: OpenExitRow,
-  ctx: { lastPrice: number | null; nowMs: number; momentumPct?: number | null },
+  ctx: { lastPrice: number | null; nowMs: number; momentumPct?: number | null; signalExit?: boolean },
 ): ExitDecision {
   const isLong = row.action !== 'sell'
   const exitSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'
@@ -122,7 +128,10 @@ export function evaluateExit(
     if (hit) return { exit: true, reason: 'target', side: exitSide }
   }
 
-  // 3. Time-stop: held past the signal horizon.
+  // 3. Strategy exit rule (computed by strategySignalExit on completed daily bars).
+  if (ctx.signalExit) return { exit: true, reason: 'signal', side: exitSide }
+
+  // 4. Time-stop: held past the signal horizon, the backstop for signal exits.
   const horizon = row.horizon_days > 0 ? row.horizon_days : 10
   if (ctx.nowMs - row.decided_at > horizon * DAY_MS) {
     return { exit: true, reason: 'time', side: exitSide }
@@ -146,6 +155,65 @@ export function currentMomentum(bars: {close: number; ts_ms: number}[], nowMs: n
   const last = sorted[sorted.length - 1]
   if (nowMs - last.ts_ms > (crypto ? 2 : 4) * DAY_MS) return null
   return (last.close / sorted[sorted.length - 21].close - 1) * 100
+}
+
+/** Wilder RSI over `closes` (oldest first). Null when there are fewer than n+1 closes. */
+export function wilderRsi(closes: number[], n: number): number | null {
+  if (closes.length < n + 1) return null
+  let gain = 0
+  let loss = 0
+  for (let i = 1; i <= n; i++) {
+    const d = closes[i] - closes[i - 1]
+    gain += Math.max(d, 0)
+    loss += Math.max(-d, 0)
+  }
+  gain /= n
+  loss /= n
+  for (let i = n + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1]
+    gain = (gain * (n - 1) + Math.max(d, 0)) / n
+    loss = (loss * (n - 1) + Math.max(-d, 0)) / n
+  }
+  if (loss === 0) return gain === 0 ? 50 : 100
+  return 100 - 100 / (1 + gain / loss)
+}
+
+const nyDate = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+/**
+ * Strategy-defined exit, matching the engine backtest's exit_fn. Reads only
+ * COMPLETED daily bars (dated before today in New York), so an intraday
+ * partial bar never triggers it: the rule fires on the first sweep of the
+ * session after the bar closes, and repeats harmlessly until the exit lands.
+ * The bar must be dated on or after the entry (fill) day: the fill-day close
+ * counts, the signal bar before the fill never does. Callers pass the fill time
+ * when known, since decided_at can fall on the signal bar's own day. Stale data (> 4 days) holds.
+ */
+export function strategySignalExit(
+  strategyId: string,
+  bars: Array<{ date?: string; close: number; high?: number; low?: number; ts_ms: number }>,
+  entryMs: number,
+  nowMs: number,
+): boolean {
+  if (strategyId !== 'rsi2-stocks' && strategyId !== 'ibs-stocks') return false
+  const today = nyDate(nowMs)
+  const completed = [...new Map(bars.filter(b => Number.isFinite(b.close) && b.close > 0 && Number.isFinite(b.ts_ms) &&
+    (b.date ?? nyDate(b.ts_ms)) < today).map(b => [b.ts_ms, b])).values()].sort((a, b) => a.ts_ms - b.ts_ms)
+  const last = completed[completed.length - 1]
+  if (!last || (last.date ?? nyDate(last.ts_ms)) < nyDate(entryMs) || nowMs - last.ts_ms > 4 * DAY_MS) return false
+  if (strategyId === 'rsi2-stocks') {
+    const closes = completed.map(b => b.close)
+    if (closes.length < 5) return false
+    const sma5 = closes.slice(-5).reduce((s, c) => s + c, 0) / 5
+    const rsi = wilderRsi(closes, 2)
+    return last.close > sma5 || (rsi != null && rsi > 70)
+  }
+  // IBS needs the bar's high and low, which the engine /prices route returns from
+  // the 2026-10-12 engine build. An older engine sends closes only: IBS then holds
+  // and the 3-day horizon backstop exits.
+  const { high, low } = last
+  if (high == null || low == null || !Number.isFinite(high) || !Number.isFinite(low) || !(high > low)) return false
+  return (last.close - low) / (high - low) > 0.8
 }
 
 /**
@@ -258,7 +326,8 @@ export async function runExitSweep(
       if (!verdict.exit) {
         try {
           const bars = await engineClient.getPrices(row.asset, nowMs - 45 * DAY_MS, nowMs)
-          verdict = evaluateExit(row, {lastPrice: last, nowMs, momentumPct: currentMomentum(bars, nowMs, isCrypto)})
+          verdict = evaluateExit(row, {lastPrice: last, nowMs, momentumPct: currentMomentum(bars, nowMs, isCrypto),
+            signalExit: row.strategy_id != null && strategySignalExit(row.strategy_id, bars, row.entry_filled_at ?? row.decided_at, nowMs)})
         } catch (err) {
           logger.warn({asset: row.asset, err}, 'Exit momentum unavailable; no momentum-based action')
         }

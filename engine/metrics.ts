@@ -35,7 +35,14 @@ function mean(xs: number[]): number {
   return xs.reduce((s, x) => s + x, 0) / xs.length
 }
 
-/** Population stdev (divide by N). Returns 0 for fewer than 2 points. */
+/** Sample stdev (divide by N-1), same as the engine's statistics.stdev. Returns 0 for fewer than 2 points. */
+function stdevSample(xs: number[]): number {
+  if (xs.length < 2) return 0
+  const m = mean(xs)
+  return Math.sqrt(xs.reduce((s, x) => s + (x - m) ** 2, 0) / (xs.length - 1))
+}
+
+/** Population stdev (divide by N), used for skew/kurtosis moments. Returns 0 for fewer than 2 points. */
 function stdevPopulation(xs: number[]): number {
   if (xs.length < 2) return 0
   const m = mean(xs)
@@ -71,7 +78,7 @@ export function cagr(curve: EquityPoint[]): number {
 export function sharpe(returns: number[], rfPerPeriod = 0): number {
   if (returns.length < 2) return 0
   const excess = returns.map((r) => r - rfPerPeriod)
-  const sd = stdevPopulation(excess)
+  const sd = stdevSample(excess)
   if (sd === 0) return 0
   return (mean(excess) / sd) * Math.sqrt(TRADING_DAYS_PER_YEAR)
 }
@@ -230,16 +237,33 @@ export function deflatedSharpe(
   /** Variance across tested Sharpe estimates, in per-period units. */
   trialSharpeVariance?: number,
 ): number {
+  if (returns.some((r) => !Number.isFinite(r))) return 0
   const n = returns.length
-  if (n < 4 || !Number.isInteger(trials) || trials < 1 || !Number.isFinite(observedSharpeAnnual) ||
-      returns.some((r) => !Number.isFinite(r))) return 0
-  if (trials > 1 && (trialSharpeVariance == null || !Number.isFinite(trialSharpeVariance) || trialSharpeVariance < 0)) return 0
-  const srPer = observedSharpeAnnual / Math.sqrt(TRADING_DAYS_PER_YEAR)
   const m = mean(returns)
   const sd = stdevPopulation(returns)
   if (sd === 0) return 0
   const skew = returns.reduce((s, r) => s + ((r - m) / sd) ** 3, 0) / n
   const kurt = returns.reduce((s, r) => s + ((r - m) / sd) ** 4, 0) / n
+  return deflatedSharpeFromMoments(observedSharpeAnnual, n, skew, kurt, trials, trialSharpeVariance)
+}
+
+/**
+ * Deflated Sharpe from summary moments, for evidence that arrives as a report
+ * (the engine's daily backtest) rather than a raw series. `kurtosis` is
+ * non-excess (normal = 3). `n` is the number of per-period returns.
+ */
+export function deflatedSharpeFromMoments(
+  observedSharpeAnnual: number,
+  n: number,
+  skew: number,
+  kurtosis: number,
+  trials: number,
+  trialSharpeVariance?: number,
+): number {
+  if (!Number.isFinite(n) || n < 4 || !Number.isInteger(trials) || trials < 1 || !Number.isFinite(observedSharpeAnnual) ||
+      !Number.isFinite(skew) || !Number.isFinite(kurtosis)) return 0
+  if (trials > 1 && (trialSharpeVariance == null || !Number.isFinite(trialSharpeVariance) || trialSharpeVariance < 0)) return 0
+  const srPer = observedSharpeAnnual / Math.sqrt(TRADING_DAYS_PER_YEAR)
   // Expected max Sharpe under the null across `trials` independent trials.
   const e = 0.5772156649015329 // Euler-Mascheroni
   // One trial uses a zero null benchmark, not inverseNormalCdf(0)=-Infinity.
@@ -248,11 +272,46 @@ export function deflatedSharpe(
     inverseNormalCdf(1 - 1 / trials) * (1 - e) +
     inverseNormalCdf(1 - 1 / (trials * Math.E)) * e
   )
-  const radicand = 1 - skew * srPer + ((kurt - 1) / 4) * srPer * srPer
+  const radicand = 1 - skew * srPer + ((kurtosis - 1) / 4) * srPer * srPer
   if (radicand <= 0) return 0
   const denom = Math.sqrt(radicand)
   const dsr = (srPer - expectedMaxSr) * Math.sqrt(n - 1) / denom
   return normalCdf(dsr)
+}
+
+const nyDateKey = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+/**
+ * Daily return series on fixed capital: P&L booked on each New York day from
+ * startMs through endMs, divided by capitalUsd. Days with no P&L are 0, so a
+ * strategy that trades twice a month is not scored on its trade days alone.
+ * `weekdaysOnly` drops Saturday and Sunday (stocks); market holidays stay as 0.
+ */
+export function dailyPnlReturns(
+  pnls: Array<{ tsMs: number; pnlUsd: number }>,
+  startMs: number,
+  endMs: number,
+  capitalUsd: number,
+  weekdaysOnly: boolean,
+): number[] {
+  if (!(capitalUsd > 0) || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return []
+  const byDay = new Map<string, number>()
+  for (const p of pnls) {
+    if (!Number.isFinite(p.pnlUsd) || p.tsMs < startMs || p.tsMs > endMs) continue
+    const key = nyDateKey(p.tsMs)
+    byDay.set(key, (byDay.get(key) ?? 0) + p.pnlUsd)
+  }
+  const keys: string[] = []
+  const endKey = nyDateKey(endMs)
+  // Step from noon UTC of the start date; 24h steps then never skip a New York date across DST.
+  const [y, m, d] = nyDateKey(startMs).split('-').map(Number)
+  for (let t = Date.UTC(y, m - 1, d, 12); ; t += 86_400_000) {
+    const key = new Date(t).toISOString().slice(0, 10)
+    if (key > endKey) break
+    const dow = new Date(t).getUTCDay()
+    if (!weekdaysOnly || (dow !== 0 && dow !== 6)) keys.push(key)
+  }
+  return keys.map((key) => (byDay.get(key) ?? 0) / capitalUsd)
 }
 
 /** Standard normal CDF via Abramowitz-Stegun 7.1.26 erf approximation. */

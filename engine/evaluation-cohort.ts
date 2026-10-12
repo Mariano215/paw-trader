@@ -8,12 +8,15 @@ import {
 } from '../config.js'
 import { startOfNyDayMs } from './bypass-counter.js'
 import { recordTraderOperationalEvent, type TraderOperationalState } from './operational-events.js'
+import { sweepPendingForPausedStrategy } from './strategy-manager.js'
 
 export const COHORT_ENFORCEMENT_KV_KEY = 'trader.cohorts.enforced'
 export const COHORT_CONFIG_VERSION = 1
 export const STOCK_PAPER_MAX_POSITION_USD = 10000
 export const CRYPTO_PAPER_MAX_POSITION_USD = 200
 export const PAPER_MAX_DAILY_TRADES = 5
+/** Concurrent open positions per cohort: the engine backtest's slot count, and the cohort capital base (x max position). */
+export const COHORT_MAX_CONCURRENT_POSITIONS = 10
 
 export type CohortAssetClass = 'stocks' | 'crypto'
 export type CohortStatus = 'draft' | 'running' | 'closed' | 'invalidated' | 'passed'
@@ -349,10 +352,14 @@ export function activateCohort(
     // Pause siblings in this sleeve that have no running cohort of their own.
     // Starting Bitcoin must not pause the stock cohorts, and a second stock
     // cohort must not pause the first.
-    db.prepare(`UPDATE trader_strategies SET status='paused',updated_at=?
+    const siblings = db.prepare(`SELECT id FROM trader_strategies
       WHERE asset_class=? AND id<>?
         AND id NOT IN (SELECT strategy_id FROM trader_evaluation_cohorts WHERE status='running')`)
-      .run(nowMs, cohort.asset_class, cohort.strategy_id)
+      .all(cohort.asset_class, cohort.strategy_id) as Array<{id: string}>
+    for (const {id} of siblings) {
+      db.prepare("UPDATE trader_strategies SET status='paused',updated_at=? WHERE id=?").run(nowMs, id)
+      sweepPendingForPausedStrategy(db, id)
+    }
     db.prepare("UPDATE trader_strategies SET status='active',max_size_usd=?,updated_at=? WHERE id=?")
       .run(cohort.max_position_usd, nowMs, cohort.strategy_id)
     db.prepare(`UPDATE trader_evaluation_cohorts SET status='running',started_at=?,legacy_quarantined_at=?
@@ -374,6 +381,7 @@ export function invalidateCohort(db: Database.Database, cohortId: string, reason
     db.prepare(`UPDATE trader_evaluation_cohorts SET status='invalidated',invalidated_at=?,ended_at=?,invalidation_reason=?
       WHERE id=?`).run(nowMs, nowMs, reason.slice(0, 500), cohortId)
     db.prepare("UPDATE trader_strategies SET status='paused',updated_at=? WHERE id=?").run(nowMs, cohort.strategy_id)
+    sweepPendingForPausedStrategy(db, cohort.strategy_id)
     event(db, cohortId, 'invalidated', actor, {reason: reason.slice(0, 500)}, nowMs)
   })
   invalidate()
@@ -402,4 +410,13 @@ export function countCohortEntriesToday(db: Database.Database, cohortId: string,
   return (db.prepare(`SELECT count(*) AS n FROM trader_decisions
     WHERE cohort_id=? AND decided_at>=? AND action='buy' AND status NOT IN ('committee_abstain','failed')`)
     .get(cohortId, start) as {n: number}).n
+}
+
+/** Open or opening entry lots of a cohort: entries not yet closed or graded. */
+export function countCohortOpenPositions(db: Database.Database, cohortId: string): number {
+  return (db.prepare(`SELECT count(*) AS n FROM trader_decisions d
+    LEFT JOIN trader_verdicts v ON v.decision_id=d.id
+    WHERE d.cohort_id=? AND d.parent_decision_id IS NULL AND d.action='buy'
+      AND d.status IN ('submitting','submitted','pending_fill','retry_pending','executed') AND v.decision_id IS NULL`)
+    .get(cohortId) as {n: number}).n
 }

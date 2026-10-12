@@ -147,6 +147,27 @@ export function seedCryptoFourHourTrendStrategy(db: Database.Database): void {
   )
 }
 
+function seedPausedStrategy(db: Database.Database, id: string, name: string, assetClass: string, params: unknown): void {
+  const now = Date.now()
+  db.prepare(`
+    INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+    VALUES (?, ?, ?, 0, 'paused', ?, ?, ?)
+  `).run(id, name, assetClass, JSON.stringify(params), now, now)
+}
+
+/** Frozen published RSI(2) pullback rules (engine signals/rsi2.py). Paused until cohort activation. */
+export function seedRsi2Strategy(db: Database.Database): void {
+  seedPausedStrategy(db, 'rsi2-stocks', 'RSI(2) Pullback', 'stocks',
+    { rsi_window: 2, rsi_entry: 10, rsi_exit: 70, sma_trend: 200, sma_exit: 5, horizon_days: 10 })
+}
+
+/** Frozen internal-bar-strength reversion rules (engine signals/ibs.py). Paused until cohort activation. */
+export function seedIbsStrategy(db: Database.Database): void {
+  seedPausedStrategy(db, 'ibs-stocks', 'IBS Reversion', 'stocks',
+    { ibs_entry: 0.2, ibs_exit: 0.8, sma_trend: 200, horizon_days: 3 })
+}
+
 /**
  * Predeclared Bitcoin microstructure research family. This is intentionally
  * non-executable: no engine candidate or cohort may exist until its frozen
@@ -192,6 +213,18 @@ export function seedAllStrategies(db: Database.Database): void {
   seedCryptoHourlyMeanReversionStrategy(db)
   seedCryptoFourHourTrendStrategy(db)
   seedBitcoinOrderFlowResearchFamily(db)
+  seedRsi2Strategy(db)
+  seedIbsStrategy(db)
+}
+
+/**
+ * A paused strategy's pending signals would sit in the queue and, before the
+ * per-strategy dedup, block that asset for every other strategy. Call at every
+ * pause site. Returns the number of signals swept.
+ */
+export function sweepPendingForPausedStrategy(db: Database.Database, strategyId: string): number {
+  return db.prepare("UPDATE trader_signals SET status='suppressed_strategy_paused' WHERE strategy_id=? AND status='pending'")
+    .run(strategyId).changes
 }
 
 export function getStrategy(db: Database.Database, id: string): Strategy | null {

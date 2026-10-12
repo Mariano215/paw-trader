@@ -346,33 +346,48 @@ describe('readCohortReadiness', () => {
 })
 
 describe('gate with the engine backtest report', () => {
-  it('uses the report for variants, trial variance and OOS Sharpe when present', async () => {
+  const v3Report = (version: number) => ({
+    version, computed_at_ms: 1, engine_revision: 'abc', days: 1260, universe: ['SPY'],
+    strategies: {
+      'momentum-stocks': {
+        live_params: { min_score: 0.7, horizon_days: 20 },
+        fixed_rule: { sharpe: 3.3, n_trades: 93 },
+        sweep: { n_trials: 8, sharpe_variance_per_period: 0.002, best: null, trials: [] },
+        walk_forward: { oos_sharpe: 0.9, oos_n_trades: 60, oos_expectancy: 0.004, oos_max_drawdown: 0.1, oos_win_rate: 0.55, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf',
+          oos_n_days: 756, oos_daily_skew: -0.1, oos_daily_kurtosis: 4, n_signal_days: 40, per_trade_sharpe_unannualized: 0.2 },
+      },
+      'mean-reversion-stocks': {
+        live_params: { min_score: 0.05, horizon_days: 10 },
+        fixed_rule: { sharpe: 1.0, n_trades: 40 },
+        sweep: { n_trials: 6, sharpe_variance_per_period: 0.001, best: null, trials: [] },
+        walk_forward: { oos_sharpe: 0.4, oos_n_trades: 30, oos_expectancy: 0.001, oos_max_drawdown: 0.2, oos_win_rate: 0.5, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf' },
+      },
+    },
+  })
+
+  it('runs the DSR on the v3 daily backtest with the family trial count', async () => {
     const db = makeDb()
     const client = mockClient([]) as unknown as Record<string, unknown>
     client.getMomentumBacktest = async () => { throw new Error('should not be called when the report exists') }
-    client.getBacktestReport = async () => ({
-      version: 1, computed_at_ms: 1, engine_revision: 'abc', days: 1260, universe: ['SPY'],
-      strategies: {
-        'momentum-stocks': {
-          live_params: { min_score: 0.7, horizon_days: 20 },
-          fixed_rule: { sharpe: 3.3, n_trades: 93 },
-          sweep: { n_trials: 8, sharpe_variance_per_period: 0.002, best: null, trials: [] },
-          walk_forward: { oos_sharpe: 0.9, oos_n_trades: 60, oos_expectancy: 0.004, oos_max_drawdown: 0.1, oos_win_rate: 0.55, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf' },
-        },
-        'mean-reversion-stocks': {
-          live_params: { min_score: 0.05, horizon_days: 10 },
-          fixed_rule: { sharpe: 1.0, n_trades: 40 },
-          sweep: { n_trials: 6, sharpe_variance_per_period: 0.001, best: null, trials: [] },
-          walk_forward: { oos_sharpe: 0.4, oos_n_trades: 30, oos_expectancy: 0.001, oos_max_drawdown: 0.2, oos_win_rate: 0.5, folds: [], train_bars: 504, test_bars: 126, step: 126, method: 'wf' },
-        },
-      },
-    })
+    client.getBacktestReport = async () => v3Report(3)
     const stored = await runGoLiveGate(db, client as unknown as EngineClient, 1_000)
     const dsr = stored.criteria.find(c => c.name === 'deflated_sharpe')!
-    expect(dsr.detail).toContain('14 variants tested')
+    // Momentum family: no cohorts yet + 8 sweep trials.
+    expect(dsr.detail).toContain('8 variants tested')
+    expect(dsr.detail).toContain('756 backtest days')
     expect(dsr.detail).not.toContain('missing measured trial Sharpe variance')
     expect(stored.backtest?.source).toBe('walk_forward_oos')
     expect(stored.backtest?.sharpe).toBe(0.9)
-    expect(stored.backtest?.n_trials).toBe(14)
+    expect(stored.backtest?.n_trials).toBe(8)
+  })
+
+  it('fails the DSR and degradation closed on a v2 report', async () => {
+    const db = makeDb()
+    const client = mockClient([]) as unknown as Record<string, unknown>
+    client.getBacktestReport = async () => v3Report(2)
+    const stored = await runGoLiveGate(db, client as unknown as EngineClient, 1_000)
+    expect(stored.criteria.find(c => c.name === 'deflated_sharpe')).toMatchObject({passed: false})
+    expect(stored.criteria.find(c => c.name === 'deflated_sharpe')?.detail).toContain('no daily v3 backtest')
+    expect(stored.criteria.find(c => c.name === 'live_vs_backtest_degradation')?.passed).toBe(false)
   })
 })

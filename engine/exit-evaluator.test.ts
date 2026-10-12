@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { evaluateExit, runExitSweep, currentMomentum, type OpenExitRow } from './exit-evaluator.js'
+import { evaluateExit, runExitSweep, currentMomentum, strategySignalExit, wilderRsi, type OpenExitRow } from './exit-evaluator.js'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
 
@@ -97,6 +97,66 @@ describe('evaluateExit', () => {
   })
 })
 
+describe('strategy signal exits', () => {
+  // Session of Tue 2026-04-21; completed bars run through Mon 04-20.
+  const bar = (date: string, close: number, high = close, low = close) =>
+    ({date, close, high, low, ts_ms: Date.parse(`${date}T04:00:00Z`)})
+  const falling = ['04-08', '04-09', '04-10', '04-13', '04-14', '04-15', '04-16', '04-17']
+    .map((d, i) => bar(`2026-${d}`, 100 - i))
+  const entryMs = Date.parse('2026-04-17T13:31:00Z') // filled at the 04-17 open
+
+  it('computes Wilder RSI', () => {
+    expect(wilderRsi([1, 2, 3], 2)).toBe(100)
+    expect(wilderRsi([3, 2, 1], 2)).toBe(0)
+    expect(wilderRsi([1, 2], 2)).toBeNull()
+    // 2-period Wilder: avg gain 0.5, loss 0.5 seed, then up 2 -> gain 1.25, loss 0.25 -> RSI 83.33
+    expect(wilderRsi([10, 11, 10, 12], 2)).toBeCloseTo(83.333, 2)
+  })
+
+  it('rsi2 exits when the last completed close is above SMA5, ignoring today\'s partial bar', () => {
+    const up = [...falling, bar('2026-04-20', 99)]
+    expect(strategySignalExit('rsi2-stocks', up, entryMs, MARKET_OPEN_MS)).toBe(true)
+    expect(strategySignalExit('rsi2-stocks', falling.concat(bar('2026-04-20', 92)), entryMs, MARKET_OPEN_MS)).toBe(false)
+    // A strong partial bar for today does not count until it completes.
+    expect(strategySignalExit('rsi2-stocks', [...falling, bar('2026-04-20', 92), bar('2026-04-21', 120)], entryMs, MARKET_OPEN_MS)).toBe(false)
+  })
+
+  it('rsi2 does not exit on the bar that produced the entry', () => {
+    const lateEntry = Date.parse('2026-04-21T13:31:00Z')
+    expect(strategySignalExit('rsi2-stocks', [...falling, bar('2026-04-20', 99)], lateEntry, MARKET_OPEN_MS)).toBe(false)
+  })
+
+  it('anchors to the fill day: no exit on the signal bar, exit on the fill-day bar next session', () => {
+    // Signal from bar 04-20 (decided late on 04-20), filled at the 04-21 open.
+    const decidedMs = Date.parse('2026-04-20T19:55:00Z')
+    const filledMs = Date.parse('2026-04-21T13:31:00Z')
+    const signalBarUp = [...falling, bar('2026-04-20', 99)]
+    expect(strategySignalExit('rsi2-stocks', signalBarUp, filledMs, MARKET_OPEN_MS)).toBe(false)
+    const nextSession = Date.parse('2026-04-22T14:00:00Z')
+    expect(strategySignalExit('rsi2-stocks', [...signalBarUp, bar('2026-04-21', 99.5)], filledMs, nextSession)).toBe(true)
+    expect(decidedMs).toBeLessThan(filledMs)
+  })
+
+  it('ibs exits when the last completed bar closes in its top fifth', () => {
+    expect(strategySignalExit('ibs-stocks', [...falling, bar('2026-04-20', 95, 96, 90)], entryMs, MARKET_OPEN_MS)).toBe(true)
+    expect(strategySignalExit('ibs-stocks', [...falling, bar('2026-04-20', 93, 96, 90)], entryMs, MARKET_OPEN_MS)).toBe(false)
+  })
+
+  it('ibs holds without high/low; the horizon backstop applies', () => {
+    const closesOnly = [...falling, {date: '2026-04-20', close: 99, ts_ms: Date.parse('2026-04-20T04:00:00Z')}]
+    expect(strategySignalExit('ibs-stocks', closesOnly, entryMs, MARKET_OPEN_MS)).toBe(false)
+  })
+
+  it('other strategies never take a signal exit', () => {
+    expect(strategySignalExit('mean-reversion-stocks', [...falling, bar('2026-04-20', 99)], entryMs, MARKET_OPEN_MS)).toBe(false)
+  })
+
+  it('evaluateExit ranks a signal exit after stop and target, before time', () => {
+    expect(evaluateExit(row(), {lastPrice: 105, nowMs: Date.now(), signalExit: true}).reason).toBe('signal')
+    expect(evaluateExit(row(), {lastPrice: 91, nowMs: Date.now(), signalExit: true}).reason).toBe('stop')
+  })
+})
+
 describe('runExitSweep', () => {
   function makeDb() {
     const db = new Database(':memory:')
@@ -115,6 +175,49 @@ describe('runExitSweep', () => {
     return db
   }
 
+  it('uses the entry fill time, not decided_at, as the signal-exit anchor', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
+      VALUES ('rsi2-stocks','R','stocks',0,'active','{}',1,1)`).run()
+    db.prepare("UPDATE trader_signals SET strategy_id='rsi2-stocks'").run()
+    // Decided on the signal bar's day (04-20), filled on 04-21.
+    db.prepare('UPDATE trader_decisions SET decided_at=?').run(Date.parse('2026-04-20T19:55:00Z'))
+    db.prepare(`INSERT INTO trader_fills (id,decision_id,client_order_id,broker_order_id,asset,side,fill_qty,fill_price,
+      intended_price,intended_ts_ms,fill_ts_ms,fee_usd,slippage_usd,entry_thesis,exit_reason,recorded_at)
+      VALUES ('f1','d1','c1','b1','AAPL','buy',1,100,NULL,NULL,?,0,0,NULL,NULL,?)`).run(Date.parse('2026-04-21T13:31:00Z'), 1)
+    const bars = ['04-08', '04-09', '04-10', '04-13', '04-14', '04-15', '04-16', '04-17']
+      .map((d, i) => ({date: `2026-${d}`, close: 100 - i, ts_ms: Date.parse(`2026-${d}T04:00:00Z`)}))
+      .concat({date: '2026-04-20', close: 99, ts_ms: Date.parse('2026-04-20T04:00:00Z')})
+    const submitDecision = vi.fn()
+    const client = {
+      getPositions: vi.fn().mockResolvedValue([{ asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 99, unrealized_pnl: -1, source: 'broker', updated_at: MARKET_OPEN_MS }]),
+      getPrices: vi.fn().mockResolvedValue(bars),
+      submitDecision,
+    } as unknown as EngineClient
+    const out = await runExitSweep(db, client, vi.fn().mockResolvedValue(undefined), { nowMs: MARKET_OPEN_MS, isMarketOpen: () => true })
+    expect(out.exited).toBe(0)
+    expect(submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('exits an rsi2 position on its signal rule from daily bars', async () => {
+    const db = makeDb()
+    db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
+      VALUES ('rsi2-stocks','R','stocks',0,'active','{}',1,1)`).run()
+    db.prepare("UPDATE trader_signals SET strategy_id='rsi2-stocks'").run()
+    db.prepare('UPDATE trader_decisions SET decided_at=?').run(Date.parse('2026-04-17T13:31:00Z'))
+    const bars = ['04-08', '04-09', '04-10', '04-13', '04-14', '04-15', '04-16', '04-17']
+      .map((d, i) => ({date: `2026-${d}`, close: 100 - i, ts_ms: Date.parse(`2026-${d}T04:00:00Z`)}))
+      .concat({date: '2026-04-20', close: 99, ts_ms: Date.parse('2026-04-20T04:00:00Z')})
+    const submitDecision = vi.fn().mockResolvedValue({ client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 0 })
+    const client = {
+      getPositions: vi.fn().mockResolvedValue([{ asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 99, unrealized_pnl: -1, source: 'broker', updated_at: MARKET_OPEN_MS }]),
+      getPrices: vi.fn().mockResolvedValue(bars),
+      submitDecision,
+    } as unknown as EngineClient
+    const out = await runExitSweep(db, client, vi.fn().mockResolvedValue(undefined), { nowMs: MARKET_OPEN_MS, isMarketOpen: () => true })
+    expect(out.exited).toBe(1)
+    expect((db.prepare("SELECT thesis FROM trader_decisions WHERE parent_decision_id='d1'").get() as {thesis: string}).thesis).toContain('Auto-exit (signal)')
+  })
   it('submits a sell with size_usd=0 (full-close sentinel) and writes a closing decision row on stop breach', async () => {
     const db = makeDb()
     const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]

@@ -124,31 +124,53 @@ describe('signal-poller', () => {
     expect(pending[0].strategy_id).toBe('momentum-stocks')
   })
 
-  it('deduplicates same asset+side across different strategy names in one batch', async () => {
+  it('deduplicates same asset+side+strategy in one batch but keeps other strategies', async () => {
     const candidates = [
       { id: 'a1', strategy: 'momentum-stocks',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a1b', strategy: 'momentum',          asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
       { id: 'a2', strategy: 'mean-reversion',     asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
-      { id: 'a3', strategy: 'momentum-crypto',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a3', strategy: 'rsi2',               asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ]
     vi.mocked(mockClient.getSignals!).mockResolvedValue(candidates)
     await pollAndStoreSignals(db, mockClient as EngineClient)
-    const rows = db.prepare("SELECT * FROM trader_signals WHERE asset='AAPL' AND side='buy'").all()
-    expect(rows).toHaveLength(1)
+    const rows = db.prepare("SELECT strategy_id FROM trader_signals WHERE asset='AAPL' AND side='buy' ORDER BY strategy_id").all()
+    expect(rows).toEqual([{strategy_id: 'mean-reversion-stocks'}, {strategy_id: 'momentum-stocks'}, {strategy_id: 'rsi2-stocks'}])
   })
 
-  it('deduplicates same asset+side across sequential poll cycles (different strategy IDs)', async () => {
+  it('a pending signal of one strategy does not block another strategy on the same asset', async () => {
     vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
-      { id: 'b1', strategy: 'momentum', asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'b1', strategy: 'momentum', asset: 'DBC', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ])
     await pollAndStoreSignals(db, mockClient as EngineClient)
 
     vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
-      { id: 'b2', strategy: 'mean-reversion', asset: 'AAPL', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'b1b', strategy: 'momentum', asset: 'DBC', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'b2', strategy: 'ibs', asset: 'DBC', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
     ])
     await pollAndStoreSignals(db, mockClient as EngineClient)
 
-    const rows = db.prepare("SELECT * FROM trader_signals WHERE asset='AAPL' AND side='buy'").all()
-    expect(rows).toHaveLength(1)
+    const rows = db.prepare("SELECT id FROM trader_signals WHERE asset='DBC' AND side='buy' ORDER BY id").all()
+    expect(rows).toEqual([{id: 'b1'}, {id: 'b2'}])
+  })
+
+  it('stores a valid rsi2 or ibs entry even when its score is below the threshold', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
+      { id: 'r1', strategy: 'rsi2', asset: 'SPY', side: 'buy' as const, raw_score: 0.005, horizon_days: 10, generated_at: MARKET_HOURS_TS },
+      { id: 'i1', strategy: 'ibs', asset: 'QQQ', side: 'buy' as const, raw_score: 0.001, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'i0', strategy: 'ibs', asset: 'IWM', side: 'buy' as const, raw_score: 0, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'm1', strategy: 'mean-reversion', asset: 'VTI', side: 'buy' as const, raw_score: 0.005, horizon_days: 10, generated_at: MARKET_HOURS_TS },
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const ids = (db.prepare('SELECT id FROM trader_signals ORDER BY id').all() as Array<{id: string}>).map(r => r.id)
+    expect(ids).toEqual(['i1', 'r1'])
+  })
+
+  it('the pending unique index is per strategy', () => {
+    const add = db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES (?,?,'SPY','buy',0.9,3,NULL,1,'pending')`)
+    add.run('x1', 'rsi2-stocks')
+    add.run('x2', 'ibs-stocks')
+    expect(() => add.run('x3', 'rsi2-stocks')).toThrow(/UNIQUE/)
   })
 
   it('drops equity signals outside market hours but passes crypto', async () => {

@@ -41,8 +41,10 @@ import {
 } from './plain-english.js'
 import { HARD_CEILING_USD } from './trader-constants.js'
 import { findUnexpectedShortPositions, notifyUnexpectedShortPositions } from './position-safety.js'
-import { countCohortEntriesToday, guardRunningCohort } from './evaluation-cohort.js'
+import { COHORT_MAX_CONCURRENT_POSITIONS, countCohortEntriesToday, countCohortOpenPositions, guardRunningCohort } from './evaluation-cohort.js'
+import { isMeanReversionFamily } from './backtest-report.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
+import { sweepPendingForPausedStrategy } from './strategy-manager.js'
 
 export interface AutoDispatchResult {
   signalId:  string
@@ -173,6 +175,7 @@ export async function dispatchApproval(
     if (signal?.strategy_id) {
       db.prepare("UPDATE trader_strategies SET status='paused', updated_at=? WHERE id=?")
         .run(Date.now(), signal.strategy_id)
+      sweepPendingForPausedStrategy(db, signal.strategy_id)
       return `Strategy '${signal.strategy_id}' paused. No new signals will be sent until you resume it.`
     }
     return 'Pause requested but signal not found -- no strategy paused.'
@@ -203,6 +206,11 @@ export async function dispatchApproval(
     db.prepare("UPDATE trader_signals SET status='suppressed_cohort_daily_cap' WHERE id=?").run(signal.id)
     recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
     return `Cohort daily trade cap reached (${cohort.daily_trade_cap}). No order placed.`
+  }
+  if (cohort && countCohortOpenPositions(db, cohort.id) >= COHORT_MAX_CONCURRENT_POSITIONS) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_cohort_max_positions' WHERE id=?").run(signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, 'cohort_max_positions')
+    return `Cohort holds ${COHORT_MAX_CONCURRENT_POSITIONS} open positions, its slot cap. No order placed.`
   }
 
   const decisionId = randomUUID()
@@ -676,6 +684,12 @@ export async function autoDispatchPendingSignals(
         recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
         continue
       }
+      // Cohort capital is ten positions; more concurrent lots than the backtest's ten slots would be leverage it never had.
+      if (cohort && countCohortOpenPositions(db, cohort.id) >= COHORT_MAX_CONCURRENT_POSITIONS) {
+        db.prepare("UPDATE trader_signals SET status='suppressed_cohort_max_positions' WHERE id=?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'cohort_max_positions')
+        continue
+      }
 
       // Gate -2: one open order per asset. A decision that is submitted or
       // waiting for a fill already owns this asset; a second one is how the
@@ -732,7 +746,7 @@ export async function autoDispatchPendingSignals(
       // regime gate and committee still protect those signals downstream.
       // For all other strategies: suppress if Markov strongly contradicts
       // the signal direction -- committee would veto anyway, skip LLM cost.
-      const isMeanReversion = strategy.id.startsWith('mean-reversion')
+      const isMeanReversion = isMeanReversionFamily(strategy.id)
       if (!isMeanReversion && signal.enrichment_json) {
         try {
           const enrichment = JSON.parse(signal.enrichment_json) as Record<string, unknown>

@@ -19,19 +19,21 @@
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
 import { archiveCumulativeOrderFills, matchLotsFifo, type FillRow, type RealizedLot } from './audit-log.js'
-import { evaluateGate, type GateResult } from './validation-gate.js'
+import { evaluateGate, type GateInput, type GateResult } from './validation-gate.js'
 import type { EquityPoint } from './metrics.js'
 import { logger } from '../logger.js'
 import { createHash } from 'node:crypto'
 import type { BacktestGateReport, EngineOrder } from './types.js'
 import { readCompleteOrderHistory } from './engine-client.js'
 import { currentFingerprintMatches, type EvaluationCohortRow } from './evaluation-cohort.js'
+import { backtestDeflatedSharpe, backtestEvidenceFromReport, dailyBacktestEvidence } from './backtest-report.js'
+import { cohortDailyReturns } from './cohort-scorecard.js'
 
 export const GATE_KV_KEY = 'trader.gate.last'
 export const GATE_REGIMES_KV_KEY = 'trader.gate.regimes_seen'
 const GATE_RUN_KV_KEY = 'trader.gate.last_run_ms'
 export const GATE_RUN_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000 // weekly
-export const GATE_VERSION = 3
+export const GATE_VERSION = 4
 export const ACCOUNTING_KV_KEY = 'trader.accounting.last'
 export const TRADER_EPOCH_KV_KEY = 'trader.epoch_start_ms'
 
@@ -335,11 +337,15 @@ export async function runGoLiveGate(
     logger.warn('Go-live gate: NAV snapshots unavailable; drawdown criterion blocked')
   }
 
-  // Which stock strategy is under evaluation: the running stocks cohort's, else momentum.
-  const runningStocks = db.prepare(`SELECT strategy_id FROM trader_evaluation_cohorts
-    WHERE status='running' AND asset_class='stocks' ORDER BY started_at DESC LIMIT 1`)
-    .get() as { strategy_id: string } | undefined
-  const gateStrategyId = runningStocks?.strategy_id ?? 'momentum-stocks'
+  // Which stock strategy is under evaluation: the running stocks cohort's, else
+  // the latest passed one (a passed cohort stops running), else momentum.
+  const gateCohort = db.prepare(`SELECT id,strategy_id FROM trader_evaluation_cohorts
+    WHERE status IN ('running','passed') AND asset_class='stocks'
+    ORDER BY status='running' DESC, started_at DESC LIMIT 1`)
+    .get() as { id: string; strategy_id: string } | undefined
+  const gateStrategyId = gateCohort?.strategy_id ?? 'momentum-stocks'
+  // Daily paper returns of that cohort, the same unit as the daily backtest Sharpe.
+  const paperDailyReturns = gateCohort ? cohortDailyReturns(db, gateCohort.id, nowMs) : []
 
   // Prefer the engine's sweep + walk-forward report. Every grid point across
   // every stock strategy counts as a trial, and the cross-trial Sharpe variance
@@ -358,39 +364,36 @@ export async function runGoLiveGate(
 
   let variantsTested = (db.prepare("SELECT count(*) c FROM trader_strategies").get() as { c: number }).c
   let trialSharpeVariance: number | undefined
-  let backtestSharpe = 0
+  let backtest: GateInput['backtest'] = null
   let backtestSnapshot: StoredGateResult['backtest'] = null
   if (report && entry) {
-    variantsTested = Object.values(report.strategies).reduce((sum, b) => sum + (b.sweep?.n_trials ?? 0), 0)
-    trialSharpeVariance = entry.sweep.sharpe_variance_per_period ?? undefined
+    // v1/v2 reports carry per-trade Sharpe; they leave `backtest` null and fail closed.
+    let daily = null
+    try { daily = dailyBacktestEvidence(backtestEvidenceFromReport(report, gateStrategyId, '').report) } catch { /* pre-v3 or incomplete */ }
+    const dsrInputs = backtestDeflatedSharpe(db, gateStrategyId, daily)
+    if (daily) {
+      backtest = { sharpe: daily.sharpe, nDays: daily.nDays, skew: daily.skew, kurtosis: daily.kurtosis }
+      variantsTested = dsrInputs.trials
+      trialSharpeVariance = dsrInputs.variance
+    }
     const oos = entry.walk_forward.oos_sharpe
-    if (oos != null && Number.isFinite(oos)) backtestSharpe = oos
     backtestSnapshot = {
-      source: 'walk_forward_oos', n_trials: variantsTested,
+      source: 'walk_forward_oos', n_trials: daily ? dsrInputs.trials : null,
       sharpe: oos, n_trades: entry.walk_forward.oos_n_trades, max_drawdown: entry.walk_forward.oos_max_drawdown,
       win_rate: entry.walk_forward.oos_win_rate, start: '', end: '', min_score: entry.live_params.min_score,
-      warnings: [`engine_revision ${report.engine_revision ?? 'unknown'}; computed ${new Date(report.computed_at_ms).toISOString()}`],
+      warnings: [`engine_revision ${report.engine_revision ?? 'unknown'}; computed ${new Date(report.computed_at_ms).toISOString()}; report v${report.version}`],
     }
   } else {
-    // Legacy path: in-sample fixed-rule momentum simulation from the engine's
-    // trade-level simulator. On failure backtestSharpe stays 0, which keeps
-    // the degradation criterion blocked: an unreachable backtest must never be
-    // read as a passing one.
+    // Legacy path: in-sample fixed-rule momentum simulation, shown for context
+    // only. Its Sharpe is per-trade, so `backtest` stays null and both the DSR
+    // and degradation criteria stay blocked.
     try {
-      const backtest = await client.getMomentumBacktest()
-      if (backtest.sharpe != null && Number.isFinite(backtest.sharpe)) {
-        backtestSharpe = backtest.sharpe
-      } else {
-        logger.warn(
-          { nTrades: backtest.n_trades, warnings: backtest.warnings },
-          'Go-live gate: backtest returned no Sharpe (too few trades), degradation criterion stays blocked',
-        )
-      }
+      const fixed = await client.getMomentumBacktest()
       backtestSnapshot = {
         source: 'fixed_rule', n_trials: null,
-        sharpe: backtest.sharpe, n_trades: backtest.n_trades, max_drawdown: backtest.max_drawdown,
-        win_rate: backtest.win_rate, start: backtest.start, end: backtest.end, min_score: backtest.min_score,
-        warnings: backtest.warnings,
+        sharpe: fixed.sharpe, n_trades: fixed.n_trades, max_drawdown: fixed.max_drawdown,
+        win_rate: fixed.win_rate, start: fixed.start, end: fixed.end, min_score: fixed.min_score,
+        warnings: fixed.warnings,
       }
     } catch (err) {
       logger.warn({ err }, 'Go-live gate: backtest unavailable, degradation criterion stays blocked')
@@ -404,13 +407,14 @@ export async function runGoLiveGate(
     variantsTested: Math.max(1, variantsTested),
     trialSharpeVariance,
     outOfSampleNoRetune: cohortReadiness.passed,
-    backtestSharpe,
+    backtest,
+    paperDailyReturns,
     liveReconReturns: closedReturns,
   })
   result.criteria.push({name: 'evaluation_cohort', passed: cohortReadiness.passed,
     detail: cohortReadiness.detail})
   result.passed = result.criteria.every(c => c.passed)
-  result.warnings.push(...truth.warnings, 'Trade-return scores use per-trade observations; they are not annualized daily portfolio Sharpe ratios.')
+  result.warnings.push(...truth.warnings, 'Sharpe is daily: the DSR runs on the v3 daily-portfolio backtest; the degradation ratio compares daily cohort paper returns (realized P&L by exit day) to it.')
 
   const stored: StoredGateResult = {
     version: GATE_VERSION,

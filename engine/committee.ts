@@ -720,14 +720,17 @@ async function runCommitteeInner(
   }
 
   // ---- Trader final decision ----
+  // Binary-entry rules (rsi2, ibs) trade as backtested once risk clears: the LLM never sets their size.
+  const ruleEntry = bypassesScoreThreshold(signal.strategy_id)
   const traderPrompt = rollupBlock + loadPrompt(SUPPORT_FILES.trader)
   const traderMessage =
     `${transcriptSoFar}\n\n` +
     `RISK OFFICER VERDICT: veto=${effectiveRisk.veto} reason="${effectiveRisk.reason}"\n\n` +
     `Produce the final trader JSON now.`
 
-  const traderRaw = await callAgent(deps, traderPrompt, traderMessage, 'committee-trader')
-  const traderVerdict = parseAgentJson<TraderVerdict>(traderRaw)
+  const traderVerdict: TraderVerdict | null = ruleEntry
+    ? { role: 'trader', action: signal.side, thesis: `Rule entry (${signal.strategy_id}). ${effectiveRisk.reason}`, confidence: coordinator?.avg_confidence ?? 0.5, size_multiplier: 1 }
+    : parseAgentJson<TraderVerdict>(await callAgent(deps, traderPrompt, traderMessage, 'committee-trader'))
   if (!traderVerdict) {
     errors.push('trader parse failed; abstaining')
     return buildAbstainResult({

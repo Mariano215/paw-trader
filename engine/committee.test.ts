@@ -750,3 +750,37 @@ describe('committee -- reversion family and binary-entry strategies', () => {
   })
 })
 
+
+describe('committee -- binary-entry rules trade as backtested', () => {
+  const rsi2: CommitteeSignalInput = { ...baseSignal, id: 'sig-rsi2-rule', strategy_id: 'rsi2-stocks' }
+  const trader = '{"role":"trader","action":"abstain","thesis":"meh","confidence":0.2,"size_multiplier":0.3}'
+
+  it('once risk clears, ignores the trader abstain and sizes at multiplier 1', async () => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"All clear","concerns":[]}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('approve')
+    expect(result.action).toBe('buy')
+    expect(result.size_usd).toBe(100)
+    expect(result.transcript.trader.size_multiplier).toBe(1)
+  })
+
+  it('still blocks on an event-risk veto', async () => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":true,"reason":"earnings tomorrow","concerns":[],"category":"event_risk"}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+  })
+
+  it('stays fail-closed when the risk officer output does not parse', async () => {
+    const script = { ...markovBaseScript(0.65), 'committee-risk-officer': 'not json', 'committee-trader': trader }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+  })
+})

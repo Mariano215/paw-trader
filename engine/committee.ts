@@ -339,6 +339,7 @@ function applyDeterministicRiskGate(
       veto: true,
       reason: `Hard veto: avg committee confidence ${avgConfidence.toFixed(2)} below 0.30 floor.`,
       concerns: [`risk_officer_hard_confidence_floor_${avgConfidence.toFixed(2)}`],
+      category: 'confidence',
     }
   }
 
@@ -705,11 +706,12 @@ async function runCommitteeInner(
   }
 
   // Binary-entry rules (rsi2, ibs) must trade as backtested (operator decision 2026-10-13):
-  // only judgment vetoes are ignored; event, size, data and unknown categories still block,
+  // only judgment vetoes are ignored; event, size, data, uncategorized and unknown vetoes still block,
   // and fail-closed parse vetoes still stand.
   if (bypassesScoreThreshold(signal.strategy_id) && riskVerdict && effectiveRisk.veto) {
     const category = classifyVetoCategory(effectiveRisk)
-    if (category === 'disagreement' || category === 'confidence' || category === 'none') {
+    // Explicit judgment categories only: an uncategorized veto may be a real event, so it blocks.
+    if (category === 'disagreement' || category === 'confidence') {
       errors.push(`rule entry: ignored ${category} veto (${effectiveRisk.reason})`)
       Object.assign(effectiveRisk, { veto: false, reason: `Rule entry; ${category} veto ignored: ${effectiveRisk.reason}` })
     }

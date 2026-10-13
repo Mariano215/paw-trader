@@ -819,6 +819,16 @@ describe('committee -- binary-entry rules trade as backtested', () => {
     expect(result.decision).toBe('approve')
   })
 
+  it('an uncategorized veto still blocks a rule entry (fail closed)', async () => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":true,"reason":"trading halt pending news","concerns":[]}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+  })
+
   it('stays fail-closed when the risk officer output does not parse', async () => {
     const script = { ...markovBaseScript(0.65), 'committee-risk-officer': 'not json', 'committee-trader': trader }
     const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))

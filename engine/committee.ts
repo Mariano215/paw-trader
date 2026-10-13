@@ -699,8 +699,19 @@ async function runCommitteeInner(
         { gateVeto: gateVerdict.veto, reason: gateVerdict.reason, markovSignal: markov?.markov_signal },
         'Committee deterministic risk gate fired',
       )
-      // Replace the LLM verdict with the gate verdict.
-      Object.assign(effectiveRisk, gateVerdict)
+      // Replace the LLM verdict with the gate verdict (gate verdicts carry no category of their own).
+      Object.assign(effectiveRisk, { category: undefined }, gateVerdict)
+    }
+  }
+
+  // Binary-entry rules (rsi2, ibs) must trade as backtested (operator decision 2026-10-13):
+  // only judgment vetoes are ignored; event, size, data and unknown categories still block,
+  // and fail-closed parse vetoes still stand.
+  if (bypassesScoreThreshold(signal.strategy_id) && riskVerdict && effectiveRisk.veto) {
+    const category = classifyVetoCategory(effectiveRisk)
+    if (category === 'disagreement' || category === 'confidence' || category === 'none') {
+      errors.push(`rule entry: ignored ${category} veto (${effectiveRisk.reason})`)
+      Object.assign(effectiveRisk, { veto: false, reason: `Rule entry; ${category} veto ignored: ${effectiveRisk.reason}` })
     }
   }
 

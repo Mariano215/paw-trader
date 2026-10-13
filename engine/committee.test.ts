@@ -768,6 +768,27 @@ describe('committee -- binary-entry rules trade as backtested', () => {
     expect(result.transcript.trader.size_multiplier).toBe(1)
   })
 
+  it('ignores a disagreement veto on a rule entry', async () => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":true,"reason":"weak consensus","concerns":[],"category":"disagreement"}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('approve')
+    expect(result.size_usd).toBe(100)
+  })
+
+  it('a disagreement veto still blocks a non-rule strategy', async () => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":true,"reason":"weak consensus","concerns":[],"category":"disagreement"}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee({ ...rsi2, strategy_id: 'momentum-stocks' }, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+  })
+
   it('still blocks on an event-risk veto', async () => {
     const script = {
       ...markovBaseScript(0.65),
@@ -776,6 +797,26 @@ describe('committee -- binary-entry rules trade as backtested', () => {
     }
     const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
     expect(result.decision).toBe('abstain')
+  })
+
+  it.each(['size', 'data', 'earnings'])('still blocks on a %s veto category', async (category) => {
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': JSON.stringify({ role: 'risk_officer', veto: true, reason: 'blocked', concerns: [], category }),
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('abstain')
+  })
+
+  it('the confidence-floor gate veto follows its own category, not the LLM one', async () => {
+    const script = {
+      ...markovBaseScript(0.2),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"ok","concerns":[],"category":"event_risk"}',
+      'committee-trader': trader,
+    }
+    const result = await runCommittee(rsi2, deps(scriptedRunAgent(script)))
+    expect(result.decision).toBe('approve')
   })
 
   it('stays fail-closed when the risk officer output does not parse', async () => {

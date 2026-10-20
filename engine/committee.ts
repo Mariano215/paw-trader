@@ -459,6 +459,12 @@ async function callAgent(
     return result.text
   } catch (err) {
     if (err instanceof CommitteeGatedError) throw err
+    // Auth is global like the kill switch: Oct 15-19 2026 an expired OAuth login
+    // was recorded as "quant parse failed" and silently consumed every rsi2 signal.
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/Failed to authenticate|request failed \((401|403)\)|no API key is configured/i.test(msg)) {
+      throw new CommitteeGatedError(`auth: ${msg}`)
+    }
     logger.warn({ err, source }, 'Committee agent call threw')
     return null
   }

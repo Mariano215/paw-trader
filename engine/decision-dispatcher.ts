@@ -606,6 +606,8 @@ function trimToSize(allowedSizeUsd: number): number | null {
   return trimmed < DEFAULT_SIZE_USD ? null : trimmed
 }
 
+const MAX_PENDING_SIGNAL_AGE_MS = 24 * 3600_000
+
 export async function autoDispatchPendingSignals(
   db: Database.Database,
   deps: AutoDispatchDeps,
@@ -654,6 +656,14 @@ export async function autoDispatchPendingSignals(
       "UPDATE trader_signals SET status = 'dispatching' WHERE id = ? AND status = 'pending'",
     ).run(signal.id)
     if (claimed.changes === 0) continue
+
+    // Gated signals stay pending through an outage; never enter on a price
+    // that is over a day old. The engine re-emits live signals each day.
+    if (Date.now() - signal.generated_at > MAX_PENDING_SIGNAL_AGE_MS) {
+      db.prepare("UPDATE trader_signals SET status = 'suppressed_stale' WHERE id = ?").run(signal.id)
+      recordSignalSuppressionBySignalId(db, signal.id, 'stale')
+      continue
+    }
 
     try {
       const strategy = db.prepare(

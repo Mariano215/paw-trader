@@ -3,6 +3,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import {
   runCommittee,
+  CommitteeGatedError,
   storeTranscript,
   parseAgentJson,
   buildSignalContext,
@@ -341,6 +342,15 @@ describe('committee -- fail-closed on broken agents', () => {
     const result = await runCommittee(baseSignal, deps(scriptedRunAgent(script)))
     expect(result.decision).toBe('abstain')
     expect(result.transcript.errors).toContain('trader parse failed; abstaining')
+  })
+
+  it.each([
+    'Claude Code returned an error result: Failed to authenticate: OAuth session expired and could not be refreshed',
+    'Anthropic API request failed (401) for claude-haiku-4-5: invalid x-api-key',
+    'Anthropic API selected but no API key is configured for this project or environment',
+  ])('auth failure is a gate, not an abstain: %s', async (message) => {
+    const runAgent: CommitteeDeps['runAgent'] = async () => { throw new Error(message) }
+    await expect(runCommittee(baseSignal, deps(runAgent))).rejects.toBeInstanceOf(CommitteeGatedError)
   })
 
   it('runAgent throwing is handled per call without aborting the run', async () => {

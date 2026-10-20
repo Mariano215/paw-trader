@@ -58,6 +58,25 @@ describe('autoDispatchPendingSignals under a gate refusal', () => {
     expect(sup.c).toBe(0)
   })
 
+  it('a signal held pending past the max age is suppressed as stale, not dispatched', async () => {
+    const db = makeDb()
+    seedPending(db, 'sig-old', 'SPY')
+    db.prepare('UPDATE trader_signals SET generated_at = ? WHERE id = ?').run(NOW - 25 * 3600_000, 'sig-old')
+
+    const runCommittee = vi.fn()
+    const engine = {getPositions: vi.fn().mockResolvedValue([])} as never
+    await autoDispatchPendingSignals(db, {
+      send: vi.fn().mockResolvedValue(undefined),
+      alertOnReject: false,
+      runCommittee: runCommittee as unknown as (...args: unknown[]) => Promise<CommitteeResult>,
+      runAgent: vi.fn() as never,
+    } as never, engine)
+
+    expect(runCommittee).not.toHaveBeenCalled()
+    const row = db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-old') as { status: string }
+    expect(row.status).toBe('suppressed_stale')
+  })
+
   it('a non-gated committee throw still re-queues just that signal and continues', async () => {
     const db = makeDb()
     seedPending(db, 'sig-a', 'SPY')

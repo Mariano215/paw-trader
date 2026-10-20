@@ -222,7 +222,7 @@ export async function dispatchApproval(
   // still record a 'committee_abstain' decision so the audit trail is complete.
   const defaultSize = parsed.override_size ?? DEFAULT_SIZE_USD
   const runCommitteeImpl = deps.runCommittee ?? runCommittee
-  const runAgentImpl = deps.runAgent ?? (await import('../agent.js')).runAgent
+  const runAgentImpl = deps.runAgent ?? (await import('./tracked-run-agent.js')).trackedRunAgent
 
   const committeeInput: CommitteeSignalInput = {
     id: signal.id,
@@ -811,7 +811,7 @@ export async function autoDispatchPendingSignals(
       const useBypass = bypass && bypassCount < TRADER_BYPASS_TRADE_TARGET
 
       const runCommitteeImpl = deps.runCommittee ?? runCommittee
-      const runAgentImpl     = deps.runAgent ?? (await import('../agent.js')).runAgent
+      const runAgentImpl     = deps.runAgent ?? (await import('./tracked-run-agent.js')).trackedRunAgent
 
       let committeeResult: CommitteeResult
       if (useBypass) {

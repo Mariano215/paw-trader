@@ -63,7 +63,7 @@ export function computeSlippageUsd(
   fillQty: number,
   intendedPrice: number | null | undefined,
 ): number {
-  if (intendedPrice == null) return 0
+  if (intendedPrice == null || !(intendedPrice > 0)) return 0  // 0 = no reference price
   const perUnit = side === 'buy' ? fillPrice - intendedPrice : intendedPrice - fillPrice
   return perUnit * fillQty
 }

@@ -900,7 +900,7 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
     expect(verdict.bench_return).toBeCloseTo(0.05, 10)      // 400 -> 420 = 5%
     expect(verdict.hold_drawdown).toBeCloseTo(-0.1, 10)     // 100 -> 90 = -10%
 
-    expect(engine.getPrices).toHaveBeenCalledTimes(2)  // asset + bench
+    expect(engine.getPrices).toHaveBeenCalledTimes(3)  // asset + bench + daily snapshot SPY
   })
 
   it('skips getPrices entirely when no decision is closing', async () => {
@@ -918,7 +918,7 @@ describe('runCloseOutSweep populates bench_return + hold_drawdown (Phase 4 Task 
 
     const result = await runCloseOutSweep(db, engine)
     expect(result.stillOpen).toBe(1)
-    expect(engine.getPrices).not.toHaveBeenCalled()
+    expect(vi.mocked(engine.getPrices).mock.calls.filter((c: unknown[]) => c[0] !== "SPY")).toHaveLength(0)  // only the daily snapshot SPY bar
   })
 
   it('gracefully writes placeholders + returns_backfilled=0 when getPrices fails', async () => {

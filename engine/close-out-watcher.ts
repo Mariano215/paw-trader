@@ -531,6 +531,19 @@ export async function fetchReturnsForDecision(
   return { success: true, benchReturn, holdDrawdown }
 }
 
+/** SPY close-to-close return for `dateNY`; 0 when the bar is unavailable. */
+export async function dailyBenchReturn(engineClient: EngineClient, dateNY: string): Promise<number> {
+  try {
+    const end = Date.parse(`${dateNY}T23:59:59Z`)
+    const bars = await engineClient.getPrices('SPY', end - 10 * 86_400_000, end)
+    const i = bars.findIndex((b) => b.date === dateNY)
+    if (i < 1 || !(bars[i - 1].close > 0)) return 0
+    return bars[i].close / bars[i - 1].close - 1
+  } catch {
+    return 0
+  }
+}
+
 /** Reason a decision reached a terminal state without a verdict. */
 export type UngradedReason =
   | 'no-fill-data'
@@ -863,7 +876,7 @@ async function writeDailySnapshot(
       navClose,
       pnlDay: pnlRow.total_pnl,
       tradesCount: pnlRow.cnt,
-      benchReturn: 0,   // backfilled later when /prices available
+      benchReturn: await dailyBenchReturn(engineClient, todayNY),
       cumulativePnl: priorBase + pnlRow.total_pnl,
       openUnrealizedPnl,
       accountNav,

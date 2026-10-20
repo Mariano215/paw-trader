@@ -42,6 +42,9 @@ function fill(over: Partial<FillRow> = {}): FillRow {
 }
 
 describe('computeSlippageUsd', () => {
+  it("returns 0 when the intended price is missing (0), not the whole notional", () => {
+    expect(computeSlippageUsd("buy", 101, 10, 0)).toBe(0)
+  })
   it('positive when a buy fills above intended', () => {
     expect(computeSlippageUsd('buy', 101, 10, 100)).toBeCloseTo(10, 10)
   })

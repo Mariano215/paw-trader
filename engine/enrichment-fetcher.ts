@@ -1,7 +1,7 @@
 /**
  * enrichment-fetcher.ts
  *
- * Fetches 30 days of daily price bars from the trading engine for each
+ * Fetches ~60 calendar days of daily price bars from the trading engine for each
  * pending signal that has no enrichment_json, computes basic technical
  * indicators (RSI-14, momentum, price levels), and stores the result as
  * JSON so the committee has real market context instead of "(none)".
@@ -13,7 +13,7 @@
 
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
-import type { MarkovRegimePayload } from './types.js'
+import type { MarkovRegimePayload, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 
 export interface SignalEnrichment {
@@ -27,11 +27,15 @@ export interface SignalEnrichment {
   price_change_20d_pct: number | null
   /** 14-period RSI calculated from daily closes. Null if < 15 bars. */
   rsi_14: number | null
-  /** Highest close in the fetched window. */
+  /**
+   * Highest high of the last VOL_WINDOW_BARS completed bars (before today,
+   * America/New_York), the same window the engine backtest sizes stops from.
+   * Bars without high/low use their close.
+   */
   window_high: number | null
-  /** Lowest close in the fetched window. */
+  /** Lowest low of the same window. */
   window_low: number | null
-  /** % below window high (negative = below high). */
+  /** % from window high. Negative = below it; positive when the current price is above the completed-bar window's high. */
   pct_from_window_high: number | null
   /** Number of daily bars the engine returned. */
   bars_fetched: number
@@ -63,13 +67,22 @@ const COINGECKO_IDS: Record<string, string> = {
   'LINK/USD': 'chainlink',
 }
 
-async function fetchCoinGeckoPrices(asset: string): Promise<number[]> {
+type Bar = Pick<PricePoint, 'date' | 'close' | 'high' | 'low'>
+
+// Must equal VOL_WINDOW_DAYS in the engine's backtest/trade_simulator.py (bars, not days).
+export const VOL_WINDOW_BARS = 35
+// Calendar days to fetch so at least VOL_WINDOW_BARS completed bars come back.
+const LOOKBACK_DAYS = 60
+
+const nyDate = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+async function fetchCoinGeckoPrices(asset: string): Promise<Bar[]> {
   const coinId = COINGECKO_IDS[asset.toUpperCase()]
   if (!coinId) return []
 
   const url =
     `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart` +
-    `?vs_currency=usd&days=35&interval=daily`
+    `?vs_currency=usd&days=${LOOKBACK_DAYS}&interval=daily`
 
   const resp = await fetch(url, {
     headers: { Accept: 'application/json' },
@@ -79,8 +92,8 @@ async function fetchCoinGeckoPrices(asset: string): Promise<number[]> {
 
   const data = await resp.json() as { prices?: [number, number][] }
   return (data.prices ?? [])
-    .map(([, price]) => price)
-    .filter((p): p is number => typeof p === 'number' && isFinite(p))
+    .filter(([, price]) => typeof price === 'number' && isFinite(price))
+    .map(([ts, price]) => ({ date: nyDate(ts), close: price }))
 }
 
 /**
@@ -123,11 +136,21 @@ function markovDataAgeDays(markov: MarkovRegimePayload | null): number | null {
   return Math.floor((Date.now() - asOfMs) / (24 * 60 * 60 * 1000))
 }
 
-function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null): SignalEnrichment {
-  const n = closes.length
+function computeEnrichment(bars: Bar[], markov: MarkovRegimePayload | null): SignalEnrichment {
   const now = Date.now()
 
-  if (n === 0) {
+  // Completed bars only: today's partial bar is not in the backtest window, and
+  // the backtest's stop basis is the signal bar's close (the last completed bar).
+  // A tradable equity signal is always enriched on its entry day (the poller drops off-hours signals, dispatch suppresses stale ones), so date < today is the backtest's "bars before the entry bar".
+  const today = nyDate(now)
+  const completed = bars
+    .filter(b => b.date < today)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+  // shortcut: with no completed bar at all, fall back to what the engine sent; it only happens on a feed with no history.
+  const closes = (completed.length > 0 ? completed : bars).map(b => b.close)
+  const n = closes.length
+
+  if (bars.length === 0) {
     return {
       price_current: null,
       price_change_1d_pct: null,
@@ -149,8 +172,9 @@ function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null)
   const prev5d  = n >= 6  ? closes[n - 6]  : null
   const prev20d = n >= 21 ? closes[n - 21] : null
 
-  const windowHigh = Math.max(...closes)
-  const windowLow  = Math.min(...closes)
+  const window = completed.slice(-VOL_WINDOW_BARS)
+  const windowHigh = window.length > 0 ? Math.max(...window.map(b => b.high ?? b.close)) : null
+  const windowLow  = window.length > 0 ? Math.min(...window.map(b => b.low ?? b.close)) : null
 
   return {
     price_current:        round2(current),
@@ -158,10 +182,10 @@ function computeEnrichment(closes: number[], markov: MarkovRegimePayload | null)
     price_change_5d_pct:  prev5d  != null ? pctChange(prev5d,  current) : null,
     price_change_20d_pct: prev20d != null ? pctChange(prev20d, current) : null,
     rsi_14:               computeRsi14(closes),
-    window_high:          round2(windowHigh),
-    window_low:           round2(windowLow),
-    pct_from_window_high: round2(((current - windowHigh) / windowHigh) * 100),
-    bars_fetched:         n,
+    window_high:          windowHigh != null ? round2(windowHigh) : null,
+    window_low:           windowLow != null ? round2(windowLow) : null,
+    pct_from_window_high: windowHigh != null ? round2(((current - windowHigh) / windowHigh) * 100) : null,
+    bars_fetched:         bars.length,
     fetched_at:           now,
     markov_regime:        markov,
     markov_data_age_days: markovDataAgeDays(markov),
@@ -190,13 +214,13 @@ export async function enrichPendingSignals(
 
   if (signals.length === 0) return 0
 
-  const LOOKBACK_MS = 35 * 24 * 60 * 60 * 1000  // 35 days -> ~25 trading bars
+  const LOOKBACK_MS = LOOKBACK_DAYS * 24 * 60 * 60 * 1000
   const now = Date.now()
   const fromMs = now - LOOKBACK_MS
   const toMs   = now
 
   // One price fetch + one markov fetch per unique asset
-  const priceCache = new Map<string, number[]>()
+  const priceCache = new Map<string, Bar[]>()
   const markovCache = new Map<string, MarkovRegimePayload | null>()
 
   const uniqueAssets = [...new Set(signals.map(s => s.asset))]
@@ -204,9 +228,9 @@ export async function enrichPendingSignals(
     uniqueAssets.map(async (asset) => {
       try {
         const bars = await client.getPrices(asset, fromMs, toMs)
-        const closes = bars.map(b => b.close).filter(c => typeof c === 'number' && isFinite(c))
-        priceCache.set(asset, closes)
-        logger.debug({ asset, bars: closes.length }, 'enrichment: price bars fetched')
+        const valid = bars.filter(b => typeof b.close === 'number' && isFinite(b.close))
+        priceCache.set(asset, valid)
+        logger.debug({ asset, bars: valid.length }, 'enrichment: price bars fetched')
       } catch (err) {
         logger.warn({ err, asset }, 'enrichment: price fetch failed; signal stays unenriched')
         priceCache.set(asset, [])
@@ -217,10 +241,10 @@ export async function enrichPendingSignals(
       // the committee has current RSI and momentum context.
       if ((priceCache.get(asset) ?? []).length === 0 && asset.includes('/')) {
         try {
-          const closes = await fetchCoinGeckoPrices(asset)
-          if (closes.length > 0) {
-            priceCache.set(asset, closes)
-            logger.info({ asset, bars: closes.length }, 'enrichment: CoinGecko fallback price bars fetched')
+          const cgBars = await fetchCoinGeckoPrices(asset)
+          if (cgBars.length > 0) {
+            priceCache.set(asset, cgBars)
+            logger.info({ asset, bars: cgBars.length }, 'enrichment: CoinGecko fallback price bars fetched')
           } else {
             logger.warn({ asset }, 'enrichment: CoinGecko returned 0 bars for crypto asset')
           }
@@ -248,14 +272,14 @@ export async function enrichPendingSignals(
   let enriched = 0
   const persist = db.transaction(() => {
     for (const signal of signals) {
-      const closes = priceCache.get(signal.asset) ?? []
+      const bars = priceCache.get(signal.asset) ?? []
       const markov = markovCache.get(signal.asset) ?? null
-      // Skip only when both bars AND Markov are missing — no useful data at all.
+      // Skip only when both bars AND Markov are missing: no useful data at all.
       // Crypto assets (e.g. BTC/USD) have Markov from the engine but no price
       // bars on the /prices endpoint; write Markov-only enrichment so the
       // committee can use regime signal instead of seeing "(none)".
-      if (closes.length === 0 && markov == null) continue
-      const data = computeEnrichment(closes, markov)
+      if (bars.length === 0 && markov == null) continue
+      const data = computeEnrichment(bars, markov)
       update.run(JSON.stringify(data), signal.id)
       enriched++
     }

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { evaluateExit, findOpenExitCandidates, runExitSweep, currentMomentum, strategySignalExit, wilderRsi, type OpenExitRow } from './exit-evaluator.js'
+import { evaluateExit, findOpenExitCandidates, runExitSweep, completedBarsAfterEntry, strategySignalExit, wilderRsi, type OpenExitRow } from './exit-evaluator.js'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
 
@@ -30,16 +30,9 @@ describe('evaluateExit', () => {
 
   it('time exits still work without a usable mark', () => {
     expect(evaluateExit(row({decided_at: Date.now() - 30 * DAY}),
-      {lastPrice: null, nowMs: Date.now()}).reason).toBe('time')
+      {lastPrice: null, nowMs: Date.now(), barsAfterEntry: 20}).reason).toBe('time')
   })
 
-  it('calculates momentum from current distinct bars, rejecting stale history', () => {
-    const now = Date.now()
-    const bars = Array.from({length: 21}, (_, i) => ({ts_ms: now - (20 - i) * DAY, close: 100 - i}))
-    expect(currentMomentum(bars, now, false)).toBeCloseTo(-20)
-    expect(currentMomentum(bars, now + 5 * DAY, false)).toBeNull()
-    expect(currentMomentum([bars[20]], now, false)).toBeNull()
-  })
   it('exits a long when the last price is at/below the stop', () => {
     const r = evaluateExit(row(), { lastPrice: 91, nowMs: Date.now() })
     expect(r.exit).toBe(true)
@@ -54,18 +47,18 @@ describe('evaluateExit', () => {
     expect(r.side).toBe('sell')
   })
 
-  it('exits on time-stop when now exceeds decided_at + horizon', () => {
+  it('exits on time-stop once horizon completed bars have passed', () => {
     const decided = Date.now() - 21 * DAY
-    const r = evaluateExit(row({ decided_at: decided }), { lastPrice: 105, nowMs: Date.now() })
+    const r = evaluateExit(row({ decided_at: decided }), { lastPrice: 105, nowMs: Date.now(), barsAfterEntry: 20 })
     expect(r.exit).toBe(true)
     expect(r.reason).toBe('time')
   })
 
-  it('exits on momentum decay when 20d change exceeds the deadband for a long', () => {
-    const enrich = JSON.stringify({ price_change_20d_pct: -5.01 })
-    const r = evaluateExit(row({ enrichment_json: enrich }), { lastPrice: 105, nowMs: Date.now(), momentumPct: -5.01 })
-    expect(r.exit).toBe(true)
-    expect(r.reason).toBe('momentum')
+  it('holds on decayed momentum: the backtest has no momentum-decay exit', () => {
+    const enrich = JSON.stringify({ price_change_20d_pct: -20 })
+    const r = evaluateExit(row({ enrichment_json: enrich }), { lastPrice: 105, nowMs: Date.now(), barsAfterEntry: 5 })
+    expect(r.exit).toBe(false)
+    expect(r.reason).toBe('hold')
   })
 
   it('holds when momentum is negative but within the deadband (-4.99)', () => {
@@ -92,8 +85,33 @@ describe('evaluateExit', () => {
     const r = evaluateExit(row({ stop_loss: null, take_profit: null }), { lastPrice: 50, nowMs: Date.now() })
     expect(r.exit).toBe(false)
     const decided = Date.now() - 21 * DAY
-    const t = evaluateExit(row({ stop_loss: null, take_profit: null, decided_at: decided }), { lastPrice: 50, nowMs: Date.now() })
+    const t = evaluateExit(row({ stop_loss: null, take_profit: null, decided_at: decided }), { lastPrice: 50, nowMs: Date.now(), barsAfterEntry: 20 })
     expect(t.reason).toBe('time')
+  })
+})
+
+describe('parity exits', () => {
+  const base = { id: 'd1', signal_id: 's1', asset: 'AAPL', action: 'buy', entry_price: 100, stop_loss: null,
+    take_profit: null, horizon_days: 20, decided_at: Date.parse('2026-09-01T14:00:00Z'), enrichment_json: null,
+    cohort_id: null, strategy_id: 'momentum-stocks', entry_filled_at: Date.parse('2026-09-01T14:00:00Z') } as OpenExitRow
+  const now = Date.parse('2026-09-23T15:00:00Z') // 22 calendar days later
+
+  it('equity time stop counts completed bars, not calendar days', () => {
+    expect(evaluateExit(base, { lastPrice: 100, nowMs: now, barsAfterEntry: 15 }).exit).toBe(false)
+    expect(evaluateExit(base, { lastPrice: 100, nowMs: now, barsAfterEntry: 20 })).toMatchObject({ exit: true, reason: 'time' })
+  })
+  it('equity without bars uses a 2x-horizon calendar backstop', () => {
+    expect(evaluateExit(base, { lastPrice: 100, nowMs: now }).exit).toBe(false)
+    expect(evaluateExit(base, { lastPrice: 100, nowMs: base.decided_at + 41 * 86_400_000 })).toMatchObject({ exit: true, reason: 'time' })
+  })
+  it('crypto keeps the calendar time stop', () => {
+    const c = { ...base, asset: 'BTC/USD', strategy_id: 'momentum-crypto' }
+    expect(evaluateExit(c, { lastPrice: 100, nowMs: now })).toMatchObject({ exit: true, reason: 'time' })
+  })
+  it('counts only completed bars dated after the fill day', () => {
+    const day = (d: string) => ({ date: d, close: 1, ts_ms: Date.parse(d + 'T20:00:00Z') })
+    const bars = [day('2026-09-01'), day('2026-09-02'), day('2026-09-03'), day('2026-09-23')]
+    expect(completedBarsAfterEntry(bars, base.entry_filled_at!, now)).toBe(2)
   })
 })
 

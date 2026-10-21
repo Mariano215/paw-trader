@@ -52,7 +52,7 @@ describe('runRetrySweep', () => {
     expect(row.engine_order_id).toBe('boid-2')
     expect(row.submit_attempts).toBe(2)
     expect(client.submitDecision).toHaveBeenCalledWith(expect.objectContaining({
-      entry_price: 100, stop_loss: 92, take_profit: 116, strategy: 'momentum-stocks',
+      entry_price: 0, stop_loss: 92, take_profit: 116, strategy: 'momentum-stocks',
     }))
     expect(db.prepare("SELECT event_type, state, decision_id, order_id FROM trader_operational_events WHERE decision_id='d1'").get())
       .toEqual({ event_type: 'broker.order.retry_submitted', state: 'submitted', decision_id: 'd1', order_id: 'boid-2' })

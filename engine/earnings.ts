@@ -4,9 +4,10 @@
 // cannot protect across an overnight gap, so the fix is to not hold into it.
 //
 // Source: Nasdaq's public analyst endpoint (no key). ETFs return 400, which
-// reads as "no earnings". Knob `earnings_blackout_days` (0 = off) sets how
-// many calendar days before earnings new entries are blocked; held positions
-// exit when earnings are today or tomorrow.
+// reads as "no earnings". Knob `earnings_blackout_days` (default 0) sets how
+// many calendar days before earnings new entries are blocked; 0 blocks the
+// earnings day only. There is no earnings exit: the backtest has none, so held
+// positions hold through the report (parity decision 2026-10-21).
 import { logger } from '../logger.js'
 import { traderKnob } from './knobs.js'
 

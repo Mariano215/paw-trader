@@ -10,11 +10,11 @@
  * Triggers:
  *   - stop:     last price breached the stored stop_loss
  *   - target:   last price reached the stored take_profit
- *   - time:     now - decided_at exceeded horizon_days (time-stop)
+ *   - time:     equities: horizon_days completed trading-day bars after the
+ *               fill day (the backtest's j - entry_idx >= horizon); crypto:
+ *               horizon_days calendar days since decided_at
  *   - signal:   the strategy's own exit rule on the last completed daily bar
  *               (rsi2-stocks: close > SMA5 or RSI(2) > 70; ibs-stocks: IBS > 0.8)
- *   - momentum: 20d momentum flipped against a long / short
- *   - earnings: a single stock reports today or tomorrow (see earnings.ts)
  *
  * Hot-path rules (mirrors close-out-watcher):
  *   - One positions round-trip per sweep; historical data only when a
@@ -29,23 +29,15 @@
 import { randomUUID } from 'crypto'
 import type Database from 'better-sqlite3'
 import type { EngineClient } from './engine-client.js'
-import type { EnginePosition } from './types.js'
+import type { EnginePosition, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { DECISION_STATUS } from './order-lifecycle.js'
 import { isEquityMarketHours } from './signal-poller.js'
 import { notifyUnexpectedShortPositions, POSITION_QTY_EPSILON } from './position-safety.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
-import { daysToEarnings } from './earnings.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 export const EXIT_MARK_MAX_AGE_MS = 5 * 60 * 1000
-
-/**
- * Momentum-decay deadband for longs (pct, negative).
- * Evaluated from current 20-session bars, not entry-time enrichment.
- * The deadband avoids treating every small negative move as a reversal.
- */
-export const MOMENTUM_EXIT_DEADBAND_PCT = -5.0
 
 export interface OpenExitRow {
   id: string
@@ -74,7 +66,7 @@ export interface ExitDecision {
 
 /**
  * Open long/short decisions that have NOT already had an exit submitted,
- * joined to their signal's enrichment for momentum.
+ * joined to their signal's horizon and enrichment.
  * 'executed' = entry filled-or-submitted (the dispatcher's success state).
  *
  * Guard is keyed on the entry DECISION id via the exit row's
@@ -115,7 +107,7 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
 /** Pure exit decision for one open position given the latest price. */
 export function evaluateExit(
   row: OpenExitRow,
-  ctx: { lastPrice: number | null; nowMs: number; momentumPct?: number | null; signalExit?: boolean },
+  ctx: { lastPrice: number | null; nowMs: number; barsAfterEntry?: number | null; signalExit?: boolean },
 ): ExitDecision {
   const isLong = row.action !== 'sell'
   const exitSide: 'buy' | 'sell' = isLong ? 'sell' : 'buy'
@@ -135,30 +127,20 @@ export function evaluateExit(
   // 3. Strategy exit rule (computed by strategySignalExit on completed daily bars).
   if (ctx.signalExit) return { exit: true, reason: 'signal', side: exitSide }
 
-  // 4. Time-stop: held past the signal horizon, the backstop for signal exits.
+  // 4. Time-stop. Equities count completed trading-day bars after the fill day,
+  //    as the backtest does (j - entry_idx >= horizon). Without bars, a 2x-horizon
+  //    calendar backstop. Crypto keeps calendar days.
   const horizon = row.horizon_days > 0 ? row.horizon_days : 10
-  if (ctx.nowMs - row.decided_at > horizon * DAY_MS) {
+  const isCrypto = row.asset.includes('/')
+  if (isCrypto) {
+    if (ctx.nowMs - row.decided_at > horizon * DAY_MS) return { exit: true, reason: 'time', side: exitSide }
+  } else if (ctx.barsAfterEntry != null) {
+    if (ctx.barsAfterEntry >= horizon) return { exit: true, reason: 'time', side: exitSide }
+  } else if (ctx.nowMs - (row.entry_filled_at ?? row.decided_at) > 2 * horizon * DAY_MS) {
     return { exit: true, reason: 'time', side: exitSide }
   }
 
-  // Entry-time enrichment is historical context, not a current exit signal.
-  const m = ctx.momentumPct
-  if (m != null && Number.isFinite(m)) {
-    const decayed = isLong ? m < MOMENTUM_EXIT_DEADBAND_PCT : m > -MOMENTUM_EXIT_DEADBAND_PCT
-    if (decayed) return { exit: true, reason: 'momentum', side: exitSide }
-  }
-
   return { exit: false, reason: 'hold', side: exitSide }
-}
-
-/** Current 20-session return, or null for incomplete/stale market data. */
-export function currentMomentum(bars: {close: number; ts_ms: number}[], nowMs: number, crypto: boolean): number | null {
-  const sorted = [...new Map(bars.filter(b => Number.isFinite(b.close) && b.close > 0 &&
-    Number.isFinite(b.ts_ms) && b.ts_ms <= nowMs).map(b => [b.ts_ms, b])).values()].sort((a, b) => a.ts_ms - b.ts_ms)
-  if (sorted.length < 21) return null
-  const last = sorted[sorted.length - 1]
-  if (nowMs - last.ts_ms > (crypto ? 2 : 4) * DAY_MS) return null
-  return (last.close / sorted[sorted.length - 21].close - 1) * 100
 }
 
 /** Wilder RSI over `closes` (oldest first). Null when there are fewer than n+1 closes. */
@@ -218,6 +200,14 @@ export function strategySignalExit(
   const { high, low } = last
   if (high == null || low == null || !Number.isFinite(high) || !Number.isFinite(low) || !(high > low)) return false
   return (last.close - low) / (high - low) > 0.8
+}
+
+/** Completed daily bars (dated before today, NY) dated after the fill day. */
+export function completedBarsAfterEntry(bars: PricePoint[], entryMs: number, nowMs: number): number {
+  const today = nyDate(nowMs)
+  const entryDay = nyDate(entryMs)
+  return new Set(bars.filter(b => Number.isFinite(b.close) && b.close > 0)
+    .map(b => b.date ?? nyDate(b.ts_ms)).filter(d => d > entryDay && d < today)).size
 }
 
 /**
@@ -321,19 +311,16 @@ export async function runExitSweep(
       const last = Number.isFinite(mark) && mark > 0 && Number.isFinite(pos.updated_at) &&
         nowMs >= pos.updated_at && nowMs - pos.updated_at <= EXIT_MARK_MAX_AGE_MS ? mark : null
       let verdict = evaluateExit(row, {lastPrice: last, nowMs})
-      // A stop cannot protect across an overnight earnings gap. Leave first.
-      if (!verdict.exit && !isCrypto) {
-        const d = await daysToEarnings(row.asset, nowMs)
-        if (d != null && d <= 1) verdict = { exit: true, reason: 'earnings', side: verdict.side }
-      }
-      // Stops and time exits do not wait on historical market-data requests.
+      // Stops, crypto time exits and the equity calendar backstop do not wait on
+      // historical market-data requests. The equity bar-count time stop needs bars.
       if (!verdict.exit) {
         try {
           const bars = await engineClient.getPrices(row.asset, nowMs - 45 * DAY_MS, nowMs)
-          verdict = evaluateExit(row, {lastPrice: last, nowMs, momentumPct: currentMomentum(bars, nowMs, isCrypto),
+          verdict = evaluateExit(row, {lastPrice: last, nowMs,
+            barsAfterEntry: completedBarsAfterEntry(bars, row.entry_filled_at ?? row.decided_at, nowMs),
             signalExit: row.strategy_id != null && strategySignalExit(row.strategy_id, bars, row.entry_filled_at ?? row.decided_at, nowMs)})
         } catch (err) {
-          logger.warn({asset: row.asset, err}, 'Exit momentum unavailable; no momentum-based action')
+          logger.warn({asset: row.asset, err}, 'Exit bars unavailable; no signal or bar-count time exit')
         }
       }
       if (!verdict.exit) continue

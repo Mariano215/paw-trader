@@ -3,7 +3,7 @@ import { entryRefFromEnrichment, resolveEntryReferencePrice } from './entry-refe
 
 const NOW = 1_784_000_000_000
 
-const client = (bars: Array<{ close: number }> | Error) => ({
+const client = (bars: Array<{ date: string; close: number }> | Error) => ({
   getPrices: async () => {
     if (bars instanceof Error) throw bars
     return bars
@@ -26,20 +26,26 @@ describe('entryRefFromEnrichment', () => {
 describe('resolveEntryReferencePrice', () => {
   it('prefers enrichment and does not call the engine', async () => {
     let called = false
-    const c = { getPrices: async () => { called = true; return [{ close: 99 }] } }
+    const c = { getPrices: async () => { called = true; return [{ date: '2026-07-01', close: 99 }] } }
     expect(await resolveEntryReferencePrice(c, 'EEM', '{"price_current":66.7}', NOW)).toBe(66.7)
     expect(called).toBe(false)
   })
 
   it('falls back to the engine latest close when enrichment has no price', async () => {
     // The 43%-of-the-book case: without this the position ships with no stop.
-    const r = await resolveEntryReferencePrice(client([{ close: 60 }, { close: 62.5 }]), 'EEM', null, NOW)
+    const r = await resolveEntryReferencePrice(client([{ date: '2026-07-09', close: 60 }, { date: '2026-07-10', close: 62.5 }]), 'EEM', null, NOW)
     expect(r).toBe(62.5)
   })
 
   it('skips trailing unusable bars', async () => {
-    const bars = [{ close: 61 }, { close: NaN }, { close: 0 }] as Array<{ close: number }>
+    const bars = [{ date: '2026-07-08', close: 61 }, { date: '2026-07-09', close: NaN }, { date: '2026-07-10', close: 0 }]
     expect(await resolveEntryReferencePrice(client(bars), 'EEM', null, NOW)).toBe(61)
+  })
+
+  it('ignores a forming bar dated today and uses the last completed close', async () => {
+    const today = new Date(NOW).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const r = await resolveEntryReferencePrice(client([{ date: '2026-07-10', close: 62.5 }, { date: today, close: 90 }]), 'EEM', null, NOW)
+    expect(r).toBe(62.5)
   })
 
   it('returns 0 when the engine has no bars', async () => {

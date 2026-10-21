@@ -16,7 +16,7 @@
 import { logger } from '../logger.js'
 
 export interface EntryRefDeps {
-  getPrices(asset: string, fromMs: number, toMs: number): Promise<Array<{ close: number }>>
+  getPrices(asset: string, fromMs: number, toMs: number): Promise<Array<{ date: string; close: number }>>
 }
 
 /** Pull price_current out of an enrichment blob. 0 when absent or unusable. */
@@ -32,7 +32,8 @@ export function entryRefFromEnrichment(enrichmentJson: string | null | undefined
 }
 
 /**
- * Enrichment price when present, else the latest close the engine has.
+ * Enrichment price when present, else the last completed close the engine has
+ * (a bar dated before today, America/New_York), the backtest's stop basis.
  *
  * Returns 0 only when both sources fail, which still yields null exits --
  * but now that is a genuine data outage rather than the normal case.
@@ -48,7 +49,8 @@ export async function resolveEntryReferencePrice(
 
   try {
     // Five days back so a long weekend or a holiday still returns a bar.
-    const bars = await client.getPrices(asset, nowMs - 5 * 24 * 60 * 60 * 1000, nowMs)
+    const today = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const bars = (await client.getPrices(asset, nowMs - 5 * 24 * 60 * 60 * 1000, nowMs)).filter(b => b.date < today)
     for (let i = bars.length - 1; i >= 0; i--) {
       const c = bars[i]?.close
       if (typeof c === 'number' && isFinite(c) && c > 0) {
@@ -70,4 +72,18 @@ export async function resolveEntryReferencePrice(
     )
   }
   return 0
+}
+
+/**
+ * entry_price to send the engine for a buy. Equities send 0: the engine
+ * accepts only limit buys (trader-engine decisions.py:129) and prices an
+ * entry_price of 0 at the live quote (decisions.py:167), so the limit sits
+ * at the market at submit time instead of at the prior close, which missed
+ * every gap-up open. Stops and targets stay sized off the reference price.
+ * Crypto keeps the reference price. The stored decision row keeps the
+ * reference price; retries must send this same value or the engine's
+ * request hash rejects them as an intent conflict.
+ */
+export function entryWirePrice(asset: string, referencePrice: number): number {
+  return asset.includes('/') ? referencePrice : 0
 }

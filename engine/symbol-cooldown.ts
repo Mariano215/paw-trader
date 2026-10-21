@@ -22,10 +22,11 @@
 import type Database from 'better-sqlite3'
 import type { EnginePosition } from './types.js'
 
-/** Days a symbol is benched after a losing realized exit. The EEM re-entry gap
- *  was 5 days, so anything below that is decorative. 10 gives a real pause
- *  without benching a symbol for a whole quarter. Env-tunable for retuning. */
-export const SYMBOL_COOLDOWN_DAYS = Number(process.env.TRADER_SYMBOL_COOLDOWN_DAYS ?? 10)
+/** Days a symbol is benched after a losing realized exit. Default 0 (off): the
+ *  engine backtest has no cooldown, so a live cooldown skips trades the backtest
+ *  takes. Set the symbol_cooldown_days knob or the env var to re-enable. The EEM
+ *  re-entry gap was 5 days, so anything below that is decorative. */
+export const SYMBOL_COOLDOWN_DAYS = Number(process.env.TRADER_SYMBOL_COOLDOWN_DAYS ?? 0)
 
 /** How underwater an open position must be before adding to it is refused.
  *  Not zero: a position a few cents red is noise, not a losing thesis. */

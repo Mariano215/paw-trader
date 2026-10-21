@@ -30,6 +30,8 @@ import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
 import type { LadderResult } from './autonomy-ladder.js'
 import { activateCohort, createDraftCohort, COHORT_ENFORCEMENT_KV_KEY } from './evaluation-cohort.js'
 import { isEquityMarketHours } from './signal-poller.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
+import { computeExits } from './exit-calculator.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -159,6 +161,33 @@ describe('decision-dispatcher', () => {
     const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
     expect(payload.entry_type).toBe('limit')
     expect((db.prepare("SELECT entry_type FROM trader_decisions WHERE signal_id = 'sig-auto-1'").get() as any).entry_type).toBe('limit')
+  })
+
+  it.each([
+    ['MSFT', 0],       // equity: wire price 0, engine limits at the live quote
+    ['BTC/USD', 100],  // crypto: unchanged, limit at the reference price
+  ])('auto-dispatch %s sends limit at wire price %s with prior-close exits', async (asset, wirePrice) => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES ('sig-wire', 'momentum-stocks', ?, 'buy', 0.7, 20, ?, ?, 'pending')
+    `).run(asset, JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 }), Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-w', broker_order_id: 'boid-w', status: 'placed', approved_size_usd: 150,
+    })
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: makeApproveCommittee(150) },
+      mockClient as EngineClient,
+    )
+    const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(payload.entry_type).toBe('limit')
+    expect(payload.entry_price).toBe(wirePrice)
+    const exits = computeExits({ side: 'buy', entryPrice: 100, horizonDays: 20,
+      enrichment: JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 }) })
+    expect(payload.stop_loss).toBe(exits.stopLoss)
+    expect(payload.take_profit).toBe(exits.takeProfit)
+    // The row keeps the prior-close reference for exits, retry checks and audit.
+    expect((db.prepare("SELECT entry_price FROM trader_decisions WHERE signal_id = 'sig-wire'").get() as any).entry_price).toBe(100)
   })
 
   it('auto-dispatch fails closed before committee work when broker positions are unavailable', async () => {
@@ -623,7 +652,7 @@ describe('decision-dispatcher', () => {
       { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
     )
     const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
-    expect(payload.entry_price).toBe(100)
+    expect(payload.entry_price).toBe(0)
     expect(payload.stop_loss).toBeCloseTo(80, 5)
     expect(payload.take_profit).toBeCloseTo(140, 5)
     const row = db.prepare('SELECT entry_price, stop_loss, take_profit FROM trader_decisions WHERE signal_id=?').get(signalId) as any
@@ -1246,8 +1275,9 @@ describe('autoDispatchPendingSignals', () => {
     )
 
     const payload = submitDecision.mock.calls[0][0]
-    // entry_price resolved from enrichment price_current
-    expect(payload.entry_price).toBe(100)
+    // Equity wire price is 0 (engine limits at the live quote); the row keeps
+    // the enrichment price_current reference.
+    expect(payload.entry_price).toBe(0)
     // vol stop: range 40/100 *0.5 = 0.20 -> stop 80, 2R target 140
     expect(payload.stop_loss).toBeCloseTo(80, 5)
     expect(payload.take_profit).toBeCloseTo(140, 5)
@@ -1355,6 +1385,89 @@ describe('autoDispatchPendingSignals: equity session staleness', () => {
     vi.setSystemTime(NEXT_0935_ET)
     const runCommittee = vi.fn(makeAbstainCommittee())
     await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('autoDispatchPendingSignals: same-day re-entry block', () => {
+  let db: Database.Database
+  // Wed 2026-10-21. EDT is UTC-4.
+  const EXIT_0935_ET = Date.parse('2026-10-21T13:35:00Z')
+  const SIGNAL_0941_ET = Date.parse('2026-10-21T13:41:00Z')
+  const NEXT_0941_ET = Date.parse('2026-10-22T13:41:00Z')
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    db = makeDb()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  function seedExit(asset: string, fillMs: number, opts: { fill?: boolean; status?: string } = {}) {
+    db.prepare(`INSERT INTO trader_decisions (id, signal_id, parent_decision_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES ('dec-exit-' || ?, 'sig-exit', 'dec-entry', 'sell', ?, 200, 'market', 'exit', 1, ?, ?)`).run(asset, asset, fillMs, opts.status ?? DECISION_STATUS.CLOSED)
+    if (opts.fill === false) return
+    db.prepare(`INSERT INTO trader_fills (id, decision_id, client_order_id, asset, side, fill_qty, fill_price, fill_ts_ms, recorded_at)
+      VALUES ('fill-' || ?, 'dec-exit-' || ?, 'c1', ?, 'sell', 1, 100, ?, ?)`).run(asset, asset, asset, fillMs, fillMs)
+  }
+  function seedSignal(id: string, asset: string, generatedAt: number) {
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, 'momentum-stocks', ?, 'buy', 0.8, 20, ?, 'pending')`).run(id, asset, generatedAt)
+  }
+  const engine = () => ({ submitDecision: vi.fn(), getNav: vi.fn().mockResolvedValue(100000), getPositions: vi.fn().mockResolvedValue([]) }) as any
+  const status = (id: string) => (db.prepare('SELECT status FROM trader_signals WHERE id = ?').get(id) as any).status
+  async function run(now: number) {
+    vi.setSystemTime(now)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    const eng = engine()
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, eng)
+    return { runCommittee, eng }
+  }
+
+  it('suppresses an entry on the ET day an exit filled, and submits no order', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee, eng } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).toBe('suppressed_same_day_reentry')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(eng.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('blocks a same-day re-entry after a closed exit with no fill row (decided_at fallback)', async () => {
+    seedExit('XLE', EXIT_0935_ET, { fill: false })
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee, eng } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).toBe('suppressed_same_day_reentry')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(eng.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('does not block re-entry after a failed exit that never filled', async () => {
+    seedExit('XLE', EXIT_0935_ET, { fill: false, status: DECISION_STATUS.FAILED })
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).not.toBe('suppressed_same_day_reentry')
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('dispatches the same signal the next day', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xle', 'XLE', NEXT_0941_ET)
+    const { runCommittee } = await run(NEXT_0941_ET)
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not affect a different asset', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xlk', 'XLK', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xlk')).not.toBe('suppressed_same_day_reentry')
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not affect crypto', async () => {
+    seedExit('BTC/USD', EXIT_0935_ET)
+    seedSignal('sig-btc', 'BTC/USD', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
     expect(runCommittee).toHaveBeenCalledTimes(1)
   })
 })

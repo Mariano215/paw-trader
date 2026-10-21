@@ -418,7 +418,7 @@ export async function dispatchApproval(
     // Falls back to the engine's latest close when enrichment carries no
     // price. A 0 here means computeExits() returns null exits, i.e. a naked
     // position -- that was 43% of the book before the fallback existed.
-    const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
+    const { resolveEntryReferencePrice, entryWirePrice } = await import('./entry-reference-price.js')
     const entryRef = await resolveEntryReferencePrice(
       engineClient!, signal.asset, signal.enrichment_json, now,
     )
@@ -526,7 +526,7 @@ export async function dispatchApproval(
       side: committeeResult.action ?? signal.side,
       size_usd: finalSizeUsd,
       entry_type: 'limit',
-      entry_price: entryRef,
+      entry_price: entryWirePrice(signal.asset, entryRef),
       ...(exits.stopLoss != null ? { stop_loss: exits.stopLoss } : {}),
       ...(exits.takeProfit != null ? { take_profit: exits.takeProfit } : {}),
       strategy: signal.strategy_id.replace(/-stocks$/, ''),
@@ -621,6 +621,18 @@ const nyDate = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', 
 function isStaleSignal(signal: { asset: string; generated_at: number }, nowMs: number): boolean {
   if (signal.asset.includes('/')) return nowMs - signal.generated_at > MAX_PENDING_SIGNAL_AGE_MS
   return !isEquityMarketHours(nowMs) || nyDate(nowMs) !== nyDate(signal.generated_at)
+}
+
+/** True when an exit decision for this asset (opposite of the entry side) filled on the ET date of nowMs. */
+function exitFilledToday(db: Database.Database, asset: string, entrySide: string, nowMs: number): boolean {
+  const exitAction = entrySide === 'buy' ? 'sell' : 'buy'
+  const rows = db.prepare(`
+    SELECT COALESCE(MAX(f.fill_ts_ms), CASE WHEN d.status = ? THEN d.decided_at END) AS fill_ms
+    FROM trader_decisions d LEFT JOIN trader_fills f ON f.decision_id = d.id
+    WHERE d.asset = ? AND d.action = ? AND d.parent_decision_id IS NOT NULL
+    GROUP BY d.id`).all(DECISION_STATUS.CLOSED, asset, exitAction) as Array<{ fill_ms: number | null }>
+  const today = nyDate(nowMs)
+  return rows.some((r) => r.fill_ms != null && nyDate(r.fill_ms) === today)
 }
 
 export async function autoDispatchPendingSignals(
@@ -754,6 +766,16 @@ export async function autoDispatchPendingSignals(
         )
         db.prepare("UPDATE trader_signals SET status = 'suppressed_already_held' WHERE id = ?").run(signal.id)
         recordSignalSuppressionBySignalId(db, signal.id, 'already_held')
+        continue
+      }
+
+      // Gate -0.75: no same-day re-entry after an exit fill. The engine backtest
+      // resumes scanning at the exit bar, so its earliest re-entry is the next
+      // bar's open; a same-open round trip only pays slippage twice.
+      if (!signal.asset.includes('/') && exitFilledToday(db, signal.asset, signal.side, Date.now())) {
+        logger.info({ event: 'trader.gate.same_day_reentry', signalId: signal.id, asset: signal.asset }, 'exit filled today, suppressing same-day re-entry')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_same_day_reentry' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'same_day_reentry')
         continue
       }
 
@@ -961,7 +983,7 @@ export async function autoDispatchPendingSignals(
       // was 152 of 350 buys over the 60 days to 2026-07-22. Enrichment first,
       // engine close as fallback. Computed before sizing so the size is set
       // off the real stop distance, not a flat 8% guess.
-      const { resolveEntryReferencePrice } = await import('./entry-reference-price.js')
+      const { resolveEntryReferencePrice, entryWirePrice } = await import('./entry-reference-price.js')
       const entryRef = await resolveEntryReferencePrice(
         engineClient, signal.asset, signal.enrichment_json, now,
       )
@@ -1197,7 +1219,7 @@ export async function autoDispatchPendingSignals(
             side:         committeeResult.action ?? signal.side,
             size_usd:     sizeUsd,
             entry_type:   'limit',
-            entry_price:  entryRef,
+            entry_price:  entryWirePrice(signal.asset, entryRef),
             ...(exits.stopLoss != null ? { stop_loss: exits.stopLoss } : {}),
             ...(exits.takeProfit != null ? { take_profit: exits.takeProfit } : {}),
             strategy:     signal.strategy_id,

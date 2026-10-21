@@ -3,6 +3,7 @@ import type { EngineClient } from './engine-client.js'
 import type { EngineOrder } from './types.js'
 import { DECISION_STATUS, MAX_SUBMIT_RETRIES, matchesBrokerOrder, isTerminalSubmitError } from './order-lifecycle.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
+import { entryWirePrice } from './entry-reference-price.js'
 import { logger } from '../logger.js'
 
 export interface RetrySweepSummary {
@@ -127,7 +128,7 @@ export async function runRetrySweep(
         side: row.action as 'buy' | 'sell',
         size_usd: row.size_usd,
         entry_type: 'limit',
-        entry_price: row.entry_price!,
+        entry_price: entryWirePrice(row.asset, row.entry_price!),
         stop_loss: row.stop_loss!,
         take_profit: row.take_profit!,
         strategy: row.strategy_id,

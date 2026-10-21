@@ -9,6 +9,7 @@ import {
 import { startOfNyDayMs } from './bypass-counter.js'
 import { recordTraderOperationalEvent, type TraderOperationalState } from './operational-events.js'
 import { sweepPendingForPausedStrategy } from './strategy-manager.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
 
 export const COHORT_ENFORCEMENT_KV_KEY = 'trader.cohorts.enforced'
 export const COHORT_CONFIG_VERSION = 1
@@ -412,11 +413,16 @@ export function countCohortEntriesToday(db: Database.Database, cohortId: string,
     .get(cohortId, start) as {n: number}).n
 }
 
-/** Open or opening entry lots of a cohort: entries not yet closed or graded. */
+/** Open or opening entry lots of a cohort: entries not yet exited or graded. A verdict lands only
+ *  once the broker is flat, so an entry with a live or closed exit child is already not open. */
 export function countCohortOpenPositions(db: Database.Database, cohortId: string): number {
   return (db.prepare(`SELECT count(*) AS n FROM trader_decisions d
     LEFT JOIN trader_verdicts v ON v.decision_id=d.id
     WHERE d.cohort_id=? AND d.parent_decision_id IS NULL AND d.action='buy'
-      AND d.status IN ('submitting','submitted','pending_fill','retry_pending','executed') AND v.decision_id IS NULL`)
-    .get(cohortId) as {n: number}).n
+      AND d.status IN ('submitting','submitted','pending_fill','retry_pending','executed') AND v.decision_id IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM trader_decisions e
+        WHERE e.parent_decision_id = d.id AND e.status IN (?, ?, ?)
+      )`)
+    .get(cohortId, DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN, DECISION_STATUS.CLOSED) as {n: number}).n
 }

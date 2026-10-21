@@ -5,6 +5,7 @@ import {
   COHORT_ENFORCEMENT_KV_KEY,
   activateCohort,
   cohortFingerprint,
+  countCohortOpenPositions,
   createDraftCohort,
   currentFingerprintMatches,
   guardRunningCohort,
@@ -146,5 +147,38 @@ describe('prospective evaluation cohorts', () => {
       backtest_fingerprint,backtest_evaluated_at FROM trader_evaluation_cohorts WHERE id=?`).get(cohort.id))
       .toEqual({backtest_sharpe:1.2,backtest_trade_count:140,backtest_max_drawdown_pct:0.12,
         backtest_fingerprint:cohort.config_fingerprint,backtest_evaluated_at:200})
+  })
+})
+
+describe('countCohortOpenPositions', () => {
+  function openDb() {
+    const d = new Database(':memory:')
+    d.exec(`CREATE TABLE trader_decisions (id TEXT PRIMARY KEY, cohort_id TEXT, parent_decision_id TEXT, action TEXT, status TEXT);
+      CREATE TABLE trader_verdicts (decision_id TEXT PRIMARY KEY)`)
+    return d
+  }
+  const add = (d: Database.Database, id: string, status: string, parent: string | null = null, action = 'buy') =>
+    d.prepare('INSERT INTO trader_decisions VALUES (?,?,?,?,?)').run(id, 'c1', parent, action, status)
+
+  it('does not count an entry whose exit child is closed, only the re-entry', () => {
+    const d = openDb()
+    add(d, 'e1', 'executed')
+    add(d, 'x1', 'closed', 'e1', 'sell')
+    add(d, 'e2', 'executed')
+    expect(countCohortOpenPositions(d, 'c1')).toBe(1)
+  })
+
+  it('treats exit_submitted and exit_unknown children as not open', () => {
+    const d = openDb()
+    add(d, 'e1', 'executed'); add(d, 'x1', 'exit_submitted', 'e1', 'sell')
+    add(d, 'e2', 'executed'); add(d, 'x2', 'exit_unknown', 'e2', 'sell')
+    expect(countCohortOpenPositions(d, 'c1')).toBe(0)
+  })
+
+  it('still counts an entry whose only exit child failed', () => {
+    const d = openDb()
+    add(d, 'e1', 'executed')
+    add(d, 'x1', 'failed', 'e1', 'sell')
+    expect(countCohortOpenPositions(d, 'c1')).toBe(1)
   })
 })

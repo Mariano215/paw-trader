@@ -122,6 +122,17 @@ describe('trader-scheduler', () => {
   })
 
   describe('runTraderTick', () => {
+    it('passes its own engine client and committee to dispatch', async () => {
+      insertSignal(db, 'sig-wiring')
+      const runCommittee = vi.fn()
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => true, runCommittee})
+
+      const [, deps, client] = vi.mocked(autoDispatchPendingSignals).mock.calls[0]
+      expect(client).toBe(engineClient)
+      expect(deps.runCommittee).toBe(runCommittee)
+    })
+
     it('timestamps tick completion when the tick finishes', async () => {
       const startedAt = Date.now()
       vi.mocked(engineClient.getSignals!).mockImplementation(async () => {

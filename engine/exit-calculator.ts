@@ -44,7 +44,7 @@ export const REWARD_RISK = 2
 // Volatility band guards (research: wide, not tight).
 export const VOL_STOP_FLOOR_PCT = 0.06
 export const VOL_STOP_CAP_PCT = 0.20
-// Half the 35-day range becomes the stop distance before flooring/capping.
+// Half the 35-bar high/low range becomes the stop distance before flooring/capping.
 export const VOL_RANGE_MULTIPLIER = 0.5
 // Time stop when the signal carries no usable horizon.
 export const FALLBACK_TIME_STOP_DAYS = 10

@@ -3,7 +3,7 @@ import { traderKnob } from './knobs.js'
 import type { EngineClient } from './engine-client.js'
 import { pollAndStoreSignals, isEquityMarketHours } from './signal-poller.js'
 import { enrichPendingSignals } from './enrichment-fetcher.js'
-import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+import { autoDispatchPendingSignals, type AutoDispatchDeps } from './decision-dispatcher.js'
 import { reconcileOpenOrders } from './order-reconciler.js'
 import { runRetrySweep } from './order-retry.js'
 import {
@@ -80,6 +80,8 @@ export interface TraderSchedulerDeps {
   /** Injectable NYSE-open check. Defaults to the real clock. Tests set this
    *  explicitly so the suite does not behave differently after 16:00 ET. */
   isMarketOpen?: () => boolean
+  /** Committee runner handed to dispatch. Defaults to the real committee. */
+  runCommittee?: AutoDispatchDeps['runCommittee']
 }
 
 let intervalHandle: NodeJS.Timeout | null = null
@@ -144,25 +146,8 @@ let _phantomConfirm: Record<string, number> = {}
 const PHANTOM_CONFIRM_TICKS = 2     // 2 × 5-min ticks ≈ 10 min broker-flat confirmation
 const PHANTOM_HEAL_MAX_USD = 2000   // only auto-zero phantoms under this local market value
 
-/**
- * Start the trader tick. Each tick:
- *  1. Checks engine health and alerts if reconciler is halted (once per halt event).
- *  2. Polls the engine for new signals and stores them in trader_signals.
- *  3. Sends an approval card for every pending signal that has no approval row yet.
- *  4. Marks any approval older than 30 min as timed out.
- *
- * Each phase is isolated -- a failure in one does not stop the others.
- * The initial tick fires immediately on start so signals accumulated while
- * the bot was offline still get surfaced.
- */
-export function initTraderScheduler(deps: TraderSchedulerDeps): void {
-  if (intervalHandle) {
-    logger.warn('Trader scheduler already running, skipping duplicate init')
-    return
-  }
-
-  const tickMs = deps.tickMs ?? DEFAULT_TICK_MS
-
+/** Startup crash recovery for rows a previous process left mid-flight. Runs once from initTraderScheduler. */
+export function recoverAfterRestart(db: Database.Database): void {
   // Crash recovery: any signal stuck in 'dispatching' from a prior bot
   // process never finished its dispatch loop (likely killed mid-claim).
   // Reset them to 'pending' so the next tick picks them up; otherwise
@@ -173,7 +158,7 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // queue; the retry sweep and reconcile own it, and re-queuing it could
   // place a second order.
   try {
-    const reset = deps.db
+    const reset = db
       .prepare(`UPDATE trader_signals SET status = 'pending'
                  WHERE status = 'dispatching'
                    AND id NOT IN (
@@ -200,7 +185,7 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // checks GET /orders first and flips a live order to submitted instead of
   // resending. The signal stays out of the fresh queue (above).
   try {
-    const orphaned = deps.db
+    const orphaned = db
       .prepare('UPDATE trader_decisions SET status = ?, next_retry_at = ? WHERE status = ?')
       .run(DECISION_STATUS.RETRY_PENDING, Date.now(), DECISION_STATUS.SUBMITTING)
     if (orphaned.changes > 0) {
@@ -218,7 +203,7 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // them. submitted / pending_fill / retry_pending are left alone -- the
   // reconcile and retry phases reconcile them against the broker each tick.
   try {
-    const revived = deps.db
+    const revived = db
       .prepare('UPDATE trader_decisions SET status = ?, next_retry_at = ? WHERE status = ?')
       .run(DECISION_STATUS.RETRY_PENDING, Date.now(), DECISION_STATUS.ENGINE_DOWN)
     if (revived.changes > 0) {
@@ -227,6 +212,28 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   } catch (err) {
     logger.warn({ err }, 'Trader scheduler: engine_down revival failed (non-fatal)')
   }
+}
+
+/**
+ * Start the trader tick. Each tick:
+ *  1. Checks engine health and alerts if reconciler is halted (once per halt event).
+ *  2. Polls the engine for new signals and stores them in trader_signals.
+ *  3. Sends an approval card for every pending signal that has no approval row yet.
+ *  4. Marks any approval older than 30 min as timed out.
+ *
+ * Each phase is isolated -- a failure in one does not stop the others.
+ * The initial tick fires immediately on start so signals accumulated while
+ * the bot was offline still get surfaced.
+ */
+export function initTraderScheduler(deps: TraderSchedulerDeps): void {
+  if (intervalHandle) {
+    logger.warn('Trader scheduler already running, skipping duplicate init')
+    return
+  }
+
+  const tickMs = deps.tickMs ?? DEFAULT_TICK_MS
+
+  recoverAfterRestart(deps.db)
 
   logger.info({ tickMs }, 'Trader scheduler started')
 
@@ -596,7 +603,7 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
     logger.warn({ err }, 'Trader tick: signal poll failed')
   }
 
-  // 1b. Enrich pending signals with 30-day price bars (RSI, momentum,
+  // 1b. Enrich pending signals with ~60 calendar days of daily bars (RSI, momentum,
   //     price levels) so the committee has real market context.
   //     Runs after poll so newly inserted signals are also enriched.
   //     Failures are logged but never block the approval-send step.
@@ -684,7 +691,8 @@ export async function runTraderTick(deps: TraderSchedulerDeps): Promise<{
       const dispatched = await autoDispatchPendingSignals(deps.db, {
         send: deps.send,
         alertOnReject: traderKnob('alert_on_reject', process.env.TRADER_ALERT_ON_REJECT === 'true'),
-      })
+        runCommittee: deps.runCommittee,
+      }, deps.getEngineClient())
       sent = dispatched.length
     } catch (err) {
       logger.error({ err }, 'Trader tick: auto-dispatch failed')

@@ -247,3 +247,126 @@ describe('fetchMarkovRegime via enrichPendingSignals', () => {
     expect(enrichment.rsi_14).not.toBeNull()
   })
 })
+
+describe('volatility window parity with the engine backtest', () => {
+  it('uses high/low of the last 35 completed bars, excluding today, so the stop matches the backtest', async () => {
+    const db = makeDb()
+    insertSignal(db, 'sig-vol', 'AAPL')
+    const DAY = 86_400_000
+    const base = Date.UTC(2026, 6, 1)  // 2026-07-01, well before today
+    // Closes stay in 100..101. Highs/lows widen with age:
+    //   bars 0-4   (outside the 35-bar window): 140 / 70
+    //   bars 5-14  (inside 35, outside last 25): 120 / 85
+    //   bars 15-39 (last 25):                    105 / 95
+    const bars: { date: string; close: number; ts_ms: number; high?: number; low?: number }[] =
+      Array.from({ length: 40 }, (_, i) => {
+        const ts = base + i * DAY
+        const [high, low] = i < 5 ? [140, 70] : i < 15 ? [120, 85] : [105, 95]
+        return { date: new Date(ts).toISOString().slice(0, 10), close: 100 + (i % 2), ts_ms: ts, high, low }
+      })
+    // Today's partial bar must not enter the window.
+    const todayNY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    bars.push({ date: todayNY, close: 101, ts_ms: Date.now(), high: 200, low: 10 })
+    const client = {
+      getPrices: vi.fn(async () => bars),
+      getMarkovRegime: vi.fn(async () => null),
+    }
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-vol') as { enrichment_json: string }
+    const e = JSON.parse(row.enrichment_json)
+    expect(e.window_high).toBe(120)
+    expect(e.window_low).toBe(85)
+
+    // At least 35 completed bars need ~49 calendar days; ask for more.
+    const [, fromMs, toMs] = client.getPrices.mock.calls[0] as unknown as [string, number, number]
+    expect(toMs - fromMs).toBeGreaterThanOrEqual(55 * DAY)
+
+    // Backtest by hand, entry 100: range (120-85)/100 = 0.35, * 0.5 = 0.175,
+    // inside [0.06, 0.20]. Stop 100 - 17.5 = 82.5, target 100 + 2 * 17.5 = 135.
+    // The old 25-bar close window would give 0.06 (floor).
+    const { computeExits } = await import('./exit-calculator.js')
+    const exits = computeExits({ side: 'buy', entryPrice: 100, horizonDays: 14, enrichment: row.enrichment_json })
+    expect(exits.basis).toBe('volatility')
+    expect(exits.stopLoss).toBe(82.5)
+    expect(exits.takeProfit).toBe(135)
+  })
+})
+
+describe('volatility window edges', () => {
+  const DAY = 86_400_000
+  const todayNY = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+  it('keeps a bar dated yesterday inside the window', async () => {
+    const db = makeDb()
+    insertSignal(db, 'sig-y', 'AAPL')
+    const yesterdayMs = Date.parse(`${todayNY()}T00:00:00Z`) - DAY
+    // 40 bars ending yesterday, newest first, so the window must sort before slicing.
+    // Yesterday's bar is wide; the 5 oldest (outside the window) are wider still.
+    const bars = Array.from({ length: 40 }, (_, i) => {
+      const ts = yesterdayMs - (39 - i) * DAY
+      const [high, low] = i === 39 ? [130, 80] : i < 5 ? [140, 60] : [105, 95]
+      return { date: new Date(ts).toISOString().slice(0, 10), close: 100, ts_ms: ts, high, low }
+    }).reverse()
+    const client = { getPrices: vi.fn(async () => bars), getMarkovRegime: vi.fn(async () => null) }
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-y') as { enrichment_json: string }
+    const e = JSON.parse(row.enrichment_json)
+    expect(e.window_high).toBe(130)
+    expect(e.window_low).toBe(80)
+  })
+
+  it('uses the close range when history is short and bars lack high/low', async () => {
+    const db = makeDb()
+    insertSignal(db, 'sig-s', 'AAPL')
+    // 10 close-only bars (older engine). Range 110 - 90 = 20.
+    const client = makeClient({ AAPL: [100, 95, 90, 98, 104, 110, 107, 101, 99, 100] })
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-s') as { enrichment_json: string }
+    const e = JSON.parse(row.enrichment_json)
+    expect(e.window_high).toBe(110)
+    expect(e.window_low).toBe(90)
+
+    // Backtest by hand, entry 100: 20/100 * 0.5 = 0.10, inside [0.06, 0.20].
+    // Stop 90, target 100 + 2 * 10 = 120.
+    const { computeExits } = await import('./exit-calculator.js')
+    const exits = computeExits({ side: 'buy', entryPrice: 100, horizonDays: 14, enrichment: row.enrichment_json })
+    expect(exits.stopLoss).toBe(90)
+    expect(exits.takeProfit).toBe(120)
+  })
+})
+
+describe('stop basis is the last completed close', () => {
+  it('ignores a forming bar dated today when setting price_current, so stop and target derive from yesterday', async () => {
+    const db = makeDb()
+    insertSignal(db, 'sig-f', 'AAPL')
+    const DAY = 86_400_000
+    const todayNY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+    const yesterdayMs = Date.parse(`${todayNY}T00:00:00Z`) - DAY
+    // 40 completed bars ending yesterday, close 100, high/low 105/95.
+    const bars: { date: string; close: number; ts_ms: number; high?: number; low?: number }[] =
+      Array.from({ length: 40 }, (_, i) => {
+        const ts = yesterdayMs - (39 - i) * DAY
+        return { date: new Date(ts).toISOString().slice(0, 10), close: 100, ts_ms: ts, high: 105, low: 95 }
+      })
+    // Forming bar today (IEX fallback or SIP after 09:46 ET) with a very different close.
+    bars.push({ date: todayNY, close: 150, ts_ms: Date.now(), high: 150, low: 150 })
+    const client = { getPrices: vi.fn(async () => bars), getMarkovRegime: vi.fn(async () => null) }
+
+    await enrichPendingSignals(db, client as unknown as EngineClient)
+    const row = db.prepare('SELECT enrichment_json FROM trader_signals WHERE id = ?').get('sig-f') as { enrichment_json: string }
+    const e = JSON.parse(row.enrichment_json)
+    expect(e.price_current).toBe(100)
+
+    const { entryRefFromEnrichment } = await import('./entry-reference-price.js')
+    const entry = entryRefFromEnrichment(row.enrichment_json)
+    expect(entry).toBe(100)
+    // Range (105-95)/100 * 0.5 = 0.05, floored to 0.06: stop 94, target 112.
+    const { computeExits } = await import('./exit-calculator.js')
+    const exits = computeExits({ side: 'buy', entryPrice: entry, horizonDays: 14, enrichment: row.enrichment_json })
+    expect(exits.stopLoss).toBe(94)
+    expect(exits.takeProfit).toBe(112)
+  })
+})

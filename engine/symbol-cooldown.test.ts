@@ -30,7 +30,7 @@ describe('evaluateSymbolCooldown', () => {
     // The real EEM sequence: closed red 2026-07-02, bought again 5 days later.
     const d = db()
     loss(d, 'EEM', -118.57, NOW - 5 * DAY)
-    const r = evaluateSymbolCooldown({ db: d, asset: 'EEM', side: 'buy', positions: [], nowMs: NOW })
+    const r = evaluateSymbolCooldown({ db: d, asset: 'EEM', side: 'buy', positions: [], nowMs: NOW, cooldownDays: 10 })
     expect(r.allowed).toBe(false)
     expect(r.rule).toBe('cooldown')
     expect(r.reason).toContain('EEM')
@@ -39,7 +39,14 @@ describe('evaluateSymbolCooldown', () => {
   it('allows re-entry once the cooldown has elapsed', () => {
     const d = db()
     loss(d, 'EEM', -118.57, NOW - 11 * DAY)
+    expect(evaluateSymbolCooldown({ db: d, asset: 'EEM', side: 'buy', positions: [], nowMs: NOW, cooldownDays: 10 }).allowed).toBe(true)
+  })
+
+  it('is off by default so live matches the cooldown-free backtest', () => {
+    const d = db()
+    loss(d, 'EEM', -118.57, NOW - 1 * DAY)
     expect(evaluateSymbolCooldown({ db: d, asset: 'EEM', side: 'buy', positions: [], nowMs: NOW }).allowed).toBe(true)
+    expect(evaluateSymbolCooldown({ db: d, asset: 'EEM', side: 'buy', positions: [], nowMs: NOW, cooldownDays: 0 }).allowed).toBe(true)
   })
 
   it('never gates an exit', () => {

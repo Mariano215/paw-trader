@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 // Mock config to disable bypass for tests that exercise the committee path.
 // Bypass-gates tests live in decision-dispatcher.bypass.test.ts with their own mock.
@@ -12,6 +12,14 @@ vi.mock('../config.js', async () => {
   }
 })
 
+// Equity signals only dispatch inside the session they were generated in.
+// Pin the session check open so this suite does not change after 16:00 ET;
+// the session tests below restore the real clock check.
+vi.mock('./signal-poller.js', async () => {
+  const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+  return { ...actual, isEquityMarketHours: vi.fn(() => true) }
+})
+
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import { seedMomentumStrategy } from './strategy-manager.js'
@@ -21,6 +29,7 @@ import type { EngineClient } from './engine-client.js'
 import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
 import type { LadderResult } from './autonomy-ladder.js'
 import { activateCohort, createDraftCohort, COHORT_ENFORCEMENT_KV_KEY } from './evaluation-cohort.js'
+import { isEquityMarketHours } from './signal-poller.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -1076,6 +1085,60 @@ describe('autoDispatchPendingSignals', () => {
     expect(testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='BTC/USD'").get()).toEqual({ n: 1 })
   })
 
+  // B2: a decision parked for retry (or at engine_down) can still fill, and the
+  // insert-first 'submitting' row is about to. Each owns the asset.
+  for (const status of ['submitting', 'retry_pending', 'engine_down']) {
+    it(`skips a signal when another strategy's decision for the asset sits at '${status}'`, async () => {
+      seedMomentumStrategy(testDb)
+      testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('sig-ibs','ibs-stocks','BTC/USD','buy',0.8,14,?,'dispatching')`).run(Date.now())
+      testDb.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+         committee_transcript_id, decided_at, status)
+        VALUES ('dec-parked','sig-ibs','buy','BTC/USD',200,'market','t',0.7,NULL,?,?)`).run(Date.now(), status)
+      testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('sig-mom','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+      const fakeEngine = {
+        submitDecision: vi.fn(),
+        getNav: vi.fn().mockResolvedValue(100000),
+        getPositions: vi.fn().mockResolvedValue([]),
+      } as any
+      const runCommittee = vi.fn(makeApproveCommittee(200))
+
+      await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+      const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-mom'").get() as any
+      expect(sig.status).toBe('suppressed_pending_order')
+      expect(runCommittee).not.toHaveBeenCalled()
+    })
+  }
+
+  it("blocks a second strategy from opening an asset another strategy just filled while the broker snapshot reads flat", async () => {
+    // 2026-09-18 AAPL/DBC: the first lot filled (executed), the positions
+    // snapshot lagged, and the per-strategy guard let a different strategy in.
+    seedMomentumStrategy(testDb)
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-ibs-fill','ibs-stocks','BTC/USD','buy',0.8,14,?,'executed')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-fill','sig-ibs-fill','buy','BTC/USD',200,'market','t',0.7,NULL,?,'executed')`).run(Date.now() - 5 * 60_000)
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-mom-2','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(200))
+
+    await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-mom-2'").get() as any
+    expect(sig.status).toBe('suppressed_already_held')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
   it('does NOT block re-entry when the broker is flat but stale rows say we hold it', async () => {
     // The 2026-08-02 regression: six QQQ decisions sat at status='executed'
     // with the broker flat since June, because the close-out watcher could
@@ -1232,5 +1295,66 @@ describe('autoDispatchPendingSignals', () => {
     expect(row.status).toBe('submitted')
     expect(row.stop_loss).toBeNull()
     expect(row.take_profit).toBeNull()
+  })
+})
+
+describe('autoDispatchPendingSignals: equity session staleness', () => {
+  let db: Database.Database
+  // Wed 2026-10-21. EDT is UTC-4.
+  const AT_1556_ET = Date.parse('2026-10-21T19:56:00Z')
+  const AT_1601_ET = Date.parse('2026-10-21T20:01:00Z')
+  const NEXT_0935_ET = Date.parse('2026-10-22T13:35:00Z')
+  const AT_1030_ET = Date.parse('2026-10-21T14:30:00Z')
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+    vi.mocked(isEquityMarketHours).mockImplementation(actual.isEquityMarketHours)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    db = makeDb()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.mocked(isEquityMarketHours).mockImplementation(() => true)
+  })
+
+  function seed(id: string, asset: string, generatedAt: number) {
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, 'momentum-stocks', ?, 'buy', 0.8, 20, ?, 'pending')`).run(id, asset, generatedAt)
+  }
+  const engine = () => ({ submitDecision: vi.fn(), getNav: vi.fn().mockResolvedValue(100000), getPositions: vi.fn().mockResolvedValue([]) }) as any
+  const status = (id: string) => (db.prepare('SELECT status FROM trader_signals WHERE id = ?').get(id) as any).status
+
+  it('marks a 15:56 ET equity signal stale when dispatch first sees it at 16:01 ET', async () => {
+    seed('sig-late', 'XLE', AT_1556_ET)
+    vi.setSystemTime(AT_1601_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(status('sig-late')).toBe('suppressed_stale')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
+  it('marks yesterday-afternoon equity signal stale at the next open, under the 24h age limit', async () => {
+    seed('sig-overnight', 'XLE', AT_1556_ET)
+    vi.setSystemTime(NEXT_0935_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(status('sig-overnight')).toBe('suppressed_stale')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
+  it('dispatches an equity signal inside the session it was generated in', async () => {
+    seed('sig-fresh', 'XLE', AT_1030_ET - 5 * 60_000)
+    vi.setSystemTime(AT_1030_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the 24h rule for crypto: a 17h-old crypto signal still dispatches', async () => {
+    seed('sig-btc', 'BTC/USD', NEXT_0935_ET - 17 * 3_600_000)
+    vi.setSystemTime(NEXT_0935_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(runCommittee).toHaveBeenCalledTimes(1)
   })
 })

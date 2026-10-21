@@ -21,7 +21,7 @@ import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
 import { recomputeTrackRecord, listOpenPositions, summarizeOpenPositions } from './track-record.js'
 import { recomputeRealizedPnlForAsset, type RealizedLot } from './audit-log.js'
-import { insertPnlSnapshot, getLastCumulativePnl } from './db.js'
+import { insertPnlSnapshot } from './db.js'
 import {
   verdictFromRealizedLots,
   rollUpFills,
@@ -531,16 +531,16 @@ export async function fetchReturnsForDecision(
   return { success: true, benchReturn, holdDrawdown }
 }
 
-/** SPY close-to-close return for `dateNY`; 0 when the bar is unavailable. */
-export async function dailyBenchReturn(engineClient: EngineClient, dateNY: string): Promise<number> {
+/** SPY close-to-close return for `dateNY`; null when the bar is unavailable (never 0). */
+export async function dailyBenchReturn(engineClient: EngineClient, dateNY: string): Promise<number | null> {
   try {
     const end = Date.parse(`${dateNY}T23:59:59Z`)
     const bars = await engineClient.getPrices('SPY', end - 10 * 86_400_000, end)
     const i = bars.findIndex((b) => b.date === dateNY)
-    if (i < 1 || !(bars[i - 1].close > 0)) return 0
+    if (i < 1 || !(bars[i - 1].close > 0)) return null
     return bars[i].close / bars[i - 1].close - 1
   } catch {
-    return 0
+    return null
   }
 }
 
@@ -788,27 +788,28 @@ async function writeDailySnapshot(
     // (EDT). Try both offsets; the one whose NY date string matches
     // todayNY is correct. DST transitions never fall at midnight so one
     // of the two will always match.
-    const nyMidnightMs = (() => {
+    const nyMidnightMs = (dateNY: string): number => {
       for (const offsetH of [4, 5]) {
-        const candidateMs = Date.parse(todayNY + 'T00:00:00Z') + offsetH * 3_600_000
-        if (new Date(candidateMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === todayNY) {
+        const candidateMs = Date.parse(dateNY + 'T00:00:00Z') + offsetH * 3_600_000
+        if (new Date(candidateMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) === dateNY) {
           return candidateMs
         }
       }
       // Should never happen; fall back to UTC midnight of the date string.
-      return Date.parse(todayNY + 'T00:00:00Z')
-    })()
-    const dayStartMs = nyMidnightMs
-    const dayEndMs = dayStartMs + 86_400_000
+      return Date.parse(dateNY + 'T00:00:00Z')
+    }
+    // DST days are 23h or 25h, so the window ends at the next NY midnight, not start + 24h.
+    const tomorrowNY = new Date(Date.parse(todayNY + 'T12:00:00Z') + 86_400_000).toISOString().slice(0, 10)
+    const dayStartMs = nyMidnightMs(todayNY)
+    const dayEndMs = nyMidnightMs(tomorrowNY)
 
-    // Sum pnl_net for verdicts closed today -- pull from DB so we
-    // capture verdicts written in prior ticks on the same calendar day,
-    // not just the ones written this pass. Use ms bounds (not OS
-    // 'localtime') so the filter agrees with todayNY on any host TZ.
+    // Sum realized lot P&L exiting today. Lots are the source of truth:
+    // a closed lot without a verdict must still count. Use ms bounds (not
+    // OS 'localtime') so the filter agrees with todayNY on any host TZ.
     const pnlRow = db.prepare(`
       SELECT COALESCE(SUM(pnl_net), 0) AS total_pnl, COUNT(*) AS cnt
-      FROM trader_verdicts
-      WHERE closed_at >= ? AND closed_at < ?
+      FROM trader_realized_pnl
+      WHERE exit_ts_ms >= ? AND exit_ts_ms < ?
     `).get(dayStartMs, dayEndMs) as { total_pnl: number; cnt: number }
 
     let navOpen = 0
@@ -820,8 +821,10 @@ async function writeDailySnapshot(
         engineClient.getNavLatest('day_open'),
         engineClient.getNavLatest('day_close'),
       ])
-      navOpen = openSnap?.nav ?? 0
-      navClose = closeSnap?.nav ?? 0
+      // Only trust a NAV dated today (NY); a snapshot from yesterday must
+      // not be written into today's row just after midnight.
+      navOpen = openSnap?.date === todayNY ? openSnap.nav : 0
+      navClose = closeSnap?.date === todayNY ? closeSnap.nav : 0
       // account_nav = the freshest broker equity we have. Prefer day_close
       // (set at 4pm), else day_open. This is account equity, distinct from
       // realized pnl_day.
@@ -861,14 +864,16 @@ async function writeDailySnapshot(
       // engine unreachable -- leave open MTM at 0
     }
 
-    const prior = getLastCumulativePnl(db)
-    // Avoid double-counting: subtract any prior cumulative that already
-    // includes today's row (INSERT OR REPLACE will overwrite it).
-    const priorRow = db.prepare(
-      `SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date = ?`,
-    ).get(todayNY) as { cumulative_pnl: number } | undefined
-    const priorToday = priorRow?.cumulative_pnl ?? 0
-    const priorBase = prior - priorToday
+    // Base = cumulative as of the newest row BEFORE today, so re-running
+    // the tick (INSERT OR REPLACE on today's row) never double-counts or resets.
+    const priorBase = (db.prepare(
+      `SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date < ? ORDER BY date DESC LIMIT 1`,
+    ).get(todayNY) as { cumulative_pnl: number } | undefined)?.cumulative_pnl ?? 0
+
+    // bench_return is NOT NULL: on a missing bar keep what this date already has.
+    const benchReturn = (await dailyBenchReturn(engineClient, todayNY))
+      ?? (db.prepare(`SELECT bench_return FROM trader_pnl_snapshots WHERE date = ?`).get(todayNY) as { bench_return: number } | undefined)?.bench_return
+      ?? 0
 
     insertPnlSnapshot(db, {
       date: todayNY,
@@ -876,7 +881,7 @@ async function writeDailySnapshot(
       navClose,
       pnlDay: pnlRow.total_pnl,
       tradesCount: pnlRow.cnt,
-      benchReturn: await dailyBenchReturn(engineClient, todayNY),
+      benchReturn,
       cumulativePnl: priorBase + pnlRow.total_pnl,
       openUnrealizedPnl,
       accountNav,

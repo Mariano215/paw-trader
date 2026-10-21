@@ -16,6 +16,7 @@ import { DEFAULT_SIZE_USD } from './approval-manager.js'
 import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { isAssetHeld } from './track-record.js'
+import { isEquityMarketHours } from './signal-poller.js'
 import { isTerminalSubmitError, DECISION_STATUS } from './order-lifecycle.js'
 import { logger } from '../logger.js'
 import {
@@ -607,6 +608,20 @@ function trimToSize(allowedSizeUsd: number): number | null {
 }
 
 const MAX_PENDING_SIGNAL_AGE_MS = 24 * 3600_000
+const MAX_COMMITTEE_ATTEMPTS = 2
+
+const nyDate = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+/**
+ * Crypto: older than 24h. Equity: not dispatched inside the regular session it
+ * was generated in. A 15:56 ET signal polled after the close would otherwise
+ * go out at the next open on a stale price and, while pending, block that
+ * day's fresh signal for the same slot.
+ */
+function isStaleSignal(signal: { asset: string; generated_at: number }, nowMs: number): boolean {
+  if (signal.asset.includes('/')) return nowMs - signal.generated_at > MAX_PENDING_SIGNAL_AGE_MS
+  return !isEquityMarketHours(nowMs) || nyDate(nowMs) !== nyDate(signal.generated_at)
+}
 
 export async function autoDispatchPendingSignals(
   db: Database.Database,
@@ -659,7 +674,7 @@ export async function autoDispatchPendingSignals(
 
     // Gated signals stay pending through an outage; never enter on a price
     // that is over a day old. The engine re-emits live signals each day.
-    if (Date.now() - signal.generated_at > MAX_PENDING_SIGNAL_AGE_MS) {
+    if (isStaleSignal(signal, Date.now())) {
       db.prepare("UPDATE trader_signals SET status = 'suppressed_stale' WHERE id = ?").run(signal.id)
       recordSignalSuppressionBySignalId(db, signal.id, 'stale')
       continue
@@ -705,8 +720,10 @@ export async function autoDispatchPendingSignals(
       // waiting for a fill already owns this asset; a second one is how the
       // 2026-08-25 BTC runaway made 83 pending_fill rows in one night.
       const openOrder = db
-        .prepare("SELECT id FROM trader_decisions WHERE asset = ? AND status IN ('submitted', 'pending_fill') LIMIT 1")
-        .get(signal.asset) as { id: string } | undefined
+        .prepare('SELECT id FROM trader_decisions WHERE asset = ? AND status IN (?, ?, ?, ?, ?) LIMIT 1')
+        // retry_pending and engine_down still get resubmitted, so they own the asset too.
+        .get(signal.asset, DECISION_STATUS.SUBMITTING, DECISION_STATUS.SUBMITTED, DECISION_STATUS.PENDING_FILL,
+          DECISION_STATUS.RETRY_PENDING, DECISION_STATUS.ENGINE_DOWN) as { id: string } | undefined
       if (openOrder) {
         logger.info({ event: 'trader.gate.pending_order', signalId: signal.id, asset: signal.asset, decisionId: openOrder.id }, 'Signal skipped: an order for this asset is still open')
         db.prepare("UPDATE trader_signals SET status = 'suppressed_pending_order' WHERE id = ?").run(signal.id)
@@ -729,12 +746,11 @@ export async function autoDispatchPendingSignals(
       if (brokerHolds || isAssetHeld(db, {
         asset: signal.asset,
         side: signal.side,
-        strategyId: signal.strategy_id,
         positions: brokerPositions,
       })) {
         logger.info(
           { event: 'trader.gate.already_held', signalId: signal.id, asset: signal.asset, side: signal.side, strategy: strategy.id },
-          'already holding this asset for this strategy, suppressing re-entry',
+          'already holding this asset, suppressing re-entry',
         )
         db.prepare("UPDATE trader_signals SET status = 'suppressed_already_held' WHERE id = ?").run(signal.id)
         recordSignalSuppressionBySignalId(db, signal.id, 'already_held')
@@ -855,9 +871,8 @@ export async function autoDispatchPendingSignals(
             db,
           })
         } catch (err) {
-          db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?")
-            .run(signal.id)
           if (err instanceof CommitteeGatedError) {
+            db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?").run(signal.id)
             // runAgent REFUSED (kill switch / cost cap). The gate is global:
             // every remaining signal would refuse identically, so stop the
             // loop instead of churning through the queue recording bogus
@@ -867,7 +882,33 @@ export async function autoDispatchPendingSignals(
             logger.warn({ signalId: signal.id, reason: err.message }, 'Committee gated -- halting dispatch loop for this tick')
             break
           }
-          logger.error({ err, signalId: signal.id }, 'Committee threw during auto-dispatch')
+          // Each committee run is paid. Count failures in the event ledger and
+          // stop after MAX_COMMITTEE_ATTEMPTS instead of rerunning every tick for 24h.
+          const reason = err instanceof Error ? err.message : String(err)
+          // The ledger drops metadata strings with spaces, so store a token-safe slug.
+          const reasonToken = reason.replace(/[^A-Za-z0-9._:/-]+/g, '-').slice(0, 160) || 'unknown'
+          const eventId = recordTraderOperationalEvent(db, {
+            source: 'brain.dispatcher',
+            stage: 'committee',
+            eventType: 'committee.run.failed',
+            state: 'failed',
+            asset: signal.asset,
+            strategyId: signal.strategy_id,
+            signalId: signal.id,
+            metadata: { reason: reasonToken },
+          })
+          const { n: attempts } = db.prepare(
+            "SELECT COUNT(*) AS n FROM trader_operational_events WHERE signal_id = ? AND event_type = 'committee.run.failed'",
+          ).get(signal.id) as { n: number }
+          // If the ledger write failed the count cannot grow, so give up rather than loop on a paid call.
+          const giveUp = eventId === null || attempts >= MAX_COMMITTEE_ATTEMPTS
+          db.prepare('UPDATE trader_signals SET status = ? WHERE id = ?').run(giveUp ? 'failed' : 'pending', signal.id)
+          logger.error(
+            { err, signalId: signal.id, attempts },
+            giveUp
+              ? `Committee failed ${attempts} times for this signal, marking it failed: ${reason}`
+              : 'Committee threw during auto-dispatch, will retry next tick',
+          )
           continue
         }
         storeTranscript(db, committeeResult)

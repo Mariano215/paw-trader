@@ -40,6 +40,7 @@ import { checkPaperProgress } from './progress-monitor.js'
 import type { HealthResponse } from './types.js'
 import { notifyUnexpectedShortPositions } from './position-safety.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
 
 /**
  * Interval between trader ticks. 5 minutes is the sweet spot:
@@ -167,19 +168,22 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // Reset them to 'pending' so the next tick picks them up; otherwise
   // autoDispatchPendingSignals' "WHERE status = 'pending'" query silently
   // returns 0 rows and the queue stays frozen across restarts.
-  // A signal that already owns a decision in retry_pending, submitting,
-  // submitted or pending_fill stays out of the fresh-dispatch queue; the
-  // retry sweep and reconcile own it, and re-queuing it could place a
-  // second order.
+  // A signal that already owns a decision in retry_pending, engine_down,
+  // submitting, submitted or pending_fill stays out of the fresh-dispatch
+  // queue; the retry sweep and reconcile own it, and re-queuing it could
+  // place a second order.
   try {
     const reset = deps.db
       .prepare(`UPDATE trader_signals SET status = 'pending'
                  WHERE status = 'dispatching'
                    AND id NOT IN (
                      SELECT signal_id FROM trader_decisions
-                      WHERE status IN ('retry_pending', 'submitting', 'submitted', 'pending_fill')
+                      WHERE status IN (?, ?, ?, ?, ?)
                    )`)
-      .run()
+      .run(
+        DECISION_STATUS.RETRY_PENDING, DECISION_STATUS.ENGINE_DOWN, DECISION_STATUS.SUBMITTING,
+        DECISION_STATUS.SUBMITTED, DECISION_STATUS.PENDING_FILL,
+      )
     if (reset.changes > 0) {
       logger.warn(
         { resetCount: reset.changes },
@@ -191,19 +195,18 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   }
 
   // Crash recovery: decision rows left at 'submitting' mean the process crashed
-  // after the INSERT but before the engine ACK.  On restart the signal is reset
-  // to 'pending' (above) so it re-enters dispatch with a new decisionId.  Mark
-  // the orphaned decision rows 'failed' so they don't pollute audit queries and
-  // so the duplicate guard (engine_order_id IS NOT NULL) can never falsely match
-  // them (it won't -- NULL != NOT NULL -- but 'failed' makes intent explicit).
+  // after the INSERT but before the engine ACK, so the order may already be at
+  // the broker. Hand them to the retry sweep under the same decision id: it
+  // checks GET /orders first and flips a live order to submitted instead of
+  // resending. The signal stays out of the fresh queue (above).
   try {
     const orphaned = deps.db
-      .prepare("UPDATE trader_decisions SET status = 'failed' WHERE status = 'submitting'")
-      .run()
+      .prepare('UPDATE trader_decisions SET status = ?, next_retry_at = ? WHERE status = ?')
+      .run(DECISION_STATUS.RETRY_PENDING, Date.now(), DECISION_STATUS.SUBMITTING)
     if (orphaned.changes > 0) {
       logger.warn(
         { count: orphaned.changes },
-        'Trader scheduler: marked orphaned submitting decisions as failed on startup',
+        'Trader scheduler: moved orphaned submitting decisions to retry_pending on startup',
       )
     }
   } catch (err) {
@@ -216,8 +219,8 @@ export function initTraderScheduler(deps: TraderSchedulerDeps): void {
   // reconcile and retry phases reconcile them against the broker each tick.
   try {
     const revived = deps.db
-      .prepare("UPDATE trader_decisions SET status = 'retry_pending', next_retry_at = ? WHERE status = 'engine_down'")
-      .run(Date.now())
+      .prepare('UPDATE trader_decisions SET status = ?, next_retry_at = ? WHERE status = ?')
+      .run(DECISION_STATUS.RETRY_PENDING, Date.now(), DECISION_STATUS.ENGINE_DOWN)
     if (revived.changes > 0) {
       logger.warn({ count: revived.changes }, 'Trader scheduler: revived engine_down decisions to retry_pending on startup')
     }

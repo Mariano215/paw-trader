@@ -83,6 +83,10 @@ export interface ExitDecision {
  * get their own independent exit guard rather than the first decision's
  * in-flight exit suppressing the second.
  *
+ * A filled exit ('closed') also blocks: the parent stays 'executed' until the
+ * broker is flat, and re-exiting it would flatten a rebuilt position in the
+ * same symbol (E1: AAPL 2026-07-23..27, IWM 2026-08-31). Only 'failed' retries.
+ *
  * HISTORY: the original convention stored the entry decision id in the exit
  * row's signal_id column. trader_decisions.signal_id has an FK to
  * trader_signals(id) and production runs PRAGMA foreign_keys = ON, so every
@@ -103,9 +107,9 @@ export function findOpenExitCandidates(db: Database.Database): OpenExitRow[] {
       AND NOT EXISTS (
         SELECT 1 FROM trader_decisions e
         WHERE e.parent_decision_id = d.id
-          AND e.status IN (?, ?)
+          AND e.status IN (?, ?, ?)
       )
-  `).all(DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN) as OpenExitRow[]
+  `).all(DECISION_STATUS.EXIT_SUBMITTED, DECISION_STATUS.EXIT_UNKNOWN, DECISION_STATUS.CLOSED) as OpenExitRow[]
 }
 
 /** Pure exit decision for one open position given the latest price. */

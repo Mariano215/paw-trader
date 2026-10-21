@@ -1,6 +1,11 @@
 import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
+// Pin the equity session check open so this suite does not change after 16:00 ET.
+vi.mock('./signal-poller.js', async () => {
+  const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+  return { ...actual, isEquityMarketHours: vi.fn(() => true) }
+})
 import { autoDispatchPendingSignals } from './decision-dispatcher.js'
 import { CommitteeGatedError, runCommittee as runRealCommittee, type CommitteeResult } from './committee.js'
 
@@ -95,6 +100,27 @@ describe('autoDispatchPendingSignals under a gate refusal', () => {
     expect(runCommittee).toHaveBeenCalledTimes(2)
     const statuses = db.prepare('SELECT status FROM trader_signals').all() as Array<{ status: string }>
     expect(statuses.every((s) => s.status === 'pending')).toBe(true)
+  })
+
+  it('a committee that throws twice for one signal marks it failed instead of rerunning every tick', async () => {
+    const db = makeDb()
+    seedPending(db, 'sig-a', 'SPY')
+    const runCommittee = vi.fn().mockRejectedValue(new Error('LLM timeout'))
+    const engine = {getPositions: vi.fn().mockResolvedValue([])} as never
+    const deps = {
+      send: vi.fn().mockResolvedValue(undefined),
+      alertOnReject: false,
+      runCommittee: runCommittee as unknown as (...args: unknown[]) => Promise<CommitteeResult>,
+      runAgent: vi.fn() as never,
+    } as never
+
+    for (let tick = 0; tick < 4; tick++) await autoDispatchPendingSignals(db, deps, engine)
+
+    expect(runCommittee).toHaveBeenCalledTimes(2)
+    const row = db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-a') as { status: string }
+    expect(row.status).toBe('failed')
+    const ev = db.prepare("SELECT metadata_json FROM trader_operational_events WHERE signal_id = ? AND event_type = 'committee.run.failed' LIMIT 1").get('sig-a') as { metadata_json: string }
+    expect(JSON.parse(ev.metadata_json).reason).toBe('LLM-timeout')
   })
 })
 

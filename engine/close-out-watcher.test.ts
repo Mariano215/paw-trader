@@ -530,7 +530,7 @@ describe('runCloseOutSweep', () => {
       { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 112, unrealized_pnl: 12, source: 'broker', updated_at: Date.now() },
     ])
     getOrders.mockResolvedValue([])
-    ;(engine as any).getNavLatest = vi.fn().mockResolvedValue({ date: '2026-06-07', period: 'day_open', nav: 1010, recorded_at: Date.now() })
+    ;(engine as any).getNavLatest = vi.fn().mockResolvedValue({ date: new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }), period: 'day_open', nav: 1010, recorded_at: Date.now() })
 
     const result = await runCloseOutSweep(db, engine)
     expect(result.processed).toBe(0)
@@ -586,10 +586,10 @@ describe('writeDailySnapshot: verdict-sum uses NY day bounds, not OS localtime',
       VALUES ('d-tz', 's-tz', 'buy', 'AAPL', 100, 'limit', 't', 0.7, ?, 'closed')
     `).run(closedAtMs - 86_400_000)
     db.prepare(`
-      INSERT INTO trader_verdicts
-        (id, decision_id, pnl_gross, pnl_net, bench_return, hold_drawdown, thesis_grade, agent_attribution_json, closed_at, returns_backfilled)
-      VALUES ('v-tz', 'd-tz', 7, 6, 0, 0, 'B', '[]', ?, 1)
-    `).run(closedAtMs)
+      INSERT INTO trader_realized_pnl
+        (id, decision_id, asset, qty, entry_price, exit_price, entry_ts_ms, exit_ts_ms, fees_usd, pnl_gross, pnl_net, lot_match_rule, computed_at)
+      VALUES ('l-tz', 'd-tz', 'AAPL', 1, 100, 107, ?, ?, 1, 7, 6, 'fifo', ?)
+    `).run(closedAtMs - 86_400_000, closedAtMs, closedAtMs)
 
     // The snapshot writer uses toLocaleDateString('en-CA', {timeZone:'America/New_York'})
     // on `nowMs` to produce `todayNY`. With nowMs = closedAtMs the NY date is '2026-06-07'.
@@ -607,7 +607,7 @@ describe('writeDailySnapshot: verdict-sum uses NY day bounds, not OS localtime',
     const expectedDate = new Date(closedAtMs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
     const snap = db.prepare('SELECT * FROM trader_pnl_snapshots WHERE date = ?').get(expectedDate) as any
     expect(snap).toBeTruthy()
-    // The verdict (pnl_net=6) must appear in the sum.
+    // The lot (pnl_net=6) must appear in the sum.
     expect(snap.pnl_day).toBe(6)
     expect(snap.trades_count).toBe(1)
   })
@@ -1095,5 +1095,67 @@ describe('grading uses this decision own exit fills, not the pooled average', ()
     expect(row.ungraded_reason).toBe('partial-stale')
     // And it never comes back.
     expect((await runCloseOutSweep(db, engine)).ungraded).toBe(0)
+  })
+})
+
+
+describe('writeDailySnapshot: B5/B6/B7 regressions', () => {
+  const NOW = Date.UTC(2026, 9, 21, 14, 0, 0) // 2026-10-21 10:00 EDT
+  const mkEngine = (nav: any, prices: any[] = []) => ({
+    getNavLatest: vi.fn().mockResolvedValue(nav),
+    getPositions: vi.fn().mockResolvedValue([]),
+    getOrders: vi.fn().mockResolvedValue([]),
+    getPrices: vi.fn().mockResolvedValue(prices),
+  }) as unknown as EngineClient
+  const snapRow = (db: any, d: string, cum = 0, bench = 0.01) => db.prepare(`INSERT OR REPLACE INTO trader_pnl_snapshots
+    (date, nav_open, nav_close, pnl_day, trades_count, bench_return, cumulative_pnl, open_unrealized_pnl, account_nav)
+    VALUES (?, 100, 100, 0, 0, ?, ?, 0, 100)`).run(d, bench, cum)
+  const lot = (db: any, id: string, exit: number, pnl: number) => {
+    db.prepare(`INSERT OR IGNORE INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status) VALUES ('s-l','momentum-stocks','AAPL','buy',0.5,20,1,'closed')`).run()
+    db.prepare(`INSERT OR IGNORE INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status) VALUES ('d-l','s-l','buy','AAPL',100,'limit','t',0.7,1,'closed')`).run()
+    db.prepare(`INSERT INTO trader_realized_pnl (id, decision_id, asset, qty, entry_price, exit_price, entry_ts_ms, exit_ts_ms, fees_usd, pnl_gross, pnl_net, lot_match_rule, computed_at)
+      VALUES (?, 'd-l','AAPL',1,1,1,1,?,0,?,?, 'fifo', 1)`).run(id, exit, pnl, pnl)
+  }
+
+  it('B5: cumulative keeps the prior-day base across repeated ticks', async () => {
+    const db = makeDb()
+    snapRow(db, '2026-10-20', -1000)
+    lot(db, 'a', NOW - 1000, -10)
+    const engine = mkEngine(null)
+    await runCloseOutSweep(db, engine, { nowMs: NOW })
+    await runCloseOutSweep(db, engine, { nowMs: NOW })
+    const r = db.prepare(`SELECT cumulative_pnl FROM trader_pnl_snapshots WHERE date='2026-10-21'`).get() as any
+    expect(r.cumulative_pnl).toBe(-1010)
+  })
+
+  it('B6: pnl_day sums realized lots even with no verdict', async () => {
+    const db = makeDb()
+    lot(db, 'a', NOW - 1000, -29.39)
+    lot(db, 'b', NOW - 2000, 5)
+    await runCloseOutSweep(db, mkEngine(null), { nowMs: NOW })
+    const r = db.prepare(`SELECT pnl_day, trades_count FROM trader_pnl_snapshots WHERE date='2026-10-21'`).get() as any
+    expect(r.pnl_day).toBeCloseTo(-24.39, 10)
+    expect(r.trades_count).toBe(2)
+  })
+
+  it('B6: on the 25h DST fall-back day a 23:30 EST exit counts in that day', async () => {
+    const db = makeDb()
+    const exitMs = Date.parse('2026-11-02T04:30:00Z') // 2026-11-01 23:30 EST
+    lot(db, 'late', exitMs, 7)
+    await runCloseOutSweep(db, mkEngine(null), { nowMs: Date.parse('2026-11-02T04:45:00Z') })
+    const r = db.prepare(`SELECT pnl_day FROM trader_pnl_snapshots WHERE date='2026-11-01'`).get() as any
+    expect(r.pnl_day).toBe(7)
+  })
+
+  it('B7: yesterday-dated NAV is not written to today, and a missing bench bar keeps the stored value', async () => {
+    const db = makeDb()
+    snapRow(db, '2026-10-20', 0, 0.01)
+    snapRow(db, '2026-10-21', 0, 0.007)
+    const stale = { date: '2026-10-20', period: 'day_open', nav: 555, recorded_at: 1 }
+    await runCloseOutSweep(db, mkEngine(stale), { nowMs: NOW })
+    const r = db.prepare(`SELECT nav_open, nav_close, bench_return FROM trader_pnl_snapshots WHERE date='2026-10-21'`).get() as any
+    expect(r.nav_open).toBe(100)   // carried from last known equity, not 555
+    expect(r.nav_close).toBe(100)
+    expect(r.bench_return).toBe(0.007)
   })
 })

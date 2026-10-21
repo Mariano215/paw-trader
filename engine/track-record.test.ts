@@ -328,8 +328,8 @@ describe('isAssetHeld (re-entry guard)', () => {
   let db: Database.Database
   beforeEach(() => { db = makeDb() })
 
-  function held(asset = 'TLT', side = 'buy', strategyId = 'momentum-stocks') {
-    return isAssetHeld(db, { asset, side, strategyId })
+  function held(asset = 'TLT', side = 'buy') {
+    return isAssetHeld(db, { asset, side })
   }
 
   function seedPosition(opts: {
@@ -362,7 +362,7 @@ describe('isAssetHeld (re-entry guard)', () => {
   // The bug: the trader tick runs every 5 minutes and the engine re-emits the
   // same candidate. Each of these statuses means we already have (or are about
   // to have) exposure, so a second lot must not open.
-  for (const status of ['submitting', 'submitted', 'pending_fill', 'executed', 'exit_submitted']) {
+  for (const status of ['submitting', 'submitted', 'pending_fill', 'retry_pending', 'engine_down', 'executed', 'exit_submitted']) {
     it(`is true while a decision sits at '${status}'`, () => {
       seedPosition({ id: `d-${status}`, status })
       expect(held()).toBe(true)
@@ -381,19 +381,19 @@ describe('isAssetHeld (re-entry guard)', () => {
     seedPosition({ id: 'd-fresh', status: 'executed' })
     db.prepare("UPDATE trader_decisions SET decided_at = ? WHERE id = 'd-fresh'").run(1_000_000)
     const flat = [{ asset: 'TLT', qty: 0 }]
-    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: flat }, 1_000_000 + 5 * 60_000)).toBe(true)
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', positions: flat }, 1_000_000 + 5 * 60_000)).toBe(true)
   })
 
   it('defers to a flat broker once the settling window has passed', () => {
     seedPosition({ id: 'd-stale', status: 'executed' })
     db.prepare("UPDATE trader_decisions SET decided_at = ? WHERE id = 'd-stale'").run(1_000_000)
     const flat = [{ asset: 'TLT', qty: 0 }]
-    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: flat }, 1_000_000 + 2 * 3_600_000)).toBe(false)
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', positions: flat }, 1_000_000 + 2 * 3_600_000)).toBe(false)
   })
 
   it('is true when the broker holds the asset, whatever the decision age', () => {
     seedPosition({ id: 'd-held', status: 'executed' })
-    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', strategyId: 'momentum-stocks', positions: [{ asset: 'TLT', qty: 3 }] }, Date.now() + 9 * 3_600_000)).toBe(true)
+    expect(isAssetHeld(db, { asset: 'TLT', side: 'buy', positions: [{ asset: 'TLT', qty: 3 }] }, Date.now() + 9 * 3_600_000)).toBe(true)
   })
 
   it('is false for a failed decision, which never reached the book', () => {
@@ -401,12 +401,16 @@ describe('isAssetHeld (re-entry guard)', () => {
     expect(held()).toBe(false)
   })
 
-  it('does not block a different asset, side, or strategy', () => {
+  it('does not block a different asset or side', () => {
     seedPosition({ id: 'd-tlt', status: 'executed' })
     expect(held('TLT', 'buy')).toBe(true)
     expect(held('QQQ', 'buy')).toBe(false)
     expect(held('TLT', 'sell')).toBe(false)
-    expect(held('TLT', 'buy', 'mean-reversion-stocks')).toBe(false)
+  })
+
+  it('blocks a second strategy from the same asset and side', () => {
+    seedPosition({ id: 'd-ibs', status: 'retry_pending', strategy: 'ibs-stocks' })
+    expect(held('TLT', 'buy')).toBe(true)
   })
 
   it('blocks the eight-identical-lots case from the 2026-08-02 report', () => {

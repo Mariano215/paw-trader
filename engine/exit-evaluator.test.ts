@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { evaluateExit, runExitSweep, currentMomentum, strategySignalExit, wilderRsi, type OpenExitRow } from './exit-evaluator.js'
+import { evaluateExit, findOpenExitCandidates, runExitSweep, currentMomentum, strategySignalExit, wilderRsi, type OpenExitRow } from './exit-evaluator.js'
 import type { EngineClient } from './engine-client.js'
 import type { EnginePosition } from './types.js'
 
@@ -307,6 +307,27 @@ describe('runExitSweep', () => {
     const out = await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })
     expect(out.exited).toBe(0)
     expect(client.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('E1: a parent whose exit already filled (closed) is never exited again; a failed exit is retried', async () => {
+    const db = makeDb()
+    // A rebuilt AAPL position is live; d1's own exit already filled.
+    db.prepare(`INSERT INTO trader_decisions
+      (id,signal_id,parent_decision_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status)
+      VALUES ('d1-exit','s1','d1','sell','AAPL',0,'market','exit',1,?,'closed')`).run(Date.now())
+    const pos: EnginePosition[] = [{ asset: 'AAPL', qty: 1.5, avg_entry_price: 100, market_value: 136.5, unrealized_pnl: -13.5, source: 'broker', updated_at: MARKET_OPEN_MS }]
+    const submitDecision = vi.fn().mockResolvedValue({ client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 0 })
+    const client = {
+      getPositions: vi.fn().mockResolvedValue(pos),
+      getPrices: vi.fn().mockResolvedValue([{ date: '2026-06-07', close: 91, ts_ms: 2 }]),
+      submitDecision,
+    } as unknown as EngineClient
+    expect(findOpenExitCandidates(db)).toEqual([])
+    expect((await runExitSweep(db, client, vi.fn(), { nowMs: MARKET_OPEN_MS })).exited).toBe(0)
+    expect(submitDecision).not.toHaveBeenCalled()
+
+    db.prepare("UPDATE trader_decisions SET status='failed' WHERE id='d1-exit'").run()
+    expect(findOpenExitCandidates(db).map(r => r.id)).toEqual(['d1'])
   })
 
   it('I3: a second executed decision for the same signal is NOT suppressed by the first decision\'s exit', async () => {

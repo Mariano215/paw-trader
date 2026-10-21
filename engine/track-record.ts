@@ -17,6 +17,7 @@
  */
 import type Database from 'better-sqlite3'
 import { logger } from '../logger.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
 
 export interface StrategyTrackRecord {
   strategy_id: string
@@ -369,13 +370,17 @@ export function listOpenPositions(db: Database.Database): OpenPositionRow[] {
 /** How long a fresh holding decision outranks a flat broker snapshot. Matches the engine's stale-entry cancel window. */
 export const HOLD_SETTLE_MS = 30 * 60 * 1000
 
+// retry_pending and engine_down can still fill: the retry sweep resubmits them.
 const HOLDING_STATUSES = [
-  'submitting', 'submitted', 'pending_fill', 'executed', 'exit_submitted',
-] as const
+  DECISION_STATUS.SUBMITTING, DECISION_STATUS.SUBMITTED, DECISION_STATUS.PENDING_FILL,
+  DECISION_STATUS.RETRY_PENDING, DECISION_STATUS.ENGINE_DOWN,
+  DECISION_STATUS.EXECUTED, DECISION_STATUS.EXIT_SUBMITTED,
+]
 
 /**
  * True when the book already holds (or is in the middle of acquiring) this
- * asset for this strategy and side.
+ * asset on this side, under ANY strategy. Two strategies share one broker
+ * position, so one strategy's exit would sell the other's shares.
  *
  * This is the re-entry guard. The partial unique index on trader_signals is
  * scoped to status IN ('pending','dispatching'), so a signal that has already
@@ -393,7 +398,6 @@ export function isAssetHeld(
   params: {
     asset: string
     side: string
-    strategyId: string
     /**
      * Live broker positions. When supplied, an asset the broker is flat on can
      * NEVER be reported as held, whatever the decision rows say.
@@ -416,10 +420,9 @@ export function isAssetHeld(
     LEFT JOIN trader_verdicts v ON v.decision_id = d.id
     WHERE s.asset = ?
       AND s.side = ?
-      AND s.strategy_id = ?
       AND d.status IN (${placeholders})
       AND v.decision_id IS NULL
-  `).get(params.asset, params.side, params.strategyId, ...HOLDING_STATUSES) as { latest: number | null } | undefined
+  `).get(params.asset, params.side, ...HOLDING_STATUSES) as { latest: number | null } | undefined
   const latestHold = row?.latest ?? null
   if (latestHold == null) return false
   if (params.positions) {

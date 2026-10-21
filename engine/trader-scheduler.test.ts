@@ -1000,6 +1000,38 @@ describe('trader-scheduler', () => {
       expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-orphan')).toEqual({ status: 'pending' })
     })
 
+    it('startup keeps a dispatching signal whose decision is engine_down out of the fresh queue', () => {
+      insertSignal(db, 'sig-down')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-down')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-down', 'sig-down', 'buy', 'AAPL', 150, 'market', 't', 0.7, ?, 'engine_down')`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      // The retry path owns the revived decision; a pending signal would also dispatch a second order.
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-down')).toEqual({ status: 'dispatching' })
+      expect(db.prepare('SELECT status FROM trader_decisions WHERE id = ?').get('dec-down')).toEqual({ status: 'retry_pending' })
+    })
+
+    it('startup sends an orphan submitting decision to retry_pending and does not re-queue its signal', () => {
+      insertSignal(db, 'sig-inflight')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-inflight')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-inflight', 'sig-inflight', 'buy', 'AAPL', 150, 'limit', 't', 0.7, ?, 'submitting')`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      // The order may already be at the broker; the retry sweep checks GET /orders before any resend.
+      const dec = db.prepare('SELECT status, next_retry_at FROM trader_decisions WHERE id = ?').get('dec-inflight') as any
+      expect(dec.status).toBe('retry_pending')
+      expect(dec.next_retry_at).not.toBeNull()
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-inflight')).toEqual({ status: 'dispatching' })
+    })
+
     it('exit sweep phase fires and counts exits when a position breaches its stop', async () => {
       // Seed an open executed buy decision with a stop that the mock price will breach.
       db.prepare(`INSERT INTO trader_signals

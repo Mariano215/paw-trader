@@ -17,6 +17,11 @@ vi.mock('../config.js', async () => {
     TRADER_STRATEGY_GATE_ENABLED: true,
   }
 })
+// Pin the equity session check open so this suite does not change after 16:00 ET.
+vi.mock('./signal-poller.js', async () => {
+  const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+  return { ...actual, isEquityMarketHours: vi.fn(() => true) }
+})
 
 import { dispatchApproval, autoDispatchPendingSignals } from './decision-dispatcher.js'
 import type { EngineClient } from './engine-client.js'

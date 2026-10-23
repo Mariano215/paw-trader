@@ -1062,6 +1062,41 @@ describe('grading uses this decision own exit fills, not the pooled average', ()
     expect(db.prepare('SELECT COUNT(*) n FROM trader_verdicts').get()).toEqual({ n: 0 })
   })
 
+  it('defers a fresh fill while the position snapshot still reads flat (XLK 2026-10-13)', () => {
+    // The sweep ran 26 ms after the reconciler promoted the XLK fill. The
+    // engine position row still said 0 shares, so the open buy was closed
+    // ungraded and its stop-out three days later (-$493.92) never graded.
+    insertSignal(db, 'sig-fresh', { asset: 'XLK' })
+    const decidedAt = 1_000_000
+    insertExecutedDecision(db, 'dec-fresh', 'sig-fresh', { asset: 'XLK', decidedAt, filledQty: 42, filledAvgPrice: 195.79 })
+    recordFill(db, { decisionId: 'dec-fresh', clientOrderId: 'c1', asset: 'XLK', side: 'buy', fillQty: 42, fillPrice: 195.79, fillTsMs: decidedAt + 100_000 })
+    const orders = [fillOrder({ asset: 'XLK', side: 'buy', qty: 42, filled_qty: 42, filled_avg_price: 195.79, created_at: decidedAt, updated_at: decidedAt + 100_000 })]
+
+    const row = findOpenDecisions(db).find(d => d.id === 'dec-fresh')!
+    expect(processClosure(db, row, [], orders, undefined, decidedAt + 160_000).reason).toBe('still-open')
+  })
+
+  it('sweep grades a bracket stop-out from the broker exit leg', async () => {
+    insertSignal(db, 'sig-xlk', { asset: 'XLK' })
+    const decidedAt = Date.now() - 3 * 86_400_000
+    insertExecutedDecision(db, 'dec-xlk', 'sig-xlk', { asset: 'XLK', decidedAt, filledQty: 42, filledAvgPrice: 195.79 })
+    recordFill(db, { decisionId: 'dec-xlk', clientOrderId: 'entry', asset: 'XLK', side: 'buy', fillQty: 42, fillPrice: 195.79, fillTsMs: decidedAt + 1000 })
+    const orders = [
+      fillOrder({ client_order_id: 'entry', broker_order_id: 'b-entry', decision_id: 'dec-xlk', asset: 'XLK', side: 'buy', qty: 42, filled_qty: 42, filled_avg_price: 195.79, created_at: decidedAt + 10, updated_at: decidedAt + 1000 }),
+      fillOrder({ client_order_id: 'stop', broker_order_id: 'b-stop', decision_id: 'adopted:stop', asset: 'XLK', side: 'sell', qty: 42, filled_qty: 42, filled_avg_price: 184.03, created_at: decidedAt + 53, updated_at: decidedAt + 86_400_000 }),
+    ]
+    const engine = {
+      getPositions: vi.fn().mockResolvedValue([]),
+      getOrders: vi.fn().mockResolvedValue(orders),
+      getPrices: vi.fn().mockResolvedValue([]),
+      getNavLatest: vi.fn().mockResolvedValue(null),
+    } as unknown as EngineClient
+
+    await runCloseOutSweep(db, engine)
+    const v = db.prepare("SELECT pnl_gross FROM trader_verdicts WHERE decision_id='dec-xlk'").get() as any
+    expect(v?.pnl_gross).toBeCloseTo(-493.92, 2)
+  })
+
   it('defers a genuinely partial close, then terminates it past the drift age', () => {
     insertSignal(db, 'sig-part', { asset: 'IWM' })
     const decidedAt = 1_000_000

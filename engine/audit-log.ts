@@ -159,6 +159,25 @@ export function upsertCumulativeOrderFill(
   return canonicalId
 }
 
+/** Max gap between a bracket entry and its legs; Alpaca creates them in one request (~40 ms apart live). */
+const BRACKET_LEG_WINDOW_MS = 2000
+
+/**
+ * The engine adopts bracket stop/take-profit legs as broker-only orders
+ * ('adopted:<coid>') with no link to their parent. Recover the parent as the
+ * opposite-side, same-asset brain order created just before the leg.
+ */
+function bracketParentDecisionId(leg: EngineOrder, orders: EngineOrder[]): string | null {
+  let best: EngineOrder | null = null
+  for (const o of orders) {
+    if (o.asset !== leg.asset || o.side === leg.side || !o.decision_id || o.decision_id.startsWith('adopted:')) continue
+    const gap = leg.created_at - o.created_at
+    if (gap < 0 || gap > BRACKET_LEG_WINDOW_MS) continue
+    if (!best || o.created_at > best.created_at) best = o
+  }
+  return best?.decision_id ?? null
+}
+
 /** Archive cumulative engine order snapshots for decisions known to the brain. */
 export function archiveCumulativeOrderFills(
   db: Database.Database,
@@ -176,7 +195,10 @@ export function archiveCumulativeOrderFills(
   for (const order of orders) {
     if (!order.broker_order_id || !(Number.isFinite(order.filled_qty) && order.filled_qty > 0) ||
         order.filled_avg_price == null || !Number.isFinite(order.filled_avg_price) || order.filled_avg_price <= 0) continue
-    const decisionKey = order.decision_id ?? order.client_order_id
+    const decisionKey = order.decision_id?.startsWith('adopted:')
+      ? bracketParentDecisionId(order, orders)
+      : order.decision_id ?? order.client_order_id
+    if (!decisionKey) continue
     const decision = findDecision.get(decisionKey, order.broker_order_id, decisionKey) as
       | {id: string; entry_price: number | null; decided_at: number; thesis: string | null}
       | undefined

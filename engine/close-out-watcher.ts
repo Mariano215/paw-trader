@@ -20,7 +20,7 @@ import type { EnginePosition, EngineOrder, PricePoint } from './types.js'
 import { logger } from '../logger.js'
 import { insertCase } from './reasoning-bank.js'
 import { recomputeTrackRecord, listOpenPositions, summarizeOpenPositions } from './track-record.js'
-import { recomputeRealizedPnlForAsset, type RealizedLot } from './audit-log.js'
+import { archiveCumulativeOrderFills, recomputeRealizedPnlForAsset, type RealizedLot } from './audit-log.js'
 import { insertPnlSnapshot } from './db.js'
 import {
   verdictFromRealizedLots,
@@ -297,6 +297,20 @@ export function processClosure(
       outcome: null,
       attribution: [],
       reason: 'no-fills',
+    }
+  }
+
+  // Broker says flat but the orders since this entry still net open: the
+  // position snapshot has not caught up with a fresh fill (XLK 2026-10-13 was
+  // closed 26 ms after its fill). Wait, up to the drift age, for the exit.
+  const netOpen = side === 'buy' ? buys.qty > sells.qty + 1e-9 : sells.qty > buys.qty + 1e-9
+  if (!outcome && netOpen && nowMs - decision.decided_at <= DRIFT_TERMINAL_AGE_MS) {
+    return {
+      decisionId: decision.id,
+      fullyClosed: false,
+      outcome: null,
+      attribution: [],
+      reason: 'still-open',
     }
   }
 
@@ -644,6 +658,12 @@ export async function runCloseOutSweep(
       // Still write snapshot even when close-out fetch fails.
       await writeDailySnapshot(db, engineClient, nowMs)
       return { processed: 0, stillOpen: 0, errors: 1, driftClosed: 0, ungraded: 0 }
+    }
+    // Bracket stop/take-profit legs reach trader_fills only through this archive.
+    try {
+      archiveCumulativeOrderFills(db, orders, nowMs)
+    } catch (err) {
+      logger.warn({ err }, 'Close-out sweep: archiving engine order fills failed')
     }
 
     for (const decision of open) {

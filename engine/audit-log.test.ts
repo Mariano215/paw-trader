@@ -7,7 +7,7 @@ import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
 import {
   recordFill, listFillsForDecision, computeSlippageUsd,
-  upsertCumulativeOrderFill,
+  upsertCumulativeOrderFill, archiveCumulativeOrderFills,
   matchLotsFifo, recomputeRealizedPnl, recomputeRealizedPnlForAsset, LOT_MATCH_RULE,
   type FillRow,
 } from './audit-log.js'
@@ -241,5 +241,37 @@ describe('recomputeRealizedPnlForAsset (cross-decision FIFO)', () => {
     recordFill(db, { decisionId: 'entry-1', clientOrderId: 'e', asset: 'VTI', side: 'buy', fillQty: 10, fillPrice: 100, fillTsMs: 1000 })
     const lots = recomputeRealizedPnlForAsset(db, 'VTI', 9999)
     expect(lots).toHaveLength(0)
+  })
+})
+
+describe('archiveCumulativeOrderFills: bracket exit legs', () => {
+  // Alpaca bracket legs come back from the engine as broker-only orders with
+  // decision_id 'adopted:<coid>'. They were skipped, so every stop-out and
+  // take-profit was missing from trader_fills and could never be graded.
+  const entry = {
+    client_order_id: 'entry', broker_order_id: 'b-entry', decision_id: 'dec-xlk', asset: 'XLK',
+    side: 'buy' as const, qty: 42, order_type: 'limit' as const, limit_price: 195.8, status: 'filled',
+    filled_qty: 42, filled_avg_price: 195.79, source: 'alpaca', created_at: 5000, updated_at: 5100,
+  }
+  const leg = (createdAt: number) => ({
+    ...entry, client_order_id: 'stop', broker_order_id: 'b-stop', decision_id: 'adopted:stop',
+    side: 'sell' as const, limit_price: null, filled_avg_price: 184.03, created_at: createdAt, updated_at: 9000,
+  })
+  function seed(db: Database.Database) {
+    db.prepare(`INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, thesis, confidence, decided_at, status, entry_price)
+      VALUES ('dec-xlk', 'sig', 'buy', 'XLK', 8330, 't', 0.5, 1000, 'executed', 195.8)`).run()
+  }
+
+  it('attributes a filled adopted leg to the entry order submitted with it', () => {
+    const db = makeDb(); seed(db)
+    archiveCumulativeOrderFills(db, [entry, leg(5043)])
+    const sells = db.prepare("SELECT decision_id, fill_qty, fill_price FROM trader_fills WHERE side = 'sell'").all()
+    expect(sells).toEqual([{ decision_id: 'dec-xlk', fill_qty: 42, fill_price: 184.03 }])
+  })
+
+  it('skips an adopted order with no entry order submitted beside it', () => {
+    const db = makeDb(); seed(db)
+    archiveCumulativeOrderFills(db, [entry, leg(5000 + 60_000)])
+    expect(db.prepare("SELECT COUNT(*) n FROM trader_fills WHERE side = 'sell'").get()).toEqual({ n: 0 })
   })
 })

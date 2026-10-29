@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { seedMomentumStrategy } from './strategy-manager.js'
+import { seedCryptoMomentumStrategy, seedCryptoMomentumVtStrategy, seedMomentumStrategy } from './strategy-manager.js'
 import type { PricePoint } from './types.js'
 
 // Mock config with the strategy gate ENABLED.
@@ -236,6 +236,28 @@ describe('autoDispatchPendingSignals: TRADER_STRATEGY_GATE_ENABLED', () => {
     expect(submitSpy).toHaveBeenCalled()
     const submitted = submitSpy.mock.calls[0][0] as { size_usd: number }
     expect(submitted.size_usd).toBeGreaterThan(0)
+  })
+})
+
+// The vt backtest applies no regime gate, so its live buys must pass the Markov pre-gate.
+describe('autoDispatchPendingSignals: markov_gate exemption for momentum-vt-crypto', () => {
+  it.each([['momentum-vt-crypto', false], ['momentum-crypto', true]])('%s buy at markov_signal=-0.5 suppressed: %s', async (strategyId, suppressed) => {
+    const db = makeDb()
+    seedCryptoMomentumStrategy(db)
+    seedCryptoMomentumVtStrategy(db)
+    db.prepare("UPDATE trader_strategies SET status='active' WHERE id=?").run(strategyId)
+    const id = `sig-markov-${strategyId}`
+    db.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status, enrichment_json)
+      VALUES (?, ?, 'BTC/USD', 'buy', 0.8, 14, ?, 'pending', ?)`
+    ).run(id, strategyId, Date.now(), JSON.stringify({ markov_regime: { markov_signal: -0.5 } }))
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: makeApproveCommittee(150) },
+      makeEngine(UPTREND_BARS) as EngineClient,
+    )
+    const sig = db.prepare('SELECT status FROM trader_signals WHERE id=?').get(id) as { status: string }
+    expect(sig.status === 'suppressed_markov_gate').toBe(suppressed)
   })
 })
 

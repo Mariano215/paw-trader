@@ -70,6 +70,14 @@ export function isMeanReversionFamily(strategyId: string): boolean {
 }
 
 /**
+ * Strategies the brain Markov pre-gate and the risk-officer Markov veto skip.
+ * momentum-vt-crypto: its backtest applies no regime gate, so live must not either.
+ */
+export function skipsMarkovGate(strategyId: string): boolean {
+  return isMeanReversionFamily(strategyId) || strategyId === 'momentum-vt-crypto'
+}
+
+/**
  * Binary-entry strategies: the engine score only says how deep the setup is,
  * and the backtest takes every positive score (MIN_SCORE=1e-9). Score
  * thresholds would drop valid entries, so these skip them.

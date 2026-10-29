@@ -74,6 +74,7 @@ export interface Candidate {
   raw_score: number;
   horizon_days: number;
   generated_at: number;  // ms
+  size_weight?: number | null;  // vol-targeting weight in (0, 1]; only momentum-vt-crypto sends it
 }
 
 export interface DecisionRequest {

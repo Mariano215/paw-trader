@@ -13,6 +13,7 @@ import {
   type CommitteeTranscript,
 } from './committee.js'
 import { DEFAULT_SIZE_USD } from './approval-manager.js'
+import { applySizeWeight } from './size-weight.js'
 import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
 import { recordSignalSuppressionBySignalId } from './suppression-state.js'
 import { isAssetHeld } from './track-record.js'
@@ -43,7 +44,7 @@ import {
 import { HARD_CEILING_USD } from './trader-constants.js'
 import { findUnexpectedShortPositions, notifyUnexpectedShortPositions } from './position-safety.js'
 import { COHORT_MAX_CONCURRENT_POSITIONS, countCohortEntriesToday, countCohortOpenPositions, guardRunningCohort } from './evaluation-cohort.js'
-import { isMeanReversionFamily } from './backtest-report.js'
+import { skipsMarkovGate } from './backtest-report.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
 import { sweepPendingForPausedStrategy } from './strategy-manager.js'
 
@@ -399,6 +400,8 @@ export async function dispatchApproval(
       const navCap = navUsable ? manualNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD
       cap = Math.min(navCap, HARD_CEILING_USD)
     }
+    // Vol-targeted strategies shrink the cap by the engine's weight; risk sizing re-clamps to it.
+    cap = applySizeWeight(cap, signal.size_weight)
     const { computeRiskBasedSize } = await import('./risk-sizing.js')
     const manualRiskSize = computeRiskBasedSize({
       nav: manualNavForSize,
@@ -794,8 +797,8 @@ export async function autoDispatchPendingSignals(
       // regime gate and committee still protect those signals downstream.
       // For all other strategies: suppress if Markov strongly contradicts
       // the signal direction -- committee would veto anyway, skip LLM cost.
-      const isMeanReversion = isMeanReversionFamily(strategy.id)
-      if (!isMeanReversion && signal.enrichment_json) {
+      // skipsMarkovGate also exempts momentum-vt-crypto (backtest has no regime gate).
+      if (!skipsMarkovGate(strategy.id) && signal.enrichment_json) {
         try {
           const enrichment = JSON.parse(signal.enrichment_json) as Record<string, unknown>
           const regime = enrichment?.markov_regime as { markov_signal?: number } | undefined
@@ -973,6 +976,7 @@ export async function autoDispatchPendingSignals(
       } else {
         autoCapUsd = Math.min(autoNavUsable ? autoNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD, HARD_CEILING_USD)
       }
+      autoCapUsd = applySizeWeight(autoCapUsd, signal.size_weight)
       const decisionId = randomUUID()
       const now        = Date.now()
 

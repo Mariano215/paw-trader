@@ -146,6 +146,7 @@ interface StoredSignal {
   enrichment_json: string | null
   generated_at: number
   status: string
+  size_weight: number | null
 }
 
 export async function pollAndStoreSignals(
@@ -161,8 +162,8 @@ export async function pollAndStoreSignals(
 
   const insert = db.prepare(`
     INSERT OR IGNORE INTO trader_signals
-      (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'pending')
+      (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status, size_weight)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'pending', ?)
   `)
 
   // Check if a pending signal already exists for this asset+side+strategy.
@@ -249,6 +250,7 @@ export async function pollAndStoreSignals(
         c.raw_score,
         c.horizon_days,
         c.generated_at,
+        c.size_weight ?? null,
       )
       seenThisCycle.add(key)
       stored += 1

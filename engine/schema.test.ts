@@ -17,6 +17,14 @@ function freshDb(): Database.Database {
 }
 
 describe('trader schema migration', () => {
+  it('migration 14 adds trader_signals.size_weight', () => {
+    const db = freshDb()
+    applyTraderSchema(db)
+    const cols = (db.prepare('PRAGMA table_info(trader_signals)').all() as Array<{ name: string }>).map(c => c.name)
+    expect(cols).toContain('size_weight')
+    expect(TRADER_SCHEMA_VERSION).toBe(14)
+  })
+
   it('migration versions are strictly increasing and start at 1', () => {
     const versions = TRADER_MIGRATIONS.map((m) => m.version)
     expect(versions[0]).toBe(1)

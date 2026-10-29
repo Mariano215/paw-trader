@@ -159,6 +159,8 @@ function runtimePolicy(): CohortConfig['runtime'] {
   }
 }
 
+const CRYPTO_COHORT_SYMBOLS = new Set(['BTC/USD', 'ETH/USD'])
+
 function validateInput(input: CreateCohortInput): void {
   if (!ID_PATTERN.test(input.id) || !ID_PATTERN.test(input.strategyId)) throw new Error('invalid cohort or strategy id')
   if (!VENUE_PATTERN.test(input.dataVenue) || !VENUE_PATTERN.test(input.executionVenue)) throw new Error('invalid venue')
@@ -173,8 +175,9 @@ function validateInput(input: CreateCohortInput): void {
   if (!/^[0-9a-f]{7,40}$/i.test(input.claudepawRevision) || !/^[0-9a-f]{7,40}$/i.test(input.engineRevision)) {
     throw new Error('invalid code revision')
   }
-  if (input.assetClass === 'crypto' && (input.universe.length !== 1 || input.universe[0] !== 'BTC/USD')) {
-    throw new Error('Bitcoin cohort universe must be exactly BTC/USD')
+  if (input.assetClass === 'crypto' && (new Set(input.universe).size !== input.universe.length ||
+      input.universe.some(s => !CRYPTO_COHORT_SYMBOLS.has(s)))) {
+    throw new Error('crypto cohort universe must be a subset of BTC/USD, ETH/USD with no duplicates')
   }
 }
 

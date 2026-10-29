@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
+import { seedCryptoMomentumVtStrategy } from './strategy-manager.js'
 import {
   COHORT_ENFORCEMENT_KV_KEY,
   activateCohort,
@@ -52,7 +53,24 @@ describe('prospective evaluation cohorts', () => {
     expect(a.status).toBe('draft')
     expect(JSON.parse(a.universe_json)).toEqual(['BTC/USD'])
     expect(cohortFingerprint(JSON.parse(a.config_json))).toBe(a.config_fingerprint)
-    expect(() => createDraftCohort(db, {...cryptoDraft, id: 'eth-paper', universe: ['ETH/USD']})).toThrow(/exactly BTC/)
+    expect(() => createDraftCohort(db, {...cryptoDraft, id: 'doge-paper', universe: ['DOGE/USD']})).toThrow(/subset of BTC\/USD, ETH\/USD/)
+  })
+
+  it('creates the BTC+ETH vol-targeted cohort draft', () => {
+    seedCryptoMomentumVtStrategy(db)
+    const row = createDraftCohort(db, {
+      id: 'crypto-momentum-vt-paper-20261029-v1', strategyId: 'momentum-vt-crypto', assetClass: 'crypto',
+      universe: ['BTC/USD', 'ETH/USD'], dataVenue: 'coinbase', executionVenue: 'alpaca',
+      feeBpsPerSide: 25, slippageBpsPerSide: 10, benchmarkAsset: 'BTC/USD', maxPositionUsd: 200, dailyTradeCap: 5,
+      claudepawRevision: '3f9b897', engineRevision: '4656022',
+    })
+    expect(row.status).toBe('draft')
+    expect(JSON.parse(row.universe_json)).toEqual(['BTC/USD', 'ETH/USD'])
+  })
+
+  it('rejects unknown or duplicate crypto symbols', () => {
+    expect(() => createDraftCohort(db, {...cryptoDraft, universe: ['BTC/USD', 'DOGE/USD']})).toThrow(/subset of BTC\/USD, ETH\/USD/)
+    expect(() => createDraftCohort(db, {...cryptoDraft, universe: ['BTC/USD', 'BTC/USD']})).toThrow(/subset of BTC\/USD, ETH\/USD/)
   })
 
   it('fails closed when activation preflight is incomplete', () => {

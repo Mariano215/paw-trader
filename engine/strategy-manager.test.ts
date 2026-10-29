@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import Database from 'better-sqlite3'
 import { initTraderTables } from './db.js'
-import { seedMomentumStrategy, getStrategy, updateStrategyTier, getActiveStrategies, seedAllStrategies, sweepPendingForPausedStrategy } from './strategy-manager.js'
+import { seedMomentumStrategy, getStrategy, updateStrategyTier, getActiveStrategies, seedAllStrategies, sweepPendingForPausedStrategy, seedCryptoMomentumVtStrategy } from './strategy-manager.js'
 
 function makeDb() {
   const db = new Database(':memory:')
@@ -105,6 +105,25 @@ describe('strategy-manager', () => {
     expect(getStrategy(db, 'mean-reversion-hourly-crypto')!.status).toBe('paused')
     expect(getStrategy(db, 'trend-4h-crypto')!.status).toBe('paused')
     expect(getStrategy(db, 'order-flow-imbalance-crypto')!.status).toBe('paused')
+  })
+
+  it('seeds momentum-vt-crypto paused with the frozen vol target', () => {
+    seedAllStrategies(db)
+    const row = getStrategy(db, 'momentum-vt-crypto') as any
+    expect(row).not.toBeNull()
+    expect(row.status).toBe('paused')
+    expect(row.asset_class).toBe('crypto')
+    const params = JSON.parse(row.params_json)
+    expect(params.basket).toEqual(['BTC/USD', 'ETH/USD'])
+    expect(params.target_vol).toBe(0.4)
+    expect(params.vol_window).toBe(20)
+  })
+
+  it('re-seeding momentum-vt-crypto never rewrites its params', () => {
+    seedCryptoMomentumVtStrategy(db)
+    db.prepare("UPDATE trader_strategies SET params_json = '{\"frozen\":true}' WHERE id = 'momentum-vt-crypto'").run()
+    seedCryptoMomentumVtStrategy(db)
+    expect((getStrategy(db, 'momentum-vt-crypto') as any).params_json).toBe('{"frozen":true}')
   })
 
   it('seeds the exact BTC four-hour trend metadata paused', async () => {

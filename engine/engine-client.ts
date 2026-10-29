@@ -453,6 +453,17 @@ export class EngineClient {
     )
   }
 
+  /** Vol-targeted BTC+ETH daily breakout simulation. Never called on the trade tick. */
+  async getCryptoMomentumVtBacktest(days = 1_825): Promise<BacktestResult> {
+    if (!Number.isInteger(days) || days < 300 || days > 5_000) {
+      throw new Error('crypto momentum vt backtest days must be an integer from 300 to 5000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-momentum-vt?days=${days}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
   /** Frozen BTC/USD four-hour trend simulation. */
   async getCryptoFourHourTrendBacktest(periods = 10_950): Promise<BacktestResult> {
     if (!Number.isInteger(periods) || periods < 1_000 || periods > 12_000) {

@@ -205,6 +205,29 @@ export function seedBitcoinOrderFlowResearchFamily(db: Database.Database): void 
   )
 }
 
+/** Vol-targeted BTC+ETH daily breakout; paused until cohort activation. Params are frozen: INSERT OR IGNORE. */
+export function seedCryptoMomentumVtStrategy(db: Database.Database): void {
+  const now = Date.now()
+  db.prepare(`
+    INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'momentum-vt-crypto',
+    'Crypto Momentum (Vol Targeted)',
+    'crypto',
+    0,
+    'paused',
+    JSON.stringify({
+      basket: ['BTC/USD', 'ETH/USD'], bar_timeframe: '1d', lookback_high: 20,
+      breakout_return_days: 7, horizon_days: 14, min_score: 0.05,
+      target_vol: 0.4, vol_window: 20, slot_fraction: 0.5, signal_poll_minutes: 15,
+    }),
+    now,
+    now,
+  )
+}
+
 /** Seed every known strategy. Idempotent. */
 export function seedAllStrategies(db: Database.Database): void {
   seedMomentumStrategy(db)
@@ -212,6 +235,7 @@ export function seedAllStrategies(db: Database.Database): void {
   seedCryptoMomentumStrategy(db)
   seedCryptoHourlyMeanReversionStrategy(db)
   seedCryptoFourHourTrendStrategy(db)
+  seedCryptoMomentumVtStrategy(db)
   seedBitcoinOrderFlowResearchFamily(db)
   seedRsi2Strategy(db)
   seedIbsStrategy(db)

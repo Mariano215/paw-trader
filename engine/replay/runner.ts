@@ -31,6 +31,7 @@ const SEEDS: Record<string, (db: Database.Database) => void> = {
   'momentum-crypto': strategies.seedCryptoMomentumStrategy,
   'mean-reversion-hourly-crypto': strategies.seedCryptoHourlyMeanReversionStrategy,
   'trend-4h-crypto': strategies.seedCryptoFourHourTrendStrategy,
+  'momentum-vt-crypto': strategies.seedCryptoMomentumVtStrategy,
   'rsi2-stocks': strategies.seedRsi2Strategy,
   'ibs-stocks': strategies.seedIbsStrategy,
 }

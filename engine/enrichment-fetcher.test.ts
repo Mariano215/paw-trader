@@ -63,6 +63,16 @@ describe('enrichPendingSignals', () => {
     db = makeDb()
   })
 
+  it('leaves size_weight untouched when enriching', async () => {
+    insertSignal(db, 'sig-w', 'AAPL')
+    db.prepare("UPDATE trader_signals SET size_weight = 0.5 WHERE id = 'sig-w'").run()
+    const closes = Array.from({ length: 25 }, (_, i) => 150 + i * 0.5)
+    await enrichPendingSignals(db, makeClient({ AAPL: closes }) as unknown as EngineClient)
+    const row = db.prepare("SELECT size_weight, enrichment_json FROM trader_signals WHERE id = 'sig-w'").get() as { size_weight: number; enrichment_json: string | null }
+    expect(row.enrichment_json).not.toBeNull()
+    expect(row.size_weight).toBe(0.5)
+  })
+
   it('enriches a pending signal with price data', async () => {
     insertSignal(db, 'sig-1', 'AAPL')
     const closes = Array.from({ length: 25 }, (_, i) => 150 + i * 0.5)  // 150..162

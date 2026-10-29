@@ -8,7 +8,7 @@ import { logger } from '../logger.js'
 import { recordTraderOperationalEvent } from './operational-events.js'
 import type { AgentResult } from '../agent.js'
 import { TRADER_SIGNAL_SCORE_THRESHOLD } from '../config.js'
-import { bypassesScoreThreshold, isMeanReversionFamily } from './backtest-report.js'
+import { bypassesScoreThreshold, skipsMarkovGate } from './backtest-report.js'
 import { rollupRecentOutcomes, type AssetClass } from './reasoning-bank.js'
 import type { MarkovRegimePayload } from './types.js'
 import type { SignalEnrichment } from './enrichment-fetcher.js'
@@ -345,8 +345,9 @@ function applyDeterministicRiskGate(
 
   // Mean-reversion strategies skip the Markov conflict veto: a bear/oversold
   // regime is the entry condition, not a contraindication. Mirrors the pre-gate
-  // bypass in decision-dispatcher.ts.
-  const isMeanReversion = isMeanReversionFamily(strategyId ?? '')
+  // bypass in decision-dispatcher.ts. skipsMarkovGate also exempts
+  // momentum-vt-crypto (backtest has no regime gate).
+  const skipMarkov = skipsMarkovGate(strategyId ?? '')
 
   if (markov !== null) {
     const markovSignal = markov.markov_signal
@@ -356,7 +357,7 @@ function applyDeterministicRiskGate(
     // pre-gate in decision-dispatcher.ts.
     // Skipped for mean-reversion: oversold/bear regime is the buy entry.
     const conflicts =
-      !isMeanReversion &&
+      !skipMarkov &&
       ((action === 'buy'  && markovSignal <= -0.15) ||
        (action === 'sell' && markovSignal >=  0.15))
 

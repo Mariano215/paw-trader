@@ -747,6 +747,16 @@ describe('committee -- reversion family and binary-entry strategies', () => {
     expect(result.transcript.risk_officer.concerns.some((c) => c.includes('markov_conflict'))).toBe(false)
   })
 
+  it.each([['momentum-vt-crypto', false], ['momentum-crypto', true]])('%s Markov conflict veto at markov_signal=-0.5: %s', async (strategyId, vetoed) => {
+    const signal: CommitteeSignalInput = { ...baseSignal, asset: 'BTC/USD', strategy_id: strategyId, enrichment_json: makeEnrichmentJson(-0.5) }
+    const script = {
+      ...markovBaseScript(0.65),
+      'committee-risk-officer': '{"role":"risk_officer","veto":false,"reason":"All clear","concerns":[]}',
+    }
+    const result = await runCommittee(signal, deps(scriptedRunAgent(script)))
+    expect(result.transcript.risk_officer.concerns.some((c) => c.includes('markov_conflict'))).toBe(vetoed)
+  })
+
   it('a weak rsi2 score on a lean asset is not abstained by the momentum score gate', async () => {
     let calls = 0
     const runAgent: CommitteeDeps['runAgent'] = async () => { calls++; return agentResult(null) }

@@ -58,6 +58,18 @@ describe('signal-poller', () => {
     mockClient = { getSignals: vi.fn() }
   })
 
+  it('stores the engine size_weight and leaves it NULL when absent', async () => {
+    // Crypto pairs only: no market-hours filter. momentum-crypto is seeded already
+    // (momentum-vt-crypto's row arrives in Task 7).
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([
+      { ...makeCandidate('BTC/USD', 0.4, 'momentum-crypto', 14), size_weight: 0.6 },
+      makeCandidate('ETH/USD', 0.4, 'momentum-crypto', 14),
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const rows = db.prepare('SELECT asset, size_weight FROM trader_signals ORDER BY asset').all()
+    expect(rows).toEqual([{ asset: 'BTC/USD', size_weight: 0.6 }, { asset: 'ETH/USD', size_weight: null }])
+  })
+
   it('stores signals above threshold', async () => {
     vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('AAPL', 0.72)])
     await pollAndStoreSignals(db, mockClient as EngineClient)

@@ -511,6 +511,13 @@ export const TRADER_MIGRATIONS: TraderMigration[] = [
       `)
     },
   },
+  {
+    version: 14,
+    description: 'Vol-targeting size weight per signal; NULL means full size',
+    up: (db) => {
+      addColumn(db, 'trader_signals', 'size_weight', 'REAL')
+    },
+  },
 ]
 
 if (TRADER_MIGRATIONS.length === 0) {
@@ -526,7 +533,7 @@ export const TRADER_SCHEMA_VERSION = Math.max(...TRADER_MIGRATIONS.map((m) => m.
  */
 export const EXPECTED_TRADER_COLUMNS: Record<string, string[]> = {
   trader_strategies: ['id', 'name', 'asset_class', 'tier', 'status', 'params_json', 'created_at', 'updated_at', 'max_size_usd'],
-  trader_signals: ['id', 'strategy_id', 'asset', 'side', 'raw_score', 'horizon_days', 'enrichment_json', 'generated_at', 'status'],
+  trader_signals: ['id', 'strategy_id', 'asset', 'side', 'raw_score', 'horizon_days', 'enrichment_json', 'generated_at', 'status', 'size_weight'],
   trader_decisions: ['id', 'signal_id', 'action', 'asset', 'size_usd', 'entry_type', 'entry_price', 'stop_loss', 'take_profit', 'thesis', 'confidence', 'committee_transcript_id', 'decided_at', 'status', 'engine_order_id', 'submit_attempts', 'next_retry_at', 'filled_qty', 'filled_avg_price', 'parent_decision_id', 'ungraded_at', 'ungraded_reason', 'cohort_id'],
   trader_committee_transcripts: ['id', 'signal_id', 'transcript_json', 'rounds', 'total_tokens', 'total_cost_usd', 'created_at'],
   trader_approvals: ['id', 'decision_id', 'sent_at', 'responded_at', 'response', 'override_size'],

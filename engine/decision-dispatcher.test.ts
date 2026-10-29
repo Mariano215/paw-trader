@@ -577,6 +577,42 @@ describe('decision-dispatcher', () => {
     expect(submitCall.size_usd).toBe(150)
   })
 
+  it('manual dispatch scales the strategy cap by the signal size_weight', async () => {
+    const signalId = insertSignal(db)
+    db.prepare("UPDATE trader_strategies SET max_size_usd = ? WHERE id = 'momentum-stocks'").run(150)
+    db.prepare('UPDATE trader_signals SET size_weight = 0.5 WHERE id = ?').run(signalId)
+    mockClient.getNav = vi.fn().mockResolvedValue(null)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-w', broker_order_id: 'boid-w', status: 'placed', approved_size_usd: 75,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(300), classifyTier: tierStub },
+    )
+    expect(vi.mocked(mockClient.submitDecision!).mock.calls[0][0].size_usd).toBe(75)
+  })
+
+  it('auto dispatch submits exactly half the size when size_weight is 0.5, and NULL changes nothing', async () => {
+    const run = async (weight: number | null): Promise<number> => {
+      const local = makeDb()
+      local.prepare("UPDATE trader_strategies SET max_size_usd = 150 WHERE id = 'momentum-stocks'").run()
+      local.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status, size_weight)
+        VALUES ('sig-w', 'momentum-stocks', 'MSFT', 'buy', 0.7, 20, ?, 'pending', ?)`).run(Date.now(), weight)
+      const client: Partial<EngineClient> = {
+        ...mockClient,
+        submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'c', broker_order_id: 'b', status: 'placed', approved_size_usd: 1 }),
+      }
+      await autoDispatchPendingSignals(local, { send: async () => {}, runCommittee: makeApproveCommittee(150) }, client as EngineClient)
+      return vi.mocked(client.submitDecision!).mock.calls[0][0].size_usd
+    }
+    const full = await run(null)
+    const half = await run(0.5)
+    expect(full).toBeGreaterThan(0)
+    expect(half).toBe(Math.round(full * 0.5 * 100) / 100)
+  })
+
   it('falls back to NAV * 2% when max_size_usd is NULL', async () => {
     const signalId = insertSignal(db)
     // Strategy has no explicit cap -- momentum-stocks seeded without max_size_usd.

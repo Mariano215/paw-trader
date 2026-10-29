@@ -162,6 +162,17 @@ describe("EngineClient", () => {
     await expect(client.getCryptoMomentumBacktest(299)).rejects.toThrow(/300 to 5000/);
   });
 
+  it("requests the vol-targeted crypto momentum backtest", async () => {
+    mockFetch.mockReturnValueOnce(mockResp({
+      strategy: 'momentum-vt-crypto', n_trades: 80, sharpe: 0.7,
+      max_drawdown: 0.15, warnings: [],
+    }));
+    const result = await client.getCryptoMomentumVtBacktest(1825);
+    expect(result.strategy).toBe('momentum-vt-crypto');
+    expect(mockFetch.mock.calls[0][0]).toContain('/backtest/crypto-momentum-vt?days=1825');
+    await expect(client.getCryptoMomentumVtBacktest(299)).rejects.toThrow(/300 to 5000/);
+  });
+
   it("requests the frozen BTC four-hour trend backtest", async () => {
     mockFetch.mockReturnValueOnce(mockResp({
       strategy: 'trend-4h-crypto', n_trades: 120, sharpe: 1.0,

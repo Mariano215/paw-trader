@@ -1,0 +1,35 @@
+/**
+ * trader-routes/index.ts
+ *
+ * Barrel router: mounts each per-concern sub-router at the same root so
+ * the absolute /api/v1/trader/... paths declared inside each module stay
+ * byte-for-byte identical to the pre-split single-file layout.
+ */
+
+import { Router } from 'express'
+import { requireTraderProjectRead } from './shared.js'
+import statusRoutes from './status.js'
+import strategiesRoutes from './strategies.js'
+import verdictsRoutes from './verdicts.js'
+import committeeRoutes from './committee.js'
+import auditLogRoutes from './audit-log.js'
+import signalsRoutes from './signals.js'
+import syncRoutes from './sync.js'
+import bypassProgressRoutes from './bypass-progress.js'
+import operationalEventsRoutes from './operational-events.js'
+
+const router = Router()
+
+router.use('/api/v1/trader', requireTraderProjectRead)
+
+router.use(statusRoutes)
+router.use(strategiesRoutes)
+router.use(verdictsRoutes)
+router.use(committeeRoutes)
+router.use(auditLogRoutes)
+router.use(signalsRoutes)
+router.use(syncRoutes)
+router.use(bypassProgressRoutes)
+router.use(operationalEventsRoutes)
+
+export default router

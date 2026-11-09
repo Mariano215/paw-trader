@@ -1,0 +1,1072 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import Database from 'better-sqlite3'
+import { initTraderTables } from './db.js'
+import { recordFill } from './audit-log.js'
+import { seedMomentumStrategy } from './strategy-manager.js'
+import {
+  initTraderScheduler,
+  stopTraderScheduler,
+  runTraderTick,
+  _resetHaltAlertForTest,
+  _resetTickLockForTest,
+  _getAndResetZeroPollCountForTest,
+} from './trader-scheduler.js'
+import * as loggerModule from '../logger.js'
+import type { EngineClient } from './engine-client.js'
+import { GATE_VERSION, gateConfigFingerprint } from './go-live-gate.js'
+
+vi.mock('./decision-dispatcher.js', () => ({
+  autoDispatchPendingSignals: vi.fn().mockResolvedValue([]),
+}))
+
+import { autoDispatchPendingSignals } from './decision-dispatcher.js'
+
+function makeDb() {
+  const db = new Database(':memory:')
+  db.pragma('foreign_keys = OFF')
+  initTraderTables(db)
+  seedMomentumStrategy(db)
+  // Phase 4 Task C -- pre-mark the weekly report as already fired today
+  // so the Sunday 09:00 NY gate inside runTraderTick is a no-op in these
+  // tests. The weekly report itself is exercised in weekly-report.test.ts.
+  // kv_settings table + the known key are created on demand.
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS kv_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `).run()
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.lastWeeklyReport', String(Date.now()))
+  // Same for the weekly go-live gate run, exercised in its own test file.
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last_run_ms', String(Date.now()))
+  db.prepare('INSERT OR REPLACE INTO kv_settings (key, value) VALUES (?, ?)')
+    .run('trader.gate.last', JSON.stringify({version: GATE_VERSION, configFingerprint: gateConfigFingerprint(db), passed: false, criteria: [], evaluatedAt: Date.now()}))
+  return db
+}
+
+function insertSignal(db: Database.Database, id: string, score = 0.72, side = 'buy') {
+  db.prepare(`
+    INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+    VALUES (?, 'momentum-stocks', 'AAPL', ?, ?, 20, ?, 'pending')
+  `).run(id, side, score, Date.now())
+}
+
+const healthOk = {
+  status: 'ok',
+  version: '0.1.0',
+  alpaca_connected: true,
+  alpaca_mode: 'paper' as const,
+  reconciler_halted: false,
+  halt_reason: null,
+  coinbase_connected: true,
+  crypto_enabled: true,
+}
+
+describe('trader-scheduler', () => {
+  let db: ReturnType<typeof makeDb>
+  let sendMock: ReturnType<typeof vi.fn>
+  let engineClient: Partial<EngineClient>
+  let getEngineClientMock: ReturnType<typeof vi.fn>
+
+  /** Plain-text alert send (halt alerts, etc.). */
+  const send = (text: string): Promise<void> =>
+    (sendMock as unknown as (text: string) => Promise<void>)(text)
+
+
+  const getEngineClient = (): EngineClient =>
+    (getEngineClientMock as unknown as () => EngineClient)()
+
+  beforeEach(() => {
+    // Pin the clock: the daily readiness digest (progress-monitor) fires on any
+    // tick at or after 17:00 ET, so on a real clock these tests pass in the
+    // morning and fail in the evening. Fake Date only, never the timer queue,
+    // so async code that awaits real timeouts still runs. Tests that need a
+    // different moment call vi.setSystemTime themselves.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-22T15:00:00Z')) // 11:00 ET
+    vi.mocked(autoDispatchPendingSignals).mockReset().mockResolvedValue([])
+    db = makeDb()
+    sendMock = vi.fn().mockResolvedValue(undefined)
+    engineClient = {
+      pingHealth: vi.fn().mockResolvedValue(true),
+      getHealth: vi.fn().mockResolvedValue(healthOk),
+      getSignals: vi.fn().mockResolvedValue([]),
+      getPositions: vi.fn().mockResolvedValue([]),
+      getOrders: vi.fn().mockResolvedValue([]),
+      getReconcileLast: vi.fn().mockResolvedValue({
+        id: 'rec-current', ran_at: Date.now(), drift_detected: false,
+        drift_summary: null, action_taken: 'none',
+      }),
+      getNavLatest: vi.fn().mockResolvedValue({
+        date: '2026-07-22', period: 'day_open', nav: 100_000, recorded_at: Date.now(),
+      }),
+      coverPaperShort: vi.fn().mockResolvedValue({
+        asset: 'IWM', prior_qty: -3, client_order_id: 'repair-cover-1',
+        broker_order_id: 'broker-cover-1', status: 'pending_new', submitted: true,
+      }),
+      // Phase 4 Task B: close-out watcher calls /prices when a decision
+      // closes in a given tick. Stub as empty so the trader-scheduler
+      // tests stay focused on scheduler behaviour, not price math.
+      getPrices: vi.fn().mockResolvedValue([]),
+    }
+    getEngineClientMock = vi.fn().mockReturnValue(engineClient)
+    _resetHaltAlertForTest()
+    _resetTickLockForTest()
+  })
+
+  afterEach(() => {
+    stopTraderScheduler()
+    vi.useRealTimers()
+  })
+
+  describe('runTraderTick', () => {
+    it('passes its own engine client and committee to dispatch', async () => {
+      insertSignal(db, 'sig-wiring')
+      const runCommittee = vi.fn()
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => true, runCommittee})
+
+      const [, deps, client] = vi.mocked(autoDispatchPendingSignals).mock.calls[0]
+      expect(client).toBe(engineClient)
+      expect(deps.runCommittee).toBe(runCommittee)
+    })
+
+    it('timestamps tick completion when the tick finishes', async () => {
+      const startedAt = Date.now()
+      vi.mocked(engineClient.getSignals!).mockImplementation(async () => {
+        vi.setSystemTime(startedAt + 1_600)
+        return []
+      })
+
+      await runTraderTick({db, send, rawSend: send, getEngineClient, isMarketOpen: () => true})
+
+      const rows = db.prepare(`SELECT event_type, source_ts, recorded_at, metadata_json
+        FROM trader_operational_events
+        WHERE event_type IN ('scheduler.tick.started','scheduler.tick.completed')
+        ORDER BY seq`).all() as Array<{event_type:string;source_ts:number;recorded_at:number;metadata_json:string}>
+      expect(rows).toHaveLength(2)
+      expect(rows[0].source_ts).toBe(startedAt)
+      expect(rows[1].source_ts).toBe(startedAt + 1_600)
+      expect(rows[1].recorded_at).toBe(startedAt + 1_600)
+      expect(JSON.parse(rows[1].metadata_json).duration_ms).toBe(1_600)
+    })
+
+    it('blocks new entries and alerts once when broker truth contains a short position', async () => {
+      insertSignal(db, 'short-safety')
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+
+      await runTraderTick({
+        db, send, rawSend: send, getEngineClient, isMarketOpen: () => true,
+        restartEngineAsync: vi.fn(),
+      })
+
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+      expect(engineClient.coverPaperShort).toHaveBeenCalledWith('IWM')
+      expect(sendMock.mock.calls.some(([message]) => String(message).includes('UNEXPECTED SHORT POSITION'))).toBe(true)
+      expect((db.prepare("SELECT status FROM trader_signals WHERE id='short-safety'").get() as any).status).toBe('pending')
+    })
+
+    it('does not cover a paper short outside equity market hours', async () => {
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => false})
+
+      expect(engineClient.coverPaperShort).not.toHaveBeenCalled()
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
+    it('never requests automatic short covering in live mode', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({...healthOk, alpaca_mode: 'live'})
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        {asset: 'IWM', qty: -3, avg_entry_price: 293, market_value: -879,
+          unrealized_pnl: 3, source: 'alpaca', updated_at: Date.now()},
+      ])
+      engineClient.haltTrading = vi.fn().mockResolvedValue(undefined)
+
+      await runTraderTick({db, send, getEngineClient, isMarketOpen: () => true})
+
+      expect(engineClient.coverPaperShort).not.toHaveBeenCalled()
+      expect(engineClient.haltTrading).toHaveBeenCalled()
+    })
+
+    // A wedged engine holds the port in LISTEN but never answers. getHealth
+    // returns null for that AND for a 404, so the wedge used to look like a
+    // healthy tick and the auto-restart never fired (13h outage 2026-07-20).
+    // pingHealth is the unambiguous reachability signal.
+    describe('wedged engine (port open, nothing served)', () => {
+      // Wednesday 11:00 ET — inside equity market hours, which gates restart.
+      const duringMarketHours = new Date('2026-07-22T15:00:00Z')
+
+      it('restarts the engine when the health probe times out', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+        expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('stopped responding'))
+      })
+
+      it('restarts a wedged engine outside market hours too', async () => {
+        // Regression: this used to be gated on NYSE hours, so an engine that
+        // wedged after the close stayed dead until 09:30 the next morning --
+        // no reconciliation, no exits, and crypto trades around the clock.
+        vi.useFakeTimers()
+        vi.setSystemTime(new Date('2026-07-22T23:30:00Z')) // 19:30 ET, market shut
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => false, db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+      })
+
+      it('retries the restart after the cooldown rather than giving up', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        vi.mocked(engineClient.pingHealth!).mockResolvedValue(false)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+
+        // Next tick, still down: inside the cooldown, so no second attempt.
+        vi.setSystemTime(new Date(duringMarketHours.getTime() + 5 * 60 * 1000))
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(1)
+
+        // Past the cooldown, still down: try again.
+        vi.setSystemTime(new Date(duringMarketHours.getTime() + 31 * 60 * 1000))
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+        expect(restartEngineAsync).toHaveBeenCalledTimes(2)
+      })
+
+      it('does not restart while the engine still answers', async () => {
+        vi.useFakeTimers()
+        vi.setSystemTime(duringMarketHours)
+        const restartEngineAsync = vi.fn()
+
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send, restartEngineAsync })
+
+        expect(restartEngineAsync).not.toHaveBeenCalled()
+      })
+    })
+
+    it('runs all phases successfully with no signals', async () => {
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(true)
+      expect(result.sent).toBe(0)
+      expect(result.reconcilerHalted).toBe(false)
+      expect(sendMock).not.toHaveBeenCalled()
+    })
+
+    it('blocks live entries locally even when requesting a halt fails', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({...healthOk, alpaca_mode: 'live'})
+      engineClient.haltTrading = vi.fn().mockRejectedValue(new Error('halt unavailable'))
+      insertSignal(db, 'unsafe-live')
+      await runTraderTick({isMarketOpen: () => true, db, getEngineClient, send})
+      expect(engineClient.haltTrading).toHaveBeenCalled()
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+      expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('New entries blocked locally'))
+    })
+
+    it('blocks new entries when mode is unknown', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue(null)
+      insertSignal(db, 'unknown-mode')
+      await runTraderTick({isMarketOpen: () => true, db, getEngineClient, send})
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
+    it('polls engine and calls autoDispatchPendingSignals for new signals', async () => {
+      vi.mocked(engineClient.getSignals!).mockResolvedValue([
+        {
+          id: 'sig-1', strategy: 'momentum', asset: 'AAPL', side: 'buy',
+          raw_score: 0.72, horizon_days: 20, generated_at: Date.now(),
+        },
+      ])
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(true)
+      expect(result.sent).toBe(1)
+    })
+
+
+
+
+    it('continues even when engine poll fails', async () => {
+      vi.mocked(engineClient.getSignals!).mockRejectedValue(new Error('engine down'))
+      insertSignal(db, 'sig-preexisting')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(true)
+      expect(result.sent).toBe(1)
+    })
+
+    it('continues when getEngineClient throws (credentials missing)', async () => {
+      getEngineClientMock.mockImplementation(() => {
+        throw new Error('credentials not configured')
+      })
+      insertSignal(db, 'sig-preexisting')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-preexisting', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(false)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
+    it('continues when autoDispatchPendingSignals throws', async () => {
+      insertSignal(db, 'sig-1', 0.9, 'buy')
+      vi.mocked(autoDispatchPendingSignals).mockRejectedValueOnce(new Error('committee blew up'))
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      // auto-dispatch failed so sent stays 0, but the tick still completes
+      expect(result.sent).toBe(0)
+      expect(result.polled).toBe(true)
+    })
+
+    it('calls autoDispatchPendingSignals with db and correct deps shape', async () => {
+      vi.mocked(autoDispatchPendingSignals).mockClear()
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(autoDispatchPendingSignals).toHaveBeenCalledOnce()
+      const [calledDb, calledDeps] = vi.mocked(autoDispatchPendingSignals).mock.calls[0]
+      expect(calledDb).toBe(db)
+      expect(typeof calledDeps.send).toBe('function')
+      expect(calledDeps.alertOnReject).toBe(false)
+      // The old sendWithKeyboard path must not be present in the deps
+      expect((calledDeps as any).sendWithKeyboard).toBeUndefined()
+    })
+
+    it('sends halt alert via plain send when reconciler_halted is true', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'daily_loss_limit',
+      })
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.reconcilerHalted).toBe(true)
+      expect(sendMock).toHaveBeenCalledWith(expect.stringContaining('disagree with the broker'))
+      expect(sendMock.mock.calls[0][0]).toContain('disagree with the broker')
+      // Approval cards go through not send
+    })
+
+    it('does not spam halt alerts on repeated ticks when halted', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'daily_loss_limit',
+      })
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      sendMock.mockClear()
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      const haltCalls = sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))
+      expect(haltCalls).toHaveLength(0)
+    })
+
+    it('resets halt flag and re-alerts when reconciler recovers then halts again', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r1' })
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(1)
+
+      sendMock.mockClear()
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: false })
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(0)
+
+      sendMock.mockClear()
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({ ...healthOk, reconciler_halted: true, halt_reason: 'r2' })
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(sendMock.mock.calls.filter((args: unknown[]) => typeof args[0] === 'string' && args[0].includes('disagree with the broker'))).toHaveLength(1)
+    })
+
+    it('auto-heals a safe broker-only halt on the first tick', async () => {
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'NVDA' }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'NVDA: broker shows qty=10 but local has no record',
+      })
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('NVDA')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('fixed a mismatch'))).toBe(true)
+    })
+
+    it('auto-heals a notional mismatch (qty agrees, $ mark drifted) on the first tick', async () => {
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'EEM' }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        reconciler_halted: true,
+        halt_reason: 'EEM: notional mismatch local=$6363.41 broker=$6402.35 diff=$38.94 threshold=$31.82',
+      })
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('EEM')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+    })
+
+    it('holds a phantom for one tick, then auto-heals once confirmed under the $ cap', async () => {
+      const phantom = { ...healthOk, reconciler_halted: true, halt_reason: 'AAPL: local qty=2.04813 but broker shows no position' }
+      vi.mocked(engineClient.getHealth!).mockResolvedValue(phantom)
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        { asset: 'AAPL', qty: 2.04813, avg_entry_price: 308.88, market_value: 612.43, unrealized_pnl: -20, source: 'adopted', updated_at: 1 } as any,
+      ])
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({ adopted: { asset: 'AAPL', qty: 0 }, reconcile_cleared: true })
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+
+      // Tick 1: not yet confirmed -> alert, no heal.
+      const r1 = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(r1.reconcilerHalted).toBe(true)
+      expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
+      expect(sendMock.mock.calls.some(c => String(c[0]).includes('double-checking'))).toBe(true)
+
+      // Tick 2: second consecutive halt confirms -> adopt + clear.
+      const r2 = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(r2.reconcilerHalted).toBe(false)
+      expect(engineClient.adoptBrokerPosition).toHaveBeenCalledWith('AAPL')
+      expect(engineClient.clearReconcilerHalt).toHaveBeenCalledOnce()
+    })
+
+    it('never auto-heals a phantom whose local value exceeds the cap', async () => {
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk, reconciler_halted: true, halt_reason: 'TSLA: local qty=50 but broker shows no position',
+      })
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([
+        { asset: 'TSLA', qty: 50, avg_entry_price: 300, market_value: 15000, unrealized_pnl: 0, source: 'adopted', updated_at: 1 } as any,
+      ])
+      engineClient.adoptBrokerPosition = vi.fn().mockResolvedValue({})
+      engineClient.clearReconcilerHalt = vi.fn().mockResolvedValue({ status: 'cleared' })
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(engineClient.adoptBrokerPosition).not.toHaveBeenCalled()
+      expect(engineClient.clearReconcilerHalt).not.toHaveBeenCalled()
+    })
+
+    it('continues when health check fails', async () => {
+      vi.mocked(engineClient.getHealth!).mockRejectedValue(new Error('health endpoint down'))
+      insertSignal(db, 'sig-1')
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-1', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(true)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+    })
+
+    it('runs close-out sweep and reports processed count when a position closed', async () => {
+      // Seed an executed decision whose asset is no longer in engine positions,
+      // and provide matching buy+sell fills so the verdict path completes.
+      insertSignal(db, 'sig-c')
+      db.prepare(`
+        INSERT INTO trader_decisions
+          (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+           committee_transcript_id, decided_at, status, filled_qty, filled_avg_price)
+        VALUES ('dec-c', 'sig-c', 'buy', 'AAPL', 100, 'limit', 't', 0.7, NULL, 1000, 'executed', 1, 100)
+      `).run()
+      // The verdict is graded off this decision's FIFO-matched realized lots,
+      // which are derived from trader_fills, not from the order snapshot.
+      recordFill(db, {
+        decisionId: 'dec-c', clientOrderId: 'b', asset: 'AAPL', side: 'buy',
+        fillQty: 1, fillPrice: 100, fillTsMs: 1100,
+      })
+      recordFill(db, {
+        decisionId: 'dec-c-exit', clientOrderId: 's', asset: 'AAPL', side: 'sell',
+        fillQty: 1, fillPrice: 110, fillTsMs: 5000,
+      })
+      vi.mocked(engineClient.getPositions!).mockResolvedValue([])
+      vi.mocked(engineClient.getOrders!).mockResolvedValue([
+        { client_order_id: 'b', broker_order_id: null, asset: 'AAPL', side: 'buy',
+          qty: 1, order_type: 'limit', limit_price: null, status: 'filled',
+          filled_qty: 1, filled_avg_price: 100, source: 't', created_at: 1100, updated_at: 1100 },
+        { client_order_id: 's', broker_order_id: null, asset: 'AAPL', side: 'sell',
+          qty: 1, order_type: 'limit', limit_price: null, status: 'filled',
+          filled_qty: 1, filled_avg_price: 110, source: 't', created_at: 5000, updated_at: 5000 },
+      ])
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.closedOut).toBe(1)
+
+      const verdict = db.prepare('SELECT pnl_gross FROM trader_verdicts WHERE decision_id=?').get('dec-c') as any
+      expect(verdict.pnl_gross).toBe(10)
+    })
+
+    it('position outage blocks new exposure while later phases still complete', async () => {
+      insertSignal(db, 'sig-poll')
+      vi.mocked(engineClient.getPositions!).mockRejectedValue(new Error('positions endpoint down'))
+      vi.mocked(autoDispatchPendingSignals).mockResolvedValueOnce([
+        { signalId: 'sig-poll', asset: 'AAPL', side: 'buy', action: 'executed', reason: 'committee approved' },
+      ])
+
+      // An executed decision must exist for runCloseOutSweep to even call getPositions.
+      db.prepare(`
+        INSERT INTO trader_decisions
+          (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+           committee_transcript_id, decided_at, status)
+        VALUES ('dec-x', 'sig-poll', 'buy', 'AAPL', 100, 'limit', 't', 0.7, NULL, 1000, 'executed')
+      `).run()
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.polled).toBe(true)
+      expect(result.sent).toBe(0)
+      expect(autoDispatchPendingSignals).not.toHaveBeenCalled()
+      expect(result.closedOut).toBe(0)
+    })
+  })
+
+  // Phase 5 Task 2 Dispatch C -- monitoring alerts wire-in (Phase 6).
+  //
+  // Each tick now runs four monitor checks after the weekly-report gate:
+  //   1. abstain digest      (read-only, recorded on fire)
+  //   2. sharpe flip         (self-records sign every tick)
+  //   3. coinbase health     (self-tracks first_down marker, recorded on fire)
+  //   4. NAV drop halt       (recorded on fire, also calls engineClient.haltEngine)
+  //
+  // Each check is wrapped in its own try/catch so one throwing check
+  // cannot starve the others.  Telegram emission is via deps.send (the
+  // same plain-text path the engine-halt alert uses).
+  describe('runTraderTick phase 6: monitoring alerts', () => {
+    function insertAbstain(
+      d: Database.Database,
+      idx: number,
+      asset = 'AAPL',
+      thesis = 'committee could not agree',
+    ) {
+      const sigId = `sig-ab-${idx}`
+      d.prepare(`
+        INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES (?, 'momentum-stocks', ?, 'buy', 0.5, 20, ?, 'decided')
+      `).run(sigId, asset, Date.now())
+      d.prepare(`
+        INSERT INTO trader_decisions
+          (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+           committee_transcript_id, decided_at, status)
+        VALUES (?, ?, 'abstain', ?, 0, 'none', ?, 0.1, NULL, ?, 'committee_abstain')
+      `).run(`dec-ab-${idx}`, sigId, asset, thesis, Date.now() - 1000)
+    }
+
+    function upsertTrack(d: Database.Database, strategyId: string, tradeCount: number, sharpe: number) {
+      d.prepare(`
+        INSERT INTO trader_strategy_track_record
+          (strategy_id, trade_count, win_count, rolling_sharpe,
+           avg_winner_pct, avg_loser_pct, max_dd_pct, net_pnl_usd, computed_at)
+        VALUES (?, ?, 0, ?, 0, 0, 0, 0, ?)
+        ON CONFLICT(strategy_id) DO UPDATE SET
+          trade_count = excluded.trade_count,
+          rolling_sharpe = excluded.rolling_sharpe,
+          computed_at = excluded.computed_at
+      `).run(strategyId, tradeCount, sharpe, Date.now())
+    }
+
+    it('abstain digest fires -> send called with message AND recordAlertFired row exists', async () => {
+      // 4 abstains in the past 24h, no prior alert row.
+      for (let i = 0; i < 4; i++) insertAbstain(db, i)
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result).toBeDefined()
+
+      // The abstain digest must have been sent via the plain-text channel.
+      const abstainCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('abstained'),
+      )
+      expect(abstainCalls.length).toBeGreaterThanOrEqual(1)
+
+      // Bookkeeping: the dedup row must now exist with a timestamp value.
+      const row = db
+        .prepare("SELECT last_alerted_at FROM trader_alert_state WHERE alert_id='abstain_digest'")
+        .get() as { last_alerted_at: number } | undefined
+      expect(row).toBeDefined()
+      expect(row!.last_alerted_at).toBeGreaterThan(Date.now() - 5 * 60 * 1000)
+    })
+
+    it('sharpe flip fires -> send called with the flip message', async () => {
+      // Active strategy with prior +1 sign and current -0.4 rolling_sharpe.
+      upsertTrack(db, 'momentum-stocks', 40, -0.4)
+      db.prepare(`
+        INSERT INTO trader_alert_state (alert_id, last_alerted_at)
+        VALUES ('sharpe_last_sign:momentum-stocks', 1)
+      `).run()
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      const flipCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('Sharpe flip'),
+      )
+      expect(flipCalls.length).toBe(1)
+      expect(flipCalls[0][0]).toContain('momentum-stocks')
+    })
+
+    it('coinbase outage past grace fires -> send called AND coinbase_alert row exists', async () => {
+      // Seed first_down 20 minutes ago so the 15-min grace has passed.
+      const twentyMinAgo = Date.now() - 20 * 60 * 1000
+      db.prepare(
+        "INSERT INTO trader_alert_state (alert_id, last_alerted_at) VALUES ('coinbase_first_down', ?)",
+      ).run(twentyMinAgo)
+
+      // Health says Coinbase is still down.
+      vi.mocked(engineClient.getHealth!).mockResolvedValue({
+        ...healthOk,
+        coinbase_connected: false,
+      })
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      const coinbaseCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('Coinbase connection down'),
+      )
+      expect(coinbaseCalls.length).toBe(1)
+
+      const row = db
+        .prepare("SELECT last_alerted_at FROM trader_alert_state WHERE alert_id='coinbase_alert'")
+        .get() as { last_alerted_at: number } | undefined
+      expect(row).toBeDefined()
+    })
+
+    it('NAV drop fires -> send called AND haltEngine called AND nav_drop_alert row exists', async () => {
+      const NOW = Date.now()
+      const DAY = 24 * 60 * 60 * 1000
+      // Snapshots: current 9400, 7-day-old 10000 -> 6% drop.
+      vi.mocked(engineClient.getNavSnapshots = vi.fn() as any).mockResolvedValue([
+        { date: '2026-04-19', period: 'day_open', nav: 9400, recorded_at: NOW },
+        { date: '2026-04-12', period: 'day_open', nav: 10000, recorded_at: NOW - 7 * DAY + 60_000 },
+      ])
+      const haltMock = vi.fn().mockResolvedValue({ status: 'halted' })
+      ;(engineClient as any).haltEngine = haltMock
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      // The Telegram alert and the engine halt call BOTH happen.
+      const navCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('NAV drop halt'),
+      )
+      expect(navCalls.length).toBe(1)
+      expect(navCalls[0][0]).toContain('10000.00')
+      expect(navCalls[0][0]).toContain('9400.00')
+      expect(haltMock).toHaveBeenCalledTimes(1)
+      expect(haltMock.mock.calls[0][0]).toContain('NAV drop halt')
+
+      // Bookkeeping: dedup row exists with a timestamp.
+      const row = db
+        .prepare("SELECT last_alerted_at FROM trader_alert_state WHERE alert_id='nav_drop_alert'")
+        .get() as { last_alerted_at: number } | undefined
+      expect(row).toBeDefined()
+      expect(row!.last_alerted_at).toBeGreaterThan(NOW - 5 * 60 * 1000)
+    })
+
+    it('a throwing monitor check does not stall the other checks', async () => {
+      // Force the coinbase getHealth to throw on the SECOND health call.
+      // Phase 0 already calls getHealth once (reconciler-halt check); the
+      // monitor calls it again.  Coinbase check swallows the throw and
+      // returns fire=false; abstain + sharpe + nav must still complete.
+      let healthCalls = 0
+      vi.mocked(engineClient.getHealth!).mockImplementation(async () => {
+        healthCalls++
+        if (healthCalls === 1) return healthOk  // phase 0 happy
+        throw new Error('health endpoint flaked')
+      })
+
+      // Seed conditions so the OTHER three checks would all fire.
+      for (let i = 0; i < 4; i++) insertAbstain(db, i)
+      upsertTrack(db, 'momentum-stocks', 40, -0.4)
+      db.prepare(`
+        INSERT INTO trader_alert_state (alert_id, last_alerted_at)
+        VALUES ('sharpe_last_sign:momentum-stocks', 1)
+      `).run()
+      const NOW = Date.now()
+      const DAY = 24 * 60 * 60 * 1000
+      vi.mocked(engineClient.getNavSnapshots = vi.fn() as any).mockResolvedValue([
+        { date: '2026-04-19', period: 'day_open', nav: 9400, recorded_at: NOW },
+        { date: '2026-04-12', period: 'day_open', nav: 10000, recorded_at: NOW - 7 * DAY + 60_000 },
+      ])
+      ;(engineClient as any).haltEngine = vi.fn().mockResolvedValue({ status: 'halted' })
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      // Abstain, sharpe, and NAV-drop alerts must all have fired even
+      // though the Coinbase check threw.
+      const messages = sendMock.mock.calls.map((c: unknown[]) => c[0] as string)
+      expect(messages.some((m: string) => m.includes('abstained'))).toBe(true)
+      expect(messages.some((m: string) => m.includes('Sharpe flip'))).toBe(true)
+      expect(messages.some((m: string) => m.includes('NAV drop halt'))).toBe(true)
+    })
+
+    it('when getEngineClient throws, abstain + sharpe still run; coinbase + NAV silently skip', async () => {
+      // Force the engine-client factory to throw so both network-dependent
+      // checks should be skipped in a single pass.  abstain + sharpe do
+      // not touch the engine at all and must still fire + send.  This
+      // also pins that we resolve the client ONCE per tick (rework fix
+      // from the Dispatch C code review -- previously there were two
+      // separate resolve-and-null-check blocks, one for each network
+      // check).
+      getEngineClientMock.mockImplementation(() => {
+        throw new Error('credentials not configured')
+      })
+
+      // Seed conditions so abstain + sharpe would both fire.
+      for (let i = 0; i < 4; i++) insertAbstain(db, i)
+      upsertTrack(db, 'momentum-stocks', 40, -0.4)
+      db.prepare(`
+        INSERT INTO trader_alert_state (alert_id, last_alerted_at)
+        VALUES ('sharpe_last_sign:momentum-stocks', 1)
+      `).run()
+
+      // These would fire if the engine calls actually ran.  Spy them so
+      // we can assert they never got invoked.
+      const getHealthSpy = vi.fn().mockResolvedValue({ ...healthOk, coinbase_connected: false })
+      const getNavSpy = vi.fn().mockResolvedValue([
+        { date: '2026-04-19', period: 'day_open', nav: 9400, recorded_at: Date.now() },
+        { date: '2026-04-12', period: 'day_open', nav: 10000, recorded_at: Date.now() - 7 * 24 * 60 * 60 * 1000 + 60_000 },
+      ])
+      const haltSpy = vi.fn().mockResolvedValue({ status: 'halted' })
+      ;(engineClient as any).getHealth = getHealthSpy
+      ;(engineClient as any).getNavSnapshots = getNavSpy
+      ;(engineClient as any).haltEngine = haltSpy
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      // Abstain + sharpe must have fired via deps.send.
+      const messages = sendMock.mock.calls.map((c: unknown[]) => c[0] as string)
+      expect(messages.some((m: string) => m.includes('abstained'))).toBe(true)
+      expect(messages.some((m: string) => m.includes('Sharpe flip'))).toBe(true)
+
+      // Coinbase + NAV must NOT have fired; no engine calls reached.
+      expect(messages.some((m: string) => m.includes('Coinbase connection down'))).toBe(false)
+      expect(messages.some((m: string) => m.includes('NAV drop halt'))).toBe(false)
+      expect(getHealthSpy).not.toHaveBeenCalled()
+      expect(getNavSpy).not.toHaveBeenCalled()
+      expect(haltSpy).not.toHaveBeenCalled()
+    })
+
+    it('haltEngine failure emits a follow-up Telegram notice', async () => {
+      const NOW = Date.now()
+      const DAY = 24 * 60 * 60 * 1000
+      vi.mocked(engineClient.getNavSnapshots = vi.fn() as any).mockResolvedValue([
+        { date: '2026-04-19', period: 'day_open', nav: 9400, recorded_at: NOW },
+        { date: '2026-04-12', period: 'day_open', nav: 10000, recorded_at: NOW - 7 * DAY + 60_000 },
+      ])
+      // Halt call throws.
+      ;(engineClient as any).haltEngine = vi.fn().mockRejectedValue(new Error('engine 503'))
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      // Two sends: the original NAV drop alert + the halt-failure follow-up.
+      const navCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) => typeof args[0] === 'string' && (args[0] as string).includes('NAV drop halt'),
+      )
+      expect(navCalls.length).toBe(1)
+
+      const followUpCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) =>
+          typeof args[0] === 'string' &&
+          (args[0] as string).includes('engine halt call failed'),
+      )
+      expect(followUpCalls.length).toBe(1)
+    })
+
+    it('resets zero-poll counter outside market hours so overnight silence does not trigger false drought at open', async () => {
+      vi.useFakeTimers()
+      // 2026-04-30 00:00 UTC = 2026-04-29 20:00 EDT -- outside NYSE 09:30-16:00 window
+      vi.setSystemTime(new Date('2026-04-30T00:00:00Z'))
+
+      // Engine is reachable but returns 0 signals (simulates post-market silence)
+      vi.mocked(engineClient.getSignals!).mockResolvedValue([])
+
+      // Run 15 ticks (> drought threshold of 12); all outside market hours.
+      // Each tick must reset the counter to 0 rather than increment it.
+      for (let i = 0; i < 15; i++) {
+        await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      }
+
+      // Counter must be 0 -- overnight silence must not carry into the next session.
+      expect(_getAndResetZeroPollCountForTest()).toBe(0)
+
+      // No drought alert should have been sent (market was closed for every tick).
+      const droughtCalls = sendMock.mock.calls.filter(
+        (args: unknown[]) =>
+          typeof args[0] === 'string' &&
+          (args[0] as string).includes('no signals for 1+ hour'),
+      )
+      expect(droughtCalls.length).toBe(0)
+    })
+  })
+
+  // Phase 6 Task 3 -- overlapping-tick concurrency guard.
+  //
+  // setInterval does not prevent tick overlap.  Two overlapping ticks
+  // in the monitor phase can duplicate Telegram sends (halt itself is
+  // idempotent engine-side).  The lock is a module-level boolean flag
+  // set at the top of runTraderTick and cleared in a finally block.
+  // A skipped tick returns a sentinel payload (all phase counters zero,
+  // skipped=true) and MUST NOT touch any phase.
+  describe('runTraderTick concurrency guard', () => {
+    it('skips a second tick while the first is still running', async () => {
+      // Block the first tick inside the signal-poll phase by making
+      // getSignals hang until we release it.  The second tick fires
+      // during that window and must return early with skipped=true.
+      let releaseFirst: () => void = () => {}
+      const firstBlocker = new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+
+      vi.mocked(engineClient.getSignals!).mockImplementation(async () => {
+        await firstBlocker
+        return []
+      })
+
+      const firstPromise = runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      // Yield so the first tick enters its phases before we fire the second.
+      await new Promise((resolve) => setImmediate(resolve))
+
+      const secondResult = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(secondResult.skipped).toBe(true)
+      expect(secondResult.polled).toBe(false)
+      expect(secondResult.sent).toBe(0)
+      expect(secondResult.reconcilerHalted).toBe(false)
+      expect(secondResult.closedOut).toBe(0)
+      expect(secondResult.weeklyReportFired).toBe(false)
+
+      // Core guarantee of the lock: nothing touched the Telegram channel
+      // for the skipped tick.  The first tick is still blocked on the
+      // getSignals hang, so any Telegram activity here would have come
+      // from the skipped second tick.
+      expect(sendMock).not.toHaveBeenCalled()
+
+      // Let the first tick finish cleanly.
+      releaseFirst()
+      const firstResult = await firstPromise
+      expect(firstResult.polled).toBe(true)
+      expect(firstResult.skipped).toBeFalsy()
+    })
+
+    it('allows a subsequent tick once the first has resolved', async () => {
+      const first = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(first.polled).toBe(true)
+      expect(first.skipped).toBeFalsy()
+
+      const second = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(second.polled).toBe(true)
+      expect(second.skipped).toBeFalsy()
+    })
+
+    it('runs a second tick cleanly after a tick where all phases errored', async () => {
+      // Every phase inside runTraderTick is wrapped in its own
+      // try/catch, so individual phase failures never propagate out of
+      // the tick.  That means we cannot inject a real throw through the
+      // outer try block without production-code changes, which are out
+      // of scope for this test.  What we CAN assert is the weaker but
+      // still meaningful guarantee: after a tick in which every phase's
+      // underlying engine call rejected, a follow-up tick still
+      // acquires the lock and runs normally.  The finally block in
+      // runTraderTick is insurance against a future regression that
+      // lets a throw escape a phase boundary.
+      vi.mocked(engineClient.getSignals!).mockRejectedValue(new Error('poll boom'))
+      vi.mocked(engineClient.getHealth!).mockRejectedValue(new Error('health boom'))
+
+      const first = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(first.skipped).toBeFalsy()
+
+      // Restore a happy engine for the second tick.
+      vi.mocked(engineClient.getSignals!).mockResolvedValue([])
+      vi.mocked(engineClient.getHealth!).mockResolvedValue(healthOk)
+
+      const second = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(second.skipped).toBeFalsy()
+      expect(second.polled).toBe(true)
+    })
+
+    it('logs info when a tick is skipped', async () => {
+      const infoSpy = vi.spyOn(loggerModule.logger, 'info')
+
+      let releaseFirst: () => void = () => {}
+      const firstBlocker = new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+      vi.mocked(engineClient.getSignals!).mockImplementation(async () => {
+        await firstBlocker
+        return []
+      })
+
+      const firstPromise = runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      await new Promise((resolve) => setImmediate(resolve))
+
+      await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+
+      const skipLog = infoSpy.mock.calls.find((args: unknown[]) => {
+        const message = typeof args[0] === 'string' ? args[0] : args[1]
+        return typeof message === 'string' && message.includes('Trader tick skipped')
+      })
+      expect(skipLog).toBeDefined()
+
+      releaseFirst()
+      await firstPromise
+      infoSpy.mockRestore()
+    })
+  })
+
+  describe('initTraderScheduler', () => {
+    it('runs an immediate tick on start', async () => {
+      insertSignal(db, 'sig-1')
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000, isMarketOpen: () => true })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(autoDispatchPendingSignals).toHaveBeenCalled()
+    })
+
+    it('does not start twice', async () => {
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+
+      // Assert one tick, independent of how many phases obtain the client.
+      expect(engineClient.getSignals).toHaveBeenCalledTimes(1)
+    })
+
+    it('stopTraderScheduler halts future ticks', async () => {
+      vi.useFakeTimers()
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 1000 })
+
+      // The initial tick fires synchronously at the end of
+      // initTraderScheduler and its runTraderTick awaits ~5 engine-
+      // client phases back-to-back.  A single advanceTimersByTimeAsync(0)
+      // flushes the timer queue plus one microtask batch, which does
+      // not walk the full await chain: if we capture the count before
+      // every phase has resolved, a later phase lands after the stop
+      // call and the assertion trips ("expected 5 to be 4").  Spin on
+      // a zero-time timer advance until the mock call count stops
+      // moving so countAfterInitial includes every call this tick is
+      // ever going to make.
+      await vi.advanceTimersByTimeAsync(0)
+      let prev = -1
+      while (prev !== getEngineClientMock.mock.calls.length) {
+        prev = getEngineClientMock.mock.calls.length
+        await vi.advanceTimersByTimeAsync(0)
+      }
+      const countAfterInitial = getEngineClientMock.mock.calls.length
+
+      stopTraderScheduler()
+      // Advance well past several tick intervals and drain any residual
+      // microtasks, then assert no further tick landed on top.
+      await vi.advanceTimersByTimeAsync(5000)
+      for (let i = 0; i < 20; i++) {
+        await Promise.resolve()
+      }
+
+      expect(getEngineClientMock.mock.calls.length).toBe(countAfterInitial)
+    })
+
+    it('revives engine_down decisions to retry_pending on startup', () => {
+      // Seed an engine_down decision (foreign_keys = OFF so signal_id can dangle).
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, submit_attempts)
+        VALUES ('d-down','s-ghost','buy','AAPL',150,'market','t',0.7,?, 'engine_down', 2)`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      const row = db.prepare("SELECT status FROM trader_decisions WHERE id='d-down'").get() as any
+      expect(row.status).toBe('retry_pending')
+    })
+
+    it('startup keeps a dispatching signal that already has a retry_pending decision', () => {
+      insertSignal(db, 'sig-parked')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-parked')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-parked', 'sig-parked', 'buy', 'AAPL', 150, 'market', 't', 0.7, ?, 'retry_pending')`).run(Date.now())
+      insertSignal(db, 'sig-orphan', 0.72, 'sell')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-orphan')
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-parked')).toEqual({ status: 'dispatching' })
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-orphan')).toEqual({ status: 'pending' })
+    })
+
+    it('startup keeps a dispatching signal whose decision is engine_down out of the fresh queue', () => {
+      insertSignal(db, 'sig-down')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-down')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-down', 'sig-down', 'buy', 'AAPL', 150, 'market', 't', 0.7, ?, 'engine_down')`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      // The retry path owns the revived decision; a pending signal would also dispatch a second order.
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-down')).toEqual({ status: 'dispatching' })
+      expect(db.prepare('SELECT status FROM trader_decisions WHERE id = ?').get('dec-down')).toEqual({ status: 'retry_pending' })
+    })
+
+    it('startup sends an orphan submitting decision to retry_pending and does not re-queue its signal', () => {
+      insertSignal(db, 'sig-inflight')
+      db.prepare("UPDATE trader_signals SET status = 'dispatching' WHERE id = ?").run('sig-inflight')
+      db.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+        VALUES ('dec-inflight', 'sig-inflight', 'buy', 'AAPL', 150, 'limit', 't', 0.7, ?, 'submitting')`).run(Date.now())
+
+      initTraderScheduler({ db, getEngineClient, send, tickMs: 60_000 })
+      stopTraderScheduler()
+
+      // The order may already be at the broker; the retry sweep checks GET /orders before any resend.
+      const dec = db.prepare('SELECT status, next_retry_at FROM trader_decisions WHERE id = ?').get('dec-inflight') as any
+      expect(dec.status).toBe('retry_pending')
+      expect(dec.next_retry_at).not.toBeNull()
+      expect(db.prepare('SELECT status FROM trader_signals WHERE id = ?').get('sig-inflight')).toEqual({ status: 'dispatching' })
+    })
+
+    it('exit sweep phase fires and counts exits when a position breaches its stop', async () => {
+      // Seed an open executed buy decision with a stop that the mock price will breach.
+      db.prepare(`INSERT INTO trader_signals
+        (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('s-exit','momentum-stocks','AAPL','buy',0.8,20,?,'executed')`).run(Date.now())
+      db.prepare(`INSERT INTO trader_decisions
+        (id,signal_id,action,asset,size_usd,entry_type,entry_price,stop_loss,take_profit,thesis,confidence,decided_at,status)
+        VALUES ('d-exit','s-exit','buy','AAPL',150,'market',100,92,116,'t',0.7,?,'executed')`).run(Date.now())
+
+      const submitDecision = vi.fn().mockResolvedValue({
+        client_order_id: 'x', broker_order_id: 'y', status: 'placed', approved_size_usd: 91,
+      })
+      // Override the shared engineClient mock for this test.
+      engineClient.getPositions = vi.fn().mockResolvedValue([
+        { asset: 'AAPL', qty: 1, avg_entry_price: 100, market_value: 91, unrealized_pnl: -9, source: 'broker', updated_at: Date.now() },
+      ])
+      engineClient.getPrices = vi.fn().mockResolvedValue([
+        { date: '2026-06-07', close: 91, ts_ms: Date.now() },
+      ])
+      engineClient.submitDecision = submitDecision
+
+      const result = await runTraderTick({ isMarketOpen: () => true, db, getEngineClient, send})
+      expect(result.exited).toBe(1)
+      expect(submitDecision.mock.calls.some((c: any[]) => c[0].side === 'sell')).toBe(true)
+    })
+  })
+})

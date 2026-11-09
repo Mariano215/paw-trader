@@ -1,0 +1,575 @@
+import type {
+  HealthResponse,
+  EnginePosition,
+  AdoptPositionResult,
+  CoverPaperShortResult,
+  EngineOrder,
+  ReconcileResult,
+  Candidate,
+  DecisionRequest,
+  DecisionStatus,
+  SubmitDecisionResult,
+  RiskState,
+  NavSnapshot,
+  NavPeriod,
+  PricePoint,
+  SignalTelemetrySummary,
+  MarkovRegimePayload,
+  BacktestResult,
+  BacktestGateReport,
+} from "./types.js";
+import { getCredential } from "../credentials.js";
+import { logger } from "../logger.js";
+
+/**
+ * Drop unusable price bars at the client boundary, before any caller sees them.
+ *
+ * Every price consumer (backtests, exit evaluation, entry reference price,
+ * enrichment) routes through EngineClient.getPrices, so one guard here covers
+ * all of them. A NaN or zero close silently poisons every downstream return
+ * calculation, and a duplicate timestamp double-counts a bar in any series
+ * walked in order.
+ *
+ * Rejects: non-finite or non-positive close, non-finite ts_ms, repeated ts_ms
+ * (first occurrence wins). Input order is preserved -- this filters, it does
+ * not sort, because callers already depend on the engine's ordering.
+ *
+ * ponytail: drops bad bars rather than throwing. A single corrupt bar in a
+ * multi-year window should not fail the whole fetch; the warn log is the
+ * signal that the feed needs looking at.
+ */
+export function sanitizePrices(points: PricePoint[], asset: string): PricePoint[] {
+  if (!Array.isArray(points)) return [];
+  const seen = new Set<number>();
+  const clean = points.filter((p) => {
+    if (p == null) return false;
+    if (!Number.isFinite(p.close) || p.close <= 0) return false;
+    if (!Number.isFinite(p.ts_ms)) return false;
+    if (seen.has(p.ts_ms)) return false;
+    seen.add(p.ts_ms);
+    return true;
+  });
+  const dropped = points.length - clean.length;
+  if (dropped > 0) {
+    logger.warn(
+      { asset, dropped, received: points.length },
+      "Engine price feed returned unusable bars, dropped at client boundary",
+    );
+  }
+  return clean;
+}
+
+export interface EngineClientOptions {
+  baseUrl: string;
+  token: string;
+  timeoutMs?: number;
+}
+
+/** Test doubles and rolling deployments may not expose getAllOrders yet. */
+export async function readCompleteOrderHistory(client: EngineClient): Promise<EngineOrder[]> {
+  const compatible = client as EngineClient & {getAllOrders?: () => Promise<EngineOrder[]>}
+  return typeof compatible.getAllOrders === 'function'
+    ? compatible.getAllOrders()
+    : client.getOrders()
+}
+
+export class EngineClient {
+  private readonly baseUrl: string;
+  private readonly token: string;
+  private readonly timeoutMs: number;
+
+  constructor(opts: EngineClientOptions) {
+    this.baseUrl = opts.baseUrl.replace(/\/$/, "");
+    this.token = opts.token;
+    this.timeoutMs = opts.timeoutMs ?? 10_000;
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const url = this.baseUrl + path;
+    const isGet = !init?.method || init.method.toUpperCase() === "GET";
+    // ponytail: retry only GET requests on network errors (2 retries, 1s/2s backoff).
+    // POST/PUT are not retried -- double-submitting a decision would place duplicate orders.
+    // HTTP errors (4xx/5xx) are never retried -- they're deterministic failures.
+    const maxAttempts = isGet ? 3 : 1;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, attempt * 1000));
+      let resp: Response;
+      try {
+        resp = await fetch(url, {
+          ...init,
+          headers: {
+            "X-Engine-Token": this.token,
+            "Content-Type": "application/json",
+            ...(init?.headers ?? {}),
+          },
+          signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxAttempts - 1) {
+          logger.warn({ path, attempt, err }, "engine-client: network error, retrying");
+        }
+        continue;
+      }
+      if (!resp.ok) {
+        // Capture response body so 4xx validation errors and 5xx engine errors
+        // surface their actual cause in logs. Without this every failure shows
+        // up as a bare status code; tracking down a 422 takes a manual curl.
+        let body = "";
+        try {
+          body = await resp.text();
+        } catch {
+          body = "<unable to read response body>";
+        }
+        const trimmed = body.length > 800 ? body.slice(0, 800) + "...(truncated)" : body;
+        throw new Error(
+          "Engine API error " + resp.status + " on " + path + " :: " + trimmed,
+        );
+      }
+      return resp.json() as Promise<T>;
+    }
+    throw lastErr instanceof Error ? lastErr : new Error("Engine fetch failed: " + path);
+  }
+
+  /**
+   * Shared null-on-404-or-network-error fetch helper.  Returns the parsed
+   * JSON body on 2xx, null on 404, null on network error / fetch timeout,
+   * and throws "Engine API error NNN" on any other non-2xx so real engine
+   * outages still surface.  Used by getHealth, getNav and getNavSnapshots
+   * (Phase 6 Task 4).  Callers that need an empty-array fallback coerce
+   * null to [] at the call site; keeping a single helper means only one
+   * error path to reason about.
+   */
+  private async requestNullable<T>(path: string, init?: RequestInit): Promise<T | null> {
+    const url = this.baseUrl + path;
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        ...init,
+        headers: {
+          "X-Engine-Token": this.token,
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {}),
+        },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch {
+      return null;
+    }
+    if (resp.status === 404) return null;
+    if (!resp.ok) {
+      throw new Error("Engine API error " + resp.status + " on " + path);
+    }
+    return (await resp.json()) as T | null;
+  }
+
+  /**
+   * Reachability probe: true when the engine answered with ANY HTTP status
+   * (200, 401, 404 all count), false when the socket never produced a
+   * response inside the timeout.
+   *
+   * This exists because getHealth collapses "route 404s" and "fetch timed
+   * out" into the same null.  A wedged engine -- one whose event loop is
+   * blocked, so the port stays in LISTEN but nothing is ever served --
+   * therefore looked identical to a healthy tick, which reset the failure
+   * counter and meant the auto-restart never fired.  A 13h outage on
+   * 2026-07-20 went unrecovered for exactly that reason.
+   *
+   * Deliberately unauthenticated-safe: a 401 proves the process is alive
+   * and serving, which is all a watchdog needs to know.
+   */
+  async pingHealth(): Promise<boolean> {
+    try {
+      await fetch(this.baseUrl + "/health", {
+        headers: { "X-Engine-Token": this.token },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Phase 5 Task 2c -- returns the full health body (including
+   * coinbase_connected) or null when the engine route 404s / the fetch
+   * times out.  Mirrors the getNav pattern: null when the endpoint is
+   * genuinely absent (older engine), throws on other non-2xx so real
+   * engine issues still bubble up.  The monitor's Coinbase check treats
+   * null and thrown errors as "engine issue, not a Coinbase-specific
+   * outage" per the Phase 5 handoff.
+   *
+   * Phase 5 Task 2 Dispatch C -- return type tightened to
+   * Promise<HealthResponse | null>.  HealthResponse keeps coinbase_connected
+   * optional so an older engine (which omits the field) still type-checks.
+   *
+   * Phase 6 Task 4 -- fetch plumbing delegated to requestNullable<T>.
+   * The body normalization (tri-state coinbase_connected) stays inline.
+   */
+  async getHealth(): Promise<HealthResponse | null> {
+    const body = await this.requestNullable<Partial<HealthResponse>>("/health");
+    if (body == null) return null;
+    // Preserve the tri-state on coinbase_connected: true/false if the
+    // engine reports it, undefined if the engine is pre-2c and doesn't
+    // expose the field.  Collapsing undefined to false here would make
+    // `evaluateAndRecordCoinbaseHealth` fire a false outage alert the
+    // first time this bot talks to an older engine build.
+    return {
+      status: String(body.status ?? ""),
+      version: String(body.version ?? ""),
+      alpaca_connected: body.alpaca_connected === true,
+      alpaca_mode: String(body.alpaca_mode ?? "unknown"),
+      reconciler_halted: body.reconciler_halted === true,
+      halt_reason: body.halt_reason ?? null,
+      coinbase_connected: typeof body.coinbase_connected === "boolean"
+        ? body.coinbase_connected
+        : undefined,
+      crypto_enabled: typeof body.crypto_enabled === "boolean"
+        ? body.crypto_enabled
+        : undefined,
+    };
+  }
+
+  async getPositions(): Promise<EnginePosition[]> {
+    return this.request<EnginePosition[]>("/positions");
+  }
+
+  /**
+   * POST /positions/{asset}/adopt-from-broker
+   * Pulls the broker-side position for `asset` into the local engine DB and
+   * writes a clean reconcile log row.  Use to clear a reconciler halt caused
+   * by "broker shows qty=X but local has no record".
+   */
+  async adoptBrokerPosition(asset: string): Promise<AdoptPositionResult> {
+    return this.request<AdoptPositionResult>(
+      `/positions/${encodeURIComponent(asset)}/adopt-from-broker`,
+      { method: "POST" },
+    );
+  }
+
+  /** Paper-only, idempotent cover for an unexpected stock short. */
+  async coverPaperShort(asset: string): Promise<CoverPaperShortResult> {
+    return this.request<CoverPaperShortResult>(
+      `/positions/${encodeURIComponent(asset)}/cover-paper-short`,
+      {method: 'POST'},
+    )
+  }
+
+  async getOrders(): Promise<EngineOrder[]> {
+    return this.request<EngineOrder[]>("/orders");
+  }
+
+  /**
+   * Read complete order history from paginated engines. An older engine ignores
+   * the query and returns its legacy 100-row page; that short page terminates
+   * the loop safely and preserves backward compatibility during rollout.
+   */
+  async getAllOrders(pageSize = 500, maxOrders = 20_000): Promise<EngineOrder[]> {
+    const orders: EngineOrder[] = []
+    const seen = new Set<string>()
+    for (let offset = 0; offset < maxOrders; offset += pageSize) {
+      const page = await this.request<EngineOrder[]>(`/orders?limit=${pageSize}&offset=${offset}`)
+      let added = 0
+      for (const order of page) {
+        const key = order.client_order_id
+        if (seen.has(key)) continue
+        seen.add(key)
+        orders.push(order)
+        added++
+      }
+      if (page.length < pageSize || added === 0) break
+    }
+    return orders
+  }
+
+  async getReconcileLast(): Promise<ReconcileResult> {
+    return this.request<ReconcileResult>("/reconcile/last");
+  }
+
+  /** @deprecated Use haltEngine() which returns status. Kept for Phase 0 compatibility. */
+  async haltTrading(reason: string): Promise<void> {
+    await this.haltEngine(reason);
+  }
+
+  async getSignals(minutes = 30): Promise<Candidate[]> {
+    return this.request<Candidate[]>(`/signals/recent?minutes=${minutes}`);
+  }
+
+  async submitDecision(decision: DecisionRequest): Promise<SubmitDecisionResult> {
+    // 30s timeout: engine makes an outbound Alpaca price-fetch when entry_price=0,
+    // which can exceed the default 10s under API latency.
+    return this.request<SubmitDecisionResult>("/decisions/submit", {
+      method: "POST",
+      body: JSON.stringify(decision),
+      signal: AbortSignal.timeout(30_000),
+    });
+  }
+
+  async getDecisionStatus(clientOrderId: string): Promise<DecisionStatus> {
+    return this.request<DecisionStatus>(`/decisions/${clientOrderId}/status`);
+  }
+
+  async getRiskState(): Promise<RiskState> {
+    return this.request<RiskState>("/risk/state");
+  }
+
+  /**
+   * POST /risk/halt with the supplied reason.  Throws on any non-2xx so a
+   * halt failure is loud (no retries -- if the engine is unreachable when
+   * the NAV-drop monitor wants to halt, the operator hears about it).
+   *
+   * Phase 5 Task 2 Dispatch C -- the NAV-drop monitor uses this directly.
+   * The legacy haltTrading() shim (kept for Phase 0 compatibility) still
+   * delegates here, so older callers keep working.
+   */
+  async haltEngine(reason: string): Promise<{ status: string }> {
+    return this.request<{ status: string }>("/risk/halt", {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    });
+  }
+
+  async clearCircuitBreaker(rule: string): Promise<{ status: string }> {
+    return this.request<{ status: string }>("/risk/clear", {
+      method: "POST",
+      body: JSON.stringify({ rule }),
+    });
+  }
+
+  /** POST /risk/clear-halt — clears the reconciler halt flag on the engine. */
+  async clearReconcilerHalt(): Promise<{ status: string }> {
+    return this.request<{ status: string }>("/risk/clear-halt", {
+      method: "POST",
+    });
+  }
+
+  /**
+   * GET /nav/snapshots?limit=N.  Returns the snapshot array on 2xx, an
+   * empty array on 404 (older engine builds without the route), and an
+   * empty array on a network error / fetch timeout.  Any other non-2xx
+   * still throws "Engine API error NNN" so a real engine outage is loud.
+   *
+   * The empty-array-on-failure semantic is intentionally different from
+   * getHealth / getNav (which return null).  Callers iterate the result
+   * directly; an empty list is more useful than a null guard.  See
+   * Phase 5 Task 2 Dispatch C handoff for the rationale.
+   *
+   * Phase 6 Task 4 -- fetch plumbing delegated to requestNullable<T>.
+   * The null -> [] coercion stays here so callers keep the iterable shape.
+   */
+  async getNavSnapshots(limit = 30): Promise<NavSnapshot[]> {
+    const body = await this.requestNullable<NavSnapshot[]>(`/nav/snapshots?limit=${limit}`);
+    return Array.isArray(body) ? body : [];
+  }
+
+  async getNavLatest(period: NavPeriod = "day_open"): Promise<NavSnapshot | null> {
+    return this.request<NavSnapshot | null>(`/nav/latest?period=${period}`);
+  }
+
+  /**
+   * Phase 5 Task 1 -- return the bare NAV number from the day_open
+   * snapshot for dispatcher cap computation. Returns null when the
+   * engine has no snapshot yet (first boot) or when the route 404s
+   * (older engine builds that predate /nav). Callers treat null as
+   * "fall back to DEFAULT_SIZE_USD" so a missing NAV never blocks
+   * trading entirely.
+   *
+   * Phase 6 Task 4 -- fetch plumbing delegated to requestNullable<T>.
+   * This tightens the contract to also return null on network error
+   * (previously threw).  The dispatcher already catches getNav throws
+   * and falls back to DEFAULT_SIZE_USD (see Phase 5 Task 1 handoff),
+   * so callers are unaffected.
+   */
+  async getNav(): Promise<number | null> {
+    const body = await this.requestNullable<{ nav?: number }>("/nav/latest?period=day_open");
+    if (body == null) return null;
+    return typeof body.nav === "number" ? body.nav : null;
+  }
+
+  /**
+   * Fetch daily closes for `asset` in [fromMs, toMs]. Returns an empty
+   * array when the engine has no bars in the window (the engine returns
+   * a 404 in that case, which we convert to [] so callers can treat
+   * "no data" the same way regardless of cause).
+   *
+   * Other non-2xx responses still throw the standard
+   * "Engine API error NNN" so real engine outages surface clearly.
+   *
+   * Response shape: PricePoint[]. Confirmed against engine
+   * src/trader_engine/api/routes/prices.py.
+   */
+  /**
+   * Trade-level backtest of the live momentum rule.
+   *
+   * Slow by design (refetches years of daily bars and walks them), so this is
+   * NOT on the tick path. The go-live gate calls it weekly and caches.
+   *
+   * Response shape: BacktestResult. Confirmed against engine
+   * src/trader_engine/api/routes/backtest.py.
+   */
+  async getMomentumBacktest(days = 1260): Promise<BacktestResult> {
+    // 120s signal: the simulation walks ~5 years x 12 assets bar by bar and
+    // the default 10s client timeout would abort it every time.
+    return this.request<BacktestResult>(
+      `/backtest/momentum?days=${days}`,
+      { signal: AbortSignal.timeout(120_000) },
+    );
+  }
+
+  /** Engine-side sweep + walk-forward report written by scripts/run_backtest_gate.py. */
+  async getBacktestReport(): Promise<BacktestGateReport> {
+    return this.request<BacktestGateReport>('/backtest/report');
+  }
+
+  /** Historical simulation of the live mean-reversion rule; horizon override is a sensitivity study. */
+  async getMeanReversionBacktest(days = 1260, horizonDays?: number): Promise<BacktestResult> {
+    const qs = `days=${days}` + (horizonDays != null ? `&horizon_days=${horizonDays}` : '');
+    return this.request<BacktestResult>(
+      `/backtest/mean-reversion?${qs}`,
+      { signal: AbortSignal.timeout(120_000) },
+    );
+  }
+
+  /** Frozen BTC/USD hourly pullback simulation. Never called on the trade tick. */
+  async getCryptoHourlyMeanReversionBacktest(hours = 8_760): Promise<BacktestResult> {
+    if (!Number.isInteger(hours) || hours < 500 || hours > 43_800) {
+      throw new Error('crypto backtest hours must be an integer from 500 to 43800')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-hourly-mean-reversion?hours=${hours}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
+  /** Deployed BTC-only daily breakout simulation. Never called on the trade tick. */
+  async getCryptoMomentumBacktest(days = 1_825): Promise<BacktestResult> {
+    if (!Number.isInteger(days) || days < 300 || days > 5_000) {
+      throw new Error('crypto momentum backtest days must be an integer from 300 to 5000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-momentum?days=${days}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
+  /** Vol-targeted BTC+ETH daily breakout simulation. Never called on the trade tick. */
+  async getCryptoMomentumVtBacktest(days = 1_825): Promise<BacktestResult> {
+    if (!Number.isInteger(days) || days < 300 || days > 5_000) {
+      throw new Error('crypto momentum vt backtest days must be an integer from 300 to 5000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-momentum-vt?days=${days}`,
+      { signal: AbortSignal.timeout(180_000) },
+    )
+  }
+
+  /** Frozen BTC/USD four-hour trend simulation. */
+  async getCryptoFourHourTrendBacktest(periods = 10_950): Promise<BacktestResult> {
+    if (!Number.isInteger(periods) || periods < 1_000 || periods > 12_000) {
+      throw new Error('crypto 4h backtest periods must be an integer from 1000 to 12000')
+    }
+    return this.request<BacktestResult>(
+      `/backtest/crypto-4h-trend?periods=${periods}`,
+      { signal: AbortSignal.timeout(300_000) },
+    )
+  }
+
+  async getPrices(asset: string, fromMs: number, toMs: number): Promise<PricePoint[]> {
+    const url = this.baseUrl + `/prices/${encodeURIComponent(asset)}?from_ms=${fromMs}&to_ms=${toMs}`;
+    const resp = await fetch(url, {
+      headers: {
+        "X-Engine-Token": this.token,
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (resp.status === 404) {
+      // Engine signals "no data in this window" with 404. Treat as empty.
+      return [];
+    }
+    if (!resp.ok) {
+      throw new Error(
+        "Engine API error " + resp.status + " on /prices/" + asset,
+      );
+    }
+    return sanitizePrices((await resp.json()) as PricePoint[], asset);
+  }
+
+  /**
+   * Phase 8C -- fetch pre-aggregated signal telemetry for the Analyst Paw.
+   * Calls GET /signals/telemetry?days=N on the engine and returns the
+   * summary JSON: regime distribution, per-strategy fire/suppress stats,
+   * and consecutive near-miss sequences.
+   *
+   * Returns null when the engine is unreachable or returns 404 (older
+   * engine builds that predate the telemetry route).  The collector
+   * treats null as a non-fatal collection error so the paw cycle still
+   * runs and the LLM can flag the data gap in its report.
+   */
+  async getSignalTelemetry(days = 7): Promise<SignalTelemetrySummary | null> {
+    return this.requestNullable<SignalTelemetrySummary>(
+      `/signals/telemetry?days=${days}`,
+    )
+  }
+
+  /**
+   * GET /signals/markov/{asset} -- Markov-chain regime payload for enrichment.
+   * The asset segment is URI-encoded so BTC/USD becomes BTC%2FUSD on the wire
+   * while FastAPI's `path` converter decodes it back to BTC/USD server-side.
+   *
+   * Hard 5 s timeout -- Markov computation is fast but we cannot let a hung
+   * engine stall the enrichment pipeline.  Returns null on ANY error (network,
+   * 4xx, 5xx, timeout, parse failure) so callers always get a result even when
+   * the regime endpoint is unavailable.
+   *
+   * backtest=false skips the walk-forward backtest (~1.5 s saved per call);
+   * the nightly job refreshes walk-forward results independently.
+   */
+  async getMarkovRegime(asset: string): Promise<MarkovRegimePayload | null> {
+    const path = `/signals/markov/${encodeURIComponent(asset)}?backtest=false&window=20&threshold=0.02`;
+    const url = this.baseUrl + path;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          'X-Engine-Token': this.token,
+          'Content-Type': 'application/json',
+        },
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        logger.warn({ asset, status: resp.status }, 'enrichment: markov regime fetch non-2xx');
+        return null;
+      }
+      return (await resp.json()) as MarkovRegimePayload;
+    } catch (err) {
+      logger.warn({ asset, err }, 'enrichment: markov regime fetch failed');
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+let _engineInstance: EngineClient | null = null
+
+export function getEngineClient(): EngineClient {
+  if (!_engineInstance) {
+    const url = getCredential('trader', 'engine', 'url')
+    const token = getCredential('trader', 'engine', 'token')
+    if (!url || !token) {
+      throw new Error('Trader engine credentials not configured. Run: cred-cli set trader engine url <url>')
+    }
+    _engineInstance = new EngineClient({ baseUrl: url, token })
+  }
+  return _engineInstance
+}
+
+/** Returns the engine base URL from credentials (e.g. "http://100.x.x.x:8200"). */
+export function getEngineBaseUrl(): string {
+  const url = getCredential('trader', 'engine', 'url')
+  if (!url) throw new Error('Trader engine URL not configured')
+  return url
+}

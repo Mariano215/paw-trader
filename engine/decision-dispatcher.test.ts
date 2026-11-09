@@ -1,0 +1,1509 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+
+// Mock config to disable bypass for tests that exercise the committee path.
+// Bypass-gates tests live in decision-dispatcher.bypass.test.ts with their own mock.
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../config.js')>('../config.js')
+  return {
+    ...actual,
+    TRADER_COMMITTEE_BYPASS: false,
+    TRADER_BYPASS_TRADE_TARGET: 20,
+    TRADER_DAILY_TRADE_CAP: 20,
+  }
+})
+
+// Equity signals only dispatch inside the session they were generated in.
+// Pin the session check open so this suite does not change after 16:00 ET;
+// the session tests below restore the real clock check.
+vi.mock('./signal-poller.js', async () => {
+  const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+  return { ...actual, isEquityMarketHours: vi.fn(() => true) }
+})
+
+import Database from 'better-sqlite3'
+import { initTraderTables } from './db.js'
+import { seedMomentumStrategy } from './strategy-manager.js'
+import { dispatchApproval, autoDispatchPendingSignals } from './decision-dispatcher.js'
+import { HARD_CEILING_USD } from './trader-constants.js'
+import type { EngineClient } from './engine-client.js'
+import type { CommitteeResult, CommitteeSignalInput } from './committee.js'
+import type { LadderResult } from './autonomy-ladder.js'
+import { activateCohort, createDraftCohort, COHORT_ENFORCEMENT_KV_KEY } from './evaluation-cohort.js'
+import { isEquityMarketHours } from './signal-poller.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
+import { computeExits } from './exit-calculator.js'
+
+function makeDb() {
+  const db = new Database(':memory:')
+  db.pragma('foreign_keys = OFF')
+  initTraderTables(db)
+  seedMomentumStrategy(db)
+  return db
+}
+
+function insertSignal(db: Database.Database): string {
+  const id = 'sig-dispatch-1'
+  db.prepare(`
+    INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, 'momentum-stocks', 'AAPL', 'buy', 0.72, 20, Date.now(), 'committee')
+  return id
+}
+
+/**
+ * Default-tier stub: tier-1 with full scale. Existing dispatcher tests
+ * rely on the committee's chosen size making it through unchanged; the
+ * autonomy ladder adds scaling that would otherwise break those size
+ * assertions. Phase 3 Task 5 adds dedicated ladder tests that exercise
+ * cold-start + tier-0 paths explicitly.
+ */
+const tier1: LadderResult = { tier: 'tier-1', scale: 1.0, reason: 'test default' }
+const tierStub = (): LadderResult => tier1
+
+/** Stub committee returning a high-confidence approve result. */
+function makeApproveCommittee(sizeUsd = 150): (s: CommitteeSignalInput) => Promise<CommitteeResult> {
+  return async (s) => ({
+    decision: 'approve',
+    action: s.side,
+    thesis: 'Stub approve: strong momentum + risk clear.',
+    confidence: 0.78,
+    size_usd: sizeUsd,
+    transcript_id: 'tr-test-approve',
+    transcript: {
+      signal_id: s.id,
+      started_at: Date.now(),
+      finished_at: Date.now(),
+      rounds_executed: 1,
+      round_1: [],
+      risk_officer: { role: 'risk_officer', veto: false, reason: 'clear', concerns: [] },
+      trader: { role: 'trader', action: s.side, thesis: 'ok', confidence: 0.78, size_multiplier: 1.5 },
+      errors: [],
+    },
+  })
+}
+
+function makeAbstainCommittee(reason = 'Risk officer veto: late-cycle crowded trade.') {
+  return async (s: CommitteeSignalInput): Promise<CommitteeResult> => ({
+    decision: 'abstain',
+    action: null,
+    thesis: reason,
+    confidence: 0,
+    size_usd: 0,
+    transcript_id: 'tr-test-abstain',
+    transcript: {
+      signal_id: s.id,
+      started_at: Date.now(),
+      finished_at: Date.now(),
+      rounds_executed: 1,
+      round_1: [],
+      risk_officer: { role: 'risk_officer', veto: true, reason, concerns: [] },
+      trader: { role: 'trader', action: 'abstain', thesis: reason, confidence: 0, size_multiplier: 0 },
+      errors: [],
+    },
+  })
+}
+
+describe('decision-dispatcher', () => {
+  let db: ReturnType<typeof makeDb>
+  let mockClient: Partial<EngineClient>
+
+  beforeEach(() => {
+    db = makeDb()
+    // Phase 5 Task 1 -- per-strategy live cap. Default getNav to null
+    // so pre-existing tests fall back to DEFAULT_SIZE_USD (200) as
+    // their cap. Cap tests override getNav explicitly to exercise
+    // the NAV fallback and $1000 hard ceiling paths.
+    mockClient = {
+      submitDecision: vi.fn(),
+      getRiskState: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(null),
+      // Default: no open positions, so the cluster gate is a no-op for all
+      // existing tests that don't exercise cluster-cap suppression.
+      getPositions: vi.fn().mockResolvedValue([]),
+    }
+  })
+
+  it('dispatches APPROVE to engine and stores trader_decisions row (committee approve path)', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-1', broker_order_id: 'boid-1', status: 'placed', approved_size_usd: 150,
+    })
+    const msg = await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
+    )
+    expect(msg).toContain('placed')
+    const row = db.prepare("SELECT * FROM trader_decisions WHERE signal_id = ?").get(signalId) as any
+    expect(row).not.toBeNull()
+    expect(row.status).toBe('submitted')
+    expect(row.thesis).toContain('Stub approve')
+    expect(row.committee_transcript_id).toBe('tr-test-approve')
+  })
+
+  it('auto-dispatch lands a submitted (not executed) decision after engine ACK', async () => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-auto-1', 'momentum-stocks', 'MSFT', 'buy', 0.7, 20, ?, 'pending')
+    `).run(Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-9', broker_order_id: 'boid-9', status: 'placed', approved_size_usd: 150,
+    })
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: makeApproveCommittee(150) },
+      mockClient as EngineClient,
+    )
+    const row = db.prepare("SELECT status, engine_order_id FROM trader_decisions WHERE signal_id = 'sig-auto-1'").get() as any
+    expect(row.status).toBe('submitted')
+    expect(row.engine_order_id).toBe('boid-9')
+    const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(payload.entry_type).toBe('limit')
+    expect((db.prepare("SELECT entry_type FROM trader_decisions WHERE signal_id = 'sig-auto-1'").get() as any).entry_type).toBe('limit')
+  })
+
+  it.each([
+    ['MSFT', 0],       // equity: wire price 0, engine limits at the live quote
+    ['BTC/USD', 100],  // crypto: unchanged, limit at the reference price
+  ])('auto-dispatch %s sends limit at wire price %s with prior-close exits', async (asset, wirePrice) => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES ('sig-wire', 'momentum-stocks', ?, 'buy', 0.7, 20, ?, ?, 'pending')
+    `).run(asset, JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 }), Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-w', broker_order_id: 'boid-w', status: 'placed', approved_size_usd: 150,
+    })
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: makeApproveCommittee(150) },
+      mockClient as EngineClient,
+    )
+    const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(payload.entry_type).toBe('limit')
+    expect(payload.entry_price).toBe(wirePrice)
+    const exits = computeExits({ side: 'buy', entryPrice: 100, horizonDays: 20,
+      enrichment: JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 }) })
+    expect(payload.stop_loss).toBe(exits.stopLoss)
+    expect(payload.take_profit).toBe(exits.takeProfit)
+    // The row keeps the prior-close reference for exits, retry checks and audit.
+    expect((db.prepare("SELECT entry_price FROM trader_decisions WHERE signal_id = 'sig-wire'").get() as any).entry_price).toBe(100)
+  })
+
+  it('auto-dispatch fails closed before committee work when broker positions are unavailable', async () => {
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-no-positions', 'momentum-stocks', 'MSFT', 'buy', 0.7, 20, ?, 'pending')
+    `).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee(150))
+    vi.mocked(mockClient.getPositions!).mockRejectedValue(new Error('position feed unavailable'))
+
+    await autoDispatchPendingSignals(
+      db,
+      { send: async () => {}, runCommittee: committee },
+      mockClient as EngineClient,
+    )
+
+    expect(committee).not.toHaveBeenCalled()
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-no-positions'").get() as any).status).toBe('pending')
+  })
+
+  it('blocks auto-dispatch before committee when cohort enforcement has no running cohort', async () => {
+    db.exec('CREATE TABLE kv_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+    db.prepare("INSERT OR REPLACE INTO kv_settings (key,value) VALUES (?, '1')").run(COHORT_ENFORCEMENT_KV_KEY)
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-no-cohort','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-no-cohort'").get() as {status:string}).status)
+      .toBe('suppressed_no_running_cohort')
+  })
+
+  it('labels an asset outside the running cohort universe distinctly from no cohort', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-narrow', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-narrow', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-outside','momentum-stocks','IEF','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-outside'").get() as {status:string}).status)
+      .toBe('suppressed_outside_cohort_universe')
+    expect((db.prepare("SELECT reason FROM trader_signal_suppressions WHERE signal_id='sig-outside'").get() as {reason:string}).reason)
+      .toBe('outside_cohort_universe')
+  })
+
+  it('caps a cohort at ten concurrent open positions, the backtest slot count', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-slots', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL','MSFT'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-slots', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    // Ten open entries decided on earlier days, so the daily cap does not fire first.
+    for (let i = 0; i < 10; i++) {
+      db.prepare(`INSERT INTO trader_decisions (id,signal_id,action,asset,size_usd,entry_type,thesis,confidence,decided_at,status,cohort_id)
+        VALUES (?,?,'buy',?,200,'market','t',0.7,1,'executed','stocks-paper-slots')`).run(`open-${i}`, `s-open-${i}`, `X${i}`)
+    }
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-slot','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    const committee = vi.fn(makeApproveCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_signals WHERE id='sig-slot'").get() as {status:string}).status)
+      .toBe('suppressed_cohort_max_positions')
+
+    // A closed entry frees its slot.
+    db.prepare("UPDATE trader_decisions SET status='closed' WHERE id='open-0'").run()
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-slot2','momentum-stocks','MSFT','buy',0.8,20,?,'pending')`).run(Date.now())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not run the Markov pre-gate on rsi2 or ibs signals (bear regime is their entry)', async () => {
+    const now = Date.now()
+    for (const id of ['rsi2-stocks', 'ibs-stocks']) {
+      db.prepare(`INSERT INTO trader_strategies (id,name,asset_class,tier,status,params_json,created_at,updated_at)
+        VALUES (?,?,'stocks',1,'active','{}',?,?)`).run(id, id, now, now)
+    }
+    const bear = JSON.stringify({markov_regime: {markov_signal: -0.5}})
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES ('sig-rsi2','rsi2-stocks','AAPL','buy',0.3,10,?,?,'pending')`).run(bear, now)
+    db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES ('sig-ibs','ibs-stocks','MSFT','buy',0.3,3,?,?,'pending')`).run(bear, now)
+    const committee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: committee}, mockClient as EngineClient)
+    expect(committee).toHaveBeenCalledTimes(2)
+    const statuses = db.prepare("SELECT status FROM trader_signals WHERE id IN ('sig-rsi2','sig-ibs')").all() as Array<{status: string}>
+    expect(statuses.every(r => r.status !== 'suppressed_markov_gate')).toBe(true)
+  })
+
+  it('attributes every submitted auto decision to the running frozen cohort', async () => {
+    createDraftCohort(db, {
+      id:'stocks-paper-test', strategyId:'momentum-stocks', assetClass:'stocks',
+      universe:['AAPL'], dataVenue:'alpaca', executionVenue:'alpaca',
+      feeBpsPerSide:0, slippageBpsPerSide:5, benchmarkAsset:'SPY',
+      maxPositionUsd:200, dailyTradeCap:5,
+      claudepawRevision:'3f9b897', engineRevision:'4656022',
+    })
+    activateCohort(db, 'stocks-paper-test', {
+      engineMode:'paper', brokerConnected:true, dataVenueConnected:true, assetClassEnabled:true,
+      reconcilerHalted:false, reconcileDriftDetected:false, reconcileFresh:true,
+      ordersAvailable:true, positionsAvailable:true, openOrderCount:0,
+      conflictingPositionCount:0, unknownOrderCount:0, unexpectedShortCount:0,
+      quarantineLegacyPositions:true,
+    }, 'test')
+    db.prepare(`INSERT INTO trader_signals
+      (id,strategy_id,asset,side,raw_score,horizon_days,generated_at,status)
+      VALUES ('sig-cohort','momentum-stocks','AAPL','buy',0.8,20,?,'pending')`).run(Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id:'cohort-client', broker_order_id:'cohort-broker', status:'placed', approved_size_usd:150,
+    })
+    await autoDispatchPendingSignals(db, {send: async () => {}, runCommittee: makeApproveCommittee(150)}, mockClient as EngineClient)
+    expect((db.prepare("SELECT status,cohort_id FROM trader_decisions WHERE signal_id='sig-cohort'").get() as
+      {status:string; cohort_id:string})).toEqual({status:'submitted', cohort_id:'stocks-paper-test'})
+  })
+
+  it('passes committee-sized amount to the engine (not Phase-1 default) when committee returns size_usd', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-2', broker_order_id: 'boid-2', status: 'placed', approved_size_usd: 150,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(150)
+    expect(submitCall.confidence).toBe(0.78)
+  })
+
+  it('records committee_abstain decision and does not call engine when committee abstains', async () => {
+    const signalId = insertSignal(db)
+    const msg = await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeAbstainCommittee('Risk veto: pending earnings.') },
+    )
+    expect(msg).toContain('abstained')
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    const row = db.prepare("SELECT * FROM trader_decisions WHERE signal_id = ?").get(signalId) as any
+    expect(row.status).toBe('committee_abstain')
+    expect(row.size_usd).toBe(0)
+    expect(row.committee_transcript_id).toBe('tr-test-abstain')
+    const suppression = db.prepare(`
+      SELECT reason FROM trader_signal_suppressions
+      WHERE strategy_id = 'momentum-stocks' AND asset = 'AAPL' AND side = 'buy'
+    `).get() as any
+    expect(suppression.reason).toBe('committee_abstain')
+  })
+
+  it('persists committee transcript for both approve and abstain paths', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-3', broker_order_id: 'boid-3', status: 'placed', approved_size_usd: 150,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-a', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
+    )
+    const row = db.prepare("SELECT id, signal_id, rounds FROM trader_committee_transcripts WHERE id = 'tr-test-approve'").get() as any
+    expect(row).not.toBeNull()
+    expect(row.signal_id).toBe(signalId)
+    expect(row.rounds).toBe(1)
+  })
+
+  it('returns skip confirmation without calling committee or engine', async () => {
+    const committeeStub = vi.fn()
+    const msg = await dispatchApproval(
+      db,
+      { action: 'skip', approvalId: 'ap-1', decisionId: 'sig-x' },
+      mockClient as EngineClient,
+      { runCommittee: committeeStub as any },
+    )
+    expect(msg).toContain('Skipped')
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+    expect(committeeStub).not.toHaveBeenCalled()
+  })
+
+  it('pauses the correct strategy (dynamic, not hardcoded)', async () => {
+    const signalId = insertSignal(db)
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-stale', 'momentum-stocks', 'DBC', 'buy', 0.8, 20, 1, 'pending')`).run()
+    const msg = await dispatchApproval(
+      db,
+      { action: 'pause', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: vi.fn() as any },
+    )
+    const strat = db.prepare("SELECT status FROM trader_strategies WHERE id='momentum-stocks'").get() as any
+    expect(strat.status).toBe('paused')
+    expect(msg).toContain('momentum-stocks')
+    expect(db.prepare("SELECT status FROM trader_signals WHERE id='sig-stale'").get()).toEqual({status: 'suppressed_strategy_paused'})
+  })
+
+  it('does not pause an unrelated strategy', async () => {
+    db.prepare(`
+      INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('other-strategy', 'Other', 'equity', 0, 'active', '{}', ?, ?)
+    `).run(Date.now(), Date.now())
+    const signalId = insertSignal(db)
+    await dispatchApproval(
+      db,
+      { action: 'pause', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: vi.fn() as any },
+    )
+    const other = db.prepare("SELECT status FROM trader_strategies WHERE id='other-strategy'").get() as any
+    expect(other.status).toBe('active')
+  })
+
+  it('handles engine rejection gracefully (after committee approve)', async () => {
+    insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockRejectedValue(new Error('422 blocked_by: daily_loss'))
+    const msg = await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: 'sig-dispatch-1' },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
+    )
+    expect(msg).toContain('blocked')
+  })
+
+  it('returns committee-failure message when runCommittee throws', async () => {
+    const signalId = insertSignal(db)
+    const failing = async (): Promise<CommitteeResult> => { throw new Error('committee boom') }
+    const msg = await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: failing },
+    )
+    expect(msg).toContain('Committee run failed')
+    expect(mockClient.submitDecision).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 3 Task 5 -- Autonomy ladder integration in dispatcher.
+  // -------------------------------------------------------------------------
+
+  it('cold-start ladder scales committee size to 25%', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-cs', broker_order_id: 'boid-cs', status: 'placed', approved_size_usd: 25,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      {
+        runCommittee: makeApproveCommittee(100),
+        classifyTier: () => ({ tier: 'cold-start', scale: 0.25, reason: 'cold start (3 of 30 trades)' }),
+      },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(25)
+  })
+
+  it('tier-0 ladder scales committee size to 50%', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-t0', broker_order_id: 'boid-t0', status: 'placed', approved_size_usd: 100,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      {
+        runCommittee: makeApproveCommittee(200),
+        classifyTier: () => ({ tier: 'tier-0', scale: 0.5, reason: 'tier 0: drawdown breach' }),
+      },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(100)
+  })
+
+  it('tier-1 ladder passes committee size through unchanged', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-t1', broker_order_id: 'boid-t1', status: 'placed', approved_size_usd: 150,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      {
+        runCommittee: makeApproveCommittee(150),
+        classifyTier: tierStub,
+      },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(150)
+  })
+
+  it('uses default-size when committee returns 0 and ladder still applies', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-d', broker_order_id: 'boid-d', status: 'placed', approved_size_usd: 50,
+    })
+    // Committee returns size_usd=0 -> dispatcher falls back to DEFAULT_SIZE_USD ($200)
+    // -> ladder cold-start scales to $50 (200 * 0.25).
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      {
+        runCommittee: makeApproveCommittee(0),
+        classifyTier: () => ({ tier: 'cold-start', scale: 0.25, reason: 'cold start' }),
+      },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(50)
+  })
+
+  it('falls back to live classifyStrategyTier when no stub provided (cold-start by default)', async () => {
+    const signalId = insertSignal(db)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-live', broker_order_id: 'boid-live', status: 'placed', approved_size_usd: 25,
+    })
+    // No track record seeded -> live classifier returns cold-start, scale 0.25.
+    // Committee size 100 * 0.25 = 25.
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(100) },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(25)
+  })
+
+  // -------------------------------------------------------------------------
+  // Phase 5 Task 1 -- per-strategy live cap.
+  // Three cap sources, checked in priority order:
+  //   1. trader_strategies.max_size_usd (explicit per-strategy ceiling)
+  //   2. NAV * 2% risk multiplier (default when column is NULL)
+  //   3. $1000 hard ceiling (applied on top of either of the above)
+  // -------------------------------------------------------------------------
+
+  it('clamps size to max_size_usd when the strategy has an explicit cap', async () => {
+    const signalId = insertSignal(db)
+    // Set explicit cap below the committee's requested 300 so the clamp is visible.
+    db.prepare("UPDATE trader_strategies SET max_size_usd = ? WHERE id = 'momentum-stocks'").run(150)
+    // The per-strategy cap path skips getNav for sizing. The cluster gate still
+    // calls getNav (returns null -> cluster gate is a no-op pass), so we mock it.
+    mockClient.getNav = vi.fn().mockResolvedValue(null)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-cap', broker_order_id: 'boid-cap', status: 'placed', approved_size_usd: 150,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(300), classifyTier: tierStub },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(150)
+  })
+
+  it('manual dispatch scales the strategy cap by the signal size_weight', async () => {
+    const signalId = insertSignal(db)
+    db.prepare("UPDATE trader_strategies SET max_size_usd = ? WHERE id = 'momentum-stocks'").run(150)
+    db.prepare('UPDATE trader_signals SET size_weight = 0.5 WHERE id = ?').run(signalId)
+    mockClient.getNav = vi.fn().mockResolvedValue(null)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-w', broker_order_id: 'boid-w', status: 'placed', approved_size_usd: 75,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(300), classifyTier: tierStub },
+    )
+    expect(vi.mocked(mockClient.submitDecision!).mock.calls[0][0].size_usd).toBe(75)
+  })
+
+  it('auto dispatch submits exactly half the size when size_weight is 0.5, and NULL changes nothing', async () => {
+    const run = async (weight: number | null): Promise<number> => {
+      const local = makeDb()
+      local.prepare("UPDATE trader_strategies SET max_size_usd = 150 WHERE id = 'momentum-stocks'").run()
+      local.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status, size_weight)
+        VALUES ('sig-w', 'momentum-stocks', 'MSFT', 'buy', 0.7, 20, ?, 'pending', ?)`).run(Date.now(), weight)
+      const client: Partial<EngineClient> = {
+        ...mockClient,
+        submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'c', broker_order_id: 'b', status: 'placed', approved_size_usd: 1 }),
+      }
+      await autoDispatchPendingSignals(local, { send: async () => {}, runCommittee: makeApproveCommittee(150) }, client as EngineClient)
+      return vi.mocked(client.submitDecision!).mock.calls[0][0].size_usd
+    }
+    const full = await run(null)
+    const half = await run(0.5)
+    expect(full).toBeGreaterThan(0)
+    expect(half).toBe(Math.round(full * 0.5 * 100) / 100)
+  })
+
+  it('falls back to NAV * 2% when max_size_usd is NULL', async () => {
+    const signalId = insertSignal(db)
+    // Strategy has no explicit cap -- momentum-stocks seeded without max_size_usd.
+    mockClient.getNav = vi.fn().mockResolvedValue(10_000)  // 10k NAV -> 200 cap
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-nav', broker_order_id: 'boid-nav', status: 'placed', approved_size_usd: 200,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(500), classifyTier: tierStub },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(200)
+    expect(mockClient.getNav).toHaveBeenCalled()
+  })
+
+  it('honors the HARD_CEILING_USD hard ceiling even when NAV * 2% would allow more', async () => {
+    const signalId = insertSignal(db)
+    // NAV 1M * 2% = 20_000, but the hard ceiling clamps to HARD_CEILING_USD.
+    mockClient.getNav = vi.fn().mockResolvedValue(1_000_000)
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-ceil', broker_order_id: 'boid-ceil', status: 'placed', approved_size_usd: HARD_CEILING_USD,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(HARD_CEILING_USD * 5), classifyTier: tierStub },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(HARD_CEILING_USD)
+  })
+
+  it('treats max_size_usd = 0 as "cap disabled" and falls through to the NAV path', async () => {
+    // Footgun guard: if an operator zeros the column to reset it, the
+    // dispatcher must not submit a $0 order. Behavior should match the
+    // NULL case exactly -- NAV * 2% fallback kicks in.
+    const signalId = insertSignal(db)
+    db.prepare("UPDATE trader_strategies SET max_size_usd = 0 WHERE id = 'momentum-stocks'").run()
+    mockClient.getNav = vi.fn().mockResolvedValue(10_000)  // 10k NAV -> 200 cap
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-zero', broker_order_id: 'boid-zero', status: 'placed', approved_size_usd: 200,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-1', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(500), classifyTier: tierStub },
+    )
+    const submitCall = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(submitCall.size_usd).toBe(200)
+    // getNav must be consulted -- zero means "no explicit cap", not "cap at zero"
+    expect(mockClient.getNav).toHaveBeenCalled()
+  })
+
+  it('attaches exits to the manual-approval payload and decision row', async () => {
+    // M2: use a clearly distinct signal id; dispatchApproval's parsed.decisionId
+    // is the signal id looked up in trader_signals, not a trader_decisions.id.
+    const signalId = 'sig-me-exit'
+    db.prepare(`
+      INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES (?, 'momentum-stocks','AAPL','buy',0.72,20,?, ?,'committee')
+    `).run(signalId, JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 }), Date.now())
+    vi.mocked(mockClient.submitDecision!).mockResolvedValue({
+      client_order_id: 'coid-me', broker_order_id: 'boid-me', status: 'placed', approved_size_usd: 150,
+    })
+    await dispatchApproval(
+      db,
+      { action: 'approve', approvalId: 'ap-exits-manual', decisionId: signalId },
+      mockClient as EngineClient,
+      { runCommittee: makeApproveCommittee(150), classifyTier: tierStub },
+    )
+    const payload = vi.mocked(mockClient.submitDecision!).mock.calls[0][0]
+    expect(payload.entry_price).toBe(0)
+    expect(payload.stop_loss).toBeCloseTo(80, 5)
+    expect(payload.take_profit).toBeCloseTo(140, 5)
+    const row = db.prepare('SELECT entry_price, stop_loss, take_profit FROM trader_decisions WHERE signal_id=?').get(signalId) as any
+    expect(row.entry_price).toBe(100)
+    expect(row.stop_loss).toBeCloseTo(80, 5)
+    expect(row.take_profit).toBeCloseTo(140, 5)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// autoDispatchPendingSignals
+// ---------------------------------------------------------------------------
+
+describe('autoDispatchPendingSignals', () => {
+  let testDb: Database.Database
+  let positionSafeClient: EngineClient
+
+  beforeEach(() => {
+    testDb = new Database(':memory:')
+    testDb.pragma('foreign_keys = OFF')
+    initTraderTables(testDb)
+    positionSafeClient = {getPositions: vi.fn().mockResolvedValue([])} as unknown as EngineClient
+  })
+
+  it('marks signal suppressed_committee_abstain when committee abstains', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s1','momentum-stocks','AAPL','buy',0.8,3,?,'pending')`).run(Date.now())
+
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'low conviction', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-1',
+      transcript: {
+        signal_id: 'auto-s1', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'low conviction', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'low conviction', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
+    const row = testDb.prepare("SELECT status FROM trader_signals WHERE id='auto-s1'").get() as any
+    expect(row.status).toBe('suppressed_committee_abstain')
+  })
+
+  it('sends a Telegram alert after suppression when alertOnReject=true', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s2','momentum-stocks','MSFT','buy',0.75,3,?,'pending')`).run(Date.now())
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'thin data', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-2',
+      transcript: {
+        signal_id: 'auto-s2', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'thin data', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'thin data', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee, alertOnReject: true }, positionSafeClient)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0][0]).toContain('MSFT')
+  })
+
+  it('does not double-dispatch: atomic claim prevents concurrent duplicates', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-s3','momentum-stocks','AMZN','buy',0.8,3,?,'pending')`).run(Date.now())
+    const send = vi.fn().mockResolvedValue(undefined)
+    const stubCommittee = vi.fn().mockResolvedValue({
+      decision: 'abstain', action: null, thesis: 'ok', confidence: 0, size_usd: 0,
+      transcript_id: 'tc-auto-3',
+      transcript: {
+        signal_id: 'auto-s3', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: true, reason: 'ok', concerns: [] },
+        trader: { role: 'trader', action: 'abstain', thesis: 'ok', confidence: 0, size_multiplier: 0 },
+        errors: [],
+      },
+    })
+    // Call twice sequentially (not concurrent -- SQLite is single-threaded)
+    // First call should process, second should find no pending signals
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
+    await autoDispatchPendingSignals(testDb, { send, runCommittee: stubCommittee }, positionSafeClient)
+    expect(stubCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('marks the signal failed (not pending) when the duplicate guard query throws', async () => {
+    testDb.prepare(
+      `INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+       VALUES ('momentum-stocks','Momentum','stocks',0,'active','{}',?,?)`,
+    ).run(Date.now(), Date.now())
+    testDb.prepare(
+      `INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+       VALUES ('sig-guard','momentum-stocks','AAPL','buy',0.9,3,?,'pending')`,
+    ).run(Date.now())
+
+    // Force the guard SELECT (... AND engine_order_id IS NOT NULL ...) to throw
+    // by rebuilding trader_decisions WITHOUT that column.
+    testDb.exec(`
+      ALTER TABLE trader_decisions RENAME TO trader_decisions_full;
+      CREATE TABLE trader_decisions (
+        id TEXT PRIMARY KEY, signal_id TEXT NOT NULL, action TEXT NOT NULL, asset TEXT NOT NULL,
+        size_usd REAL, entry_type TEXT, entry_price REAL, stop_loss REAL, take_profit REAL,
+        thesis TEXT NOT NULL, confidence REAL NOT NULL, committee_transcript_id TEXT,
+        decided_at INTEGER NOT NULL, status TEXT NOT NULL
+      );
+    `)
+
+    const sent: string[] = []
+    const stubCommittee = async () => ({
+      decision: 'approve' as const,
+      action: 'buy' as const,
+      size_usd: 50,
+      confidence: 0.9,
+      thesis: 'test',
+      transcript_id: 'tx-guard',
+      transcript: {
+        signal_id: 'sig-guard', started_at: Date.now(), finished_at: Date.now(),
+        rounds_executed: 0, round_1: [],
+        risk_officer: { role: 'risk_officer' as const, veto: false, reason: 'ok', concerns: [] },
+        trader: { role: 'trader' as const, action: 'buy' as const, thesis: 'ok', confidence: 0.9, size_multiplier: 1 },
+        errors: [],
+      },
+    })
+    const fakeEngine = { getPositions: vi.fn().mockResolvedValue([]), submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: async (t: string) => { sent.push(t) }, runCommittee: stubCommittee as any, runAgent: (async () => '') as any },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-guard'`).get() as { status: string }
+    expect(sig.status).toBe('failed')
+    expect(sig.status).not.toBe('pending')
+    expect(sent.some((m) => m.includes('something went wrong'))).toBe(true)
+  })
+
+  it('does not re-dispatch a signal across ticks when engine_order_id is missing (loop guard)', async () => {
+    testDb.prepare(
+      `INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+       VALUES ('momentum-stocks','Momentum','stocks',0,'active','{}',?,?)`,
+    ).run(Date.now(), Date.now())
+    testDb.prepare(
+      `INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+       VALUES ('sig-loop','momentum-stocks','NVDA','buy',0.95,3,?,'pending')`,
+    ).run(Date.now())
+    testDb.exec(`
+      ALTER TABLE trader_decisions RENAME TO trader_decisions_full;
+      CREATE TABLE trader_decisions (
+        id TEXT PRIMARY KEY, signal_id TEXT NOT NULL, action TEXT NOT NULL, asset TEXT NOT NULL,
+        size_usd REAL, entry_type TEXT, entry_price REAL, stop_loss REAL, take_profit REAL,
+        thesis TEXT NOT NULL, confidence REAL NOT NULL, committee_transcript_id TEXT,
+        decided_at INTEGER NOT NULL, status TEXT NOT NULL
+      );
+    `)
+
+    const stubCommittee = async () => ({
+      decision: 'approve' as const, action: 'buy' as const, size_usd: 50, confidence: 0.9,
+      thesis: 'x', transcript_id: 'tx',
+      transcript: {
+        signal_id: 'sig-loop', started_at: 0, finished_at: 0, rounds_executed: 0, round_1: [],
+        risk_officer: { role: 'risk_officer' as const, veto: false, reason: 'ok', concerns: [] },
+        trader: { role: 'trader' as const, action: 'buy' as const, thesis: 'ok', confidence: 0.9, size_multiplier: 1 },
+        errors: [],
+      },
+    })
+    const fakeEngine = { getPositions: vi.fn().mockResolvedValue([]), submitDecision: async () => ({ client_order_id: 'x', status: 'placed', approved_size_usd: 50, broker_order_id: 'b1' }) } as any
+    const deps = { send: async () => {}, runCommittee: stubCommittee as any, runAgent: (async () => '') as any }
+
+    await autoDispatchPendingSignals(testDb, deps, fakeEngine)
+    const afterTick1 = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-loop'`).get() as { status: string }
+    expect(afterTick1.status).toBe('failed')
+
+    // Tick 2 must NOT pick the signal up again -- it is no longer 'pending'.
+    const tick2 = await autoDispatchPendingSignals(testDb, deps, fakeEngine)
+    expect(tick2.length).toBe(0)
+    const afterTick2 = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-loop'`).get() as { status: string }
+    expect(afterTick2.status).toBe('failed')
+  })
+
+  it('outer loop catch: marks signal failed, cleans up stranded submitting decisions, and sends alert', async () => {
+    // Seed a signal and a pre-existing 'submitting' decision (simulates a crash
+    // between the INSERT and the engine call that left the row stranded).
+    testDb.prepare(
+      `INSERT INTO trader_strategies (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+       VALUES ('momentum-stocks','Momentum','stocks',0,'active','{}',?,?)`,
+    ).run(Date.now(), Date.now())
+    testDb.prepare(
+      `INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+       VALUES ('sig-outer','momentum-stocks','TSLA','buy',0.88,3,?,'pending')`,
+    ).run(Date.now())
+
+    // Force the outer catch to fire by corrupting trader_strategies after the
+    // signal is claimed. The strategy SELECT (outer try, before inner try)
+    // will throw, hitting the outer catch directly.
+    const origRun = testDb.prepare(
+      "UPDATE trader_signals SET status = 'dispatching' WHERE id = ? AND status = 'pending'",
+    ).run.bind(testDb.prepare(
+      "UPDATE trader_signals SET status = 'dispatching' WHERE id = ? AND status = 'pending'",
+    ))
+
+    // Simpler approach: pre-insert a 'submitting' decision row, then drop
+    // trader_strategies so the strategy lookup throws in the outer try.
+    testDb.prepare(
+      `INSERT INTO trader_decisions (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+         committee_transcript_id, decided_at, status)
+       VALUES ('dec-outer','sig-outer','buy','TSLA',50,'market','test',0.8,null,?,'submitting')`,
+    ).run(Date.now())
+
+    // Drop trader_strategies -- the outer try's strategy SELECT will throw.
+    testDb.exec('DROP TABLE trader_strategies')
+
+    const sent: string[] = []
+    const deps = {
+      send: async (m: string) => { sent.push(m) },
+      runCommittee: async () => { throw new Error('should not reach committee') },
+      runAgent: async () => ({ text: null }),
+    }
+
+    await autoDispatchPendingSignals(testDb, deps, positionSafeClient)
+
+    const sig = testDb.prepare(`SELECT status FROM trader_signals WHERE id='sig-outer'`).get() as { status: string }
+    expect(sig.status).toBe('failed')
+
+    const dec = testDb.prepare(`SELECT status FROM trader_decisions WHERE id='dec-outer'`).get() as { status: string }
+    expect(dec.status).toBe('failed')
+
+    expect(sent.some((m) => m.includes('something went wrong'))).toBe(true)
+  })
+
+  it('parks a network-timeout submit at retry_pending (no terminal fail, no resend)', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-t1','momentum-stocks','TSLA','buy',0.7,20,?, 'pending')`).run(Date.now())
+    const sendSpy = vi.fn(async () => {})
+    const fakeEngine = {
+      submitDecision: vi.fn().mockRejectedValue(new Error('The operation was aborted due to timeout')),
+      getNav: vi.fn().mockResolvedValue(null),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: sendSpy, runCommittee: makeApproveCommittee(150) },
+      fakeEngine,
+    )
+    const dec = testDb.prepare("SELECT status, submit_attempts, next_retry_at FROM trader_decisions WHERE signal_id='sig-t1'").get() as any
+    expect(dec.status).toBe('retry_pending')
+    expect(dec.submit_attempts).toBe(1)
+    expect(dec.next_retry_at).toBeGreaterThan(0)
+    // submitDecision called exactly once -- a timed-out order is never resent in-tick.
+    expect(vi.mocked(fakeEngine.submitDecision)).toHaveBeenCalledTimes(1)
+  })
+
+  it('marks a 4xx submit reject as terminal failed and alerts', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-t2','momentum-stocks','NVDA','buy',0.7,20,?, 'pending')`).run(Date.now())
+    const sendSpy = vi.fn(async () => {})
+    const fakeEngine = {
+      submitDecision: vi.fn().mockRejectedValue(new Error('Engine API error 422 on /decisions/submit :: position_sizer')),
+      getNav: vi.fn().mockResolvedValue(null),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: sendSpy, runCommittee: makeApproveCommittee(150) },
+      fakeEngine,
+    )
+    const dec = testDb.prepare("SELECT status FROM trader_decisions WHERE signal_id='sig-t2'").get() as any
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-t2'").get() as any
+    expect(dec.status).toBe('failed')
+    expect(sig.status).toBe('failed')
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('suppresses a signal when cluster headroom is zero (already at/over cap)', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-cluster','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    const sendSpy = vi.fn(async () => {})
+    // NAV=2000, cluster cap 50%=$1000. Existing SPY+QQQ exposure=$1200, already over cap -> headroom=0.
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(2000),
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'SPY', qty: 1, avg_entry_price: 600, market_value: 700, unrealized_pnl: 100, source: 'test', updated_at: Date.now() },
+        { asset: 'QQQ', qty: 1, avg_entry_price: 450, market_value: 500, unrealized_pnl: 50, source: 'test', updated_at: Date.now() },
+      ]),
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: sendSpy, runCommittee: makeApproveCommittee(150) },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-cluster'").get() as any
+    expect(sig.status).toBe('suppressed_cluster_cap')
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('trims (not blocks) when cluster headroom is positive but smaller than proposed size', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    // Explicit max_size_usd=400 so risk sizing produces $400 (no NAV needed).
+    testDb.prepare("UPDATE trader_strategies SET max_size_usd=400 WHERE id='momentum-stocks'").run()
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-trim','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    // NAV=6000, cluster cap 50%=$3000. Existing SPY market_value=$2700 ->
+    // cluster exposure=$2700, headroom=$300. Risk sizing: explicit cap=$400 ->
+    // sizeUsd=$400. Cluster gate: 400 > 300 headroom -> TRIM to 300. The
+    // headroom stays above DEFAULT_SIZE_USD ($200) so the trim is a real
+    // order, not dust.
+    const fakeEngine = {
+      submitDecision: vi.fn().mockResolvedValue({
+        client_order_id: 'coid-trim', broker_order_id: 'boid-trim', status: 'placed', approved_size_usd: 300,
+      }),
+      getNav: vi.fn().mockResolvedValue(6000),
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'SPY', qty: 1, avg_entry_price: 2700, market_value: 2700, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+      ]),
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(400) },
+      fakeEngine,
+    )
+
+    // Signal should NOT be suppressed -- it was trimmed and submitted.
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-trim'").get() as any
+    expect(sig.status).toBe('submitted')
+    expect(fakeEngine.submitDecision).toHaveBeenCalledTimes(1)
+    // Engine was called with size <= 300 (the headroom: 3000 - 2700 = 300).
+    const call = vi.mocked(fakeEngine.submitDecision).mock.calls[0][0]
+    expect(call.size_usd).toBeLessThanOrEqual(300)
+    expect(call.size_usd).toBeGreaterThanOrEqual(200)
+  })
+
+  it('blocks rather than trims when cluster headroom is below the minimum order size', async () => {
+    // The dust-lot bug: on 2026-07-31 the symbol cap reopened a few dollars of
+    // headroom each cycle and every re-emitted signal was trimmed to fit it,
+    // producing $27.31, $8.12, $3.94 and $1.80 TLT lots. A trim below
+    // DEFAULT_SIZE_USD must block instead.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare("UPDATE trader_strategies SET max_size_usd=400 WHERE id='momentum-stocks'").run()
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-dust','momentum-stocks','AAPL','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    // NAV=6000, cluster cap 50%=$3000. SPY market_value=$2990 -> headroom $10.
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(6000),
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'SPY', qty: 1, avg_entry_price: 2990, market_value: 2990, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+      ]),
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(400) },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-dust'").get() as any
+    expect(sig.status).toBe('suppressed_below_min_size')
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    const supp = testDb.prepare("SELECT reason FROM trader_signal_suppressions WHERE signal_id='sig-dust'").get() as any
+    expect(supp.reason).toBe('below_min_size')
+  })
+
+  it('suppresses a re-emitted signal for an asset the book already holds', async () => {
+    // The root cause of the 44-open-position report: the signal dedupe index is
+    // scoped to pending/dispatching, so a dispatched signal frees its slot and
+    // the next tick opens a second identical lot.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    // An already-executed TLT buy with no verdict: the book is holding it.
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-held','momentum-stocks','TLT','buy',0.7,20,?,'submitted')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-held','sig-held','buy','TLT',1973.25,'limit','t',0.7,NULL,?,'executed')`).run(Date.now())
+    // The engine re-emits the same candidate five minutes later.
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-dup','momentum-stocks','TLT','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      // Broker confirms we really hold TLT. The guard only blocks when brain
+      // state AND broker truth agree.
+      getPositions: vi.fn().mockResolvedValue([
+        { asset: 'TLT', qty: 180.6, avg_entry_price: 82, market_value: 14857, unrealized_pnl: 0, source: 'test', updated_at: Date.now() },
+      ]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(1973.25))
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-dup'").get() as any
+    expect(sig.status).toBe('suppressed_already_held')
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    // The guard runs before the committee, so it costs no LLM call.
+    expect(runCommittee).not.toHaveBeenCalled()
+    const decisions = testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='TLT'").get() as any
+    expect(decisions.n).toBe(1)
+  })
+
+  it('skips a signal when an order for the asset is still submitted or waiting for a fill', async () => {
+    seedMomentumStrategy(testDb)
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-open','sig-open','buy','BTC/USD',200,'market','t',0.7,NULL,?,'pending_fill')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-again','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(200))
+
+    await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-again'").get() as any
+    expect(sig.status).toBe('suppressed_pending_order')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(fakeEngine.submitDecision).not.toHaveBeenCalled()
+    expect(testDb.prepare("SELECT COUNT(*) AS n FROM trader_decisions WHERE asset='BTC/USD'").get()).toEqual({ n: 1 })
+  })
+
+  // B2: a decision parked for retry (or at engine_down) can still fill, and the
+  // insert-first 'submitting' row is about to. Each owns the asset.
+  for (const status of ['submitting', 'retry_pending', 'engine_down']) {
+    it(`skips a signal when another strategy's decision for the asset sits at '${status}'`, async () => {
+      seedMomentumStrategy(testDb)
+      testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('sig-ibs','ibs-stocks','BTC/USD','buy',0.8,14,?,'dispatching')`).run(Date.now())
+      testDb.prepare(`INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+         committee_transcript_id, decided_at, status)
+        VALUES ('dec-parked','sig-ibs','buy','BTC/USD',200,'market','t',0.7,NULL,?,?)`).run(Date.now(), status)
+      testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+        VALUES ('sig-mom','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+      const fakeEngine = {
+        submitDecision: vi.fn(),
+        getNav: vi.fn().mockResolvedValue(100000),
+        getPositions: vi.fn().mockResolvedValue([]),
+      } as any
+      const runCommittee = vi.fn(makeApproveCommittee(200))
+
+      await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+      const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-mom'").get() as any
+      expect(sig.status).toBe('suppressed_pending_order')
+      expect(runCommittee).not.toHaveBeenCalled()
+    })
+  }
+
+  it("blocks a second strategy from opening an asset another strategy just filled while the broker snapshot reads flat", async () => {
+    // 2026-09-18 AAPL/DBC: the first lot filled (executed), the positions
+    // snapshot lagged, and the per-strategy guard let a different strategy in.
+    seedMomentumStrategy(testDb)
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-ibs-fill','ibs-stocks','BTC/USD','buy',0.8,14,?,'executed')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-fill','sig-ibs-fill','buy','BTC/USD',200,'market','t',0.7,NULL,?,'executed')`).run(Date.now() - 5 * 60_000)
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-mom-2','momentum-stocks','BTC/USD','buy',0.8,14,?,'pending')`).run(Date.now())
+    const fakeEngine = {
+      submitDecision: vi.fn(),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+    const runCommittee = vi.fn(makeApproveCommittee(200))
+
+    await autoDispatchPendingSignals(testDb, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, fakeEngine)
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-mom-2'").get() as any
+    expect(sig.status).toBe('suppressed_already_held')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
+  it('does NOT block re-entry when the broker is flat but stale rows say we hold it', async () => {
+    // The 2026-08-02 regression: six QQQ decisions sat at status='executed'
+    // with the broker flat since June, because the close-out watcher could
+    // never grade them. A DB-only guard reads that as "we hold QQQ" and blocks
+    // every future QQQ signal permanently. Broker truth has to win.
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-stale','momentum-stocks','QQQ','buy',0.7,20,?,'submitted')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence,
+       committee_transcript_id, decided_at, status)
+      VALUES ('dec-stale','sig-stale','buy','QQQ',2008.03,'limit','t',0.7,NULL,?,'executed')`).run(Date.now() - 3 * 86_400_000) // decided days ago, well past the fill settling window
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-new','momentum-stocks','QQQ','buy',0.7,20,?,'pending')`).run(Date.now())
+
+    const fakeEngine = {
+      submitDecision: vi.fn().mockResolvedValue({
+        client_order_id: 'c', broker_order_id: 'b', status: 'placed', approved_size_usd: 200,
+      }),
+      getNav: vi.fn().mockResolvedValue(100000),
+      getPositions: vi.fn().mockResolvedValue([]),  // broker holds nothing
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: makeApproveCommittee(200) },
+      fakeEngine,
+    )
+
+    const sig = testDb.prepare("SELECT status FROM trader_signals WHERE id='sig-new'").get() as any
+    expect(sig.status).not.toBe('suppressed_already_held')
+  })
+
+  it('dispatches highest-score signal first (rank-aware daily cap)', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    // Three signals with different scores; insert in low-to-high order to confirm
+    // ordering is by raw_score DESC, not insertion order.
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-low','momentum-stocks','MSFT','buy',0.3,20,?,'pending')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-mid','momentum-stocks','AAPL','buy',0.5,20,?,'pending')`).run(Date.now())
+    testDb.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('sig-high','momentum-stocks','NVDA','buy',0.9,20,?,'pending')`).run(Date.now())
+
+    const dispatchOrder: string[] = []
+    const trackingCommittee = async (s: CommitteeSignalInput): Promise<CommitteeResult> => {
+      dispatchOrder.push(s.id)
+      return makeApproveCommittee(150)(s)
+    }
+
+    const fakeEngine = {
+      submitDecision: vi.fn().mockResolvedValue({
+        client_order_id: 'coid-rank', broker_order_id: 'boid-rank', status: 'placed', approved_size_usd: 150,
+      }),
+      getNav: vi.fn().mockResolvedValue(null),
+      getPositions: vi.fn().mockResolvedValue([]),
+    } as any
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send: vi.fn().mockResolvedValue(undefined), runCommittee: trackingCommittee },
+      fakeEngine,
+    )
+
+    // Highest-score signal must be dispatched first.
+    expect(dispatchOrder[0]).toBe('sig-high')
+    expect(dispatchOrder[1]).toBe('sig-mid')
+    expect(dispatchOrder[2]).toBe('sig-low')
+  })
+
+  it('attaches vol-aware stop_loss + take_profit to the engine payload and the decision row', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    // enrichment with a price window so the calculator uses the volatility path.
+    const enrich = JSON.stringify({ price_current: 100, window_high: 120, window_low: 80 })
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, enrichment_json, generated_at, status)
+      VALUES ('auto-exit-1','momentum-stocks','AAPL','buy',0.8,20,?, ?,'pending')`).run(enrich, Date.now())
+
+    const send = vi.fn().mockResolvedValue(undefined)
+    const approve = vi.fn().mockResolvedValue({
+      decision: 'approve', action: 'buy', thesis: 'ok', confidence: 0.7, size_usd: 150,
+      transcript_id: 'tc-exit-1',
+      transcript: {
+        signal_id: 'auto-exit-1', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: false, reason: 'clear', concerns: [] },
+        trader: { role: 'trader', action: 'buy', thesis: 'ok', confidence: 0.7, size_multiplier: 1 },
+        errors: [],
+      },
+    })
+    const submitDecision = vi.fn().mockResolvedValue({
+      client_order_id: 'coid-e1', broker_order_id: 'boid-e1', status: 'placed', approved_size_usd: 150,
+    })
+    const mockClient = { submitDecision, getNav: vi.fn().mockResolvedValue(null), getPositions: vi.fn().mockResolvedValue([]) }
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send, runCommittee: approve },
+      mockClient as unknown as EngineClient,
+    )
+
+    const payload = submitDecision.mock.calls[0][0]
+    // Equity wire price is 0 (engine limits at the live quote); the row keeps
+    // the enrichment price_current reference.
+    expect(payload.entry_price).toBe(0)
+    // vol stop: range 40/100 *0.5 = 0.20 -> stop 80, 2R target 140
+    expect(payload.stop_loss).toBeCloseTo(80, 5)
+    expect(payload.take_profit).toBeCloseTo(140, 5)
+
+    const row = testDb.prepare("SELECT entry_price, stop_loss, take_profit FROM trader_decisions WHERE signal_id='auto-exit-1'").get() as any
+    expect(row.entry_price).toBe(100)
+    expect(row.stop_loss).toBeCloseTo(80, 5)
+    expect(row.take_profit).toBeCloseTo(140, 5)
+  })
+
+  it('still executes with null exits when enrichment is missing and price is unknown', async () => {
+    testDb.prepare(`INSERT OR IGNORE INTO trader_strategies
+      (id, name, asset_class, tier, status, params_json, created_at, updated_at)
+      VALUES ('momentum-stocks','Momentum','stocks',1,'active','{}',?,?)`).run(Date.now(), Date.now())
+    testDb.prepare(`INSERT INTO trader_signals
+      (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES ('auto-exit-2','momentum-stocks','MSFT','buy',0.8,20,?,'pending')`).run(Date.now())
+
+    const send = vi.fn().mockResolvedValue(undefined)
+    const approve = vi.fn().mockResolvedValue({
+      decision: 'approve', action: 'buy', thesis: 'ok', confidence: 0.7, size_usd: 150,
+      transcript_id: 'tc-exit-2',
+      transcript: {
+        signal_id: 'auto-exit-2', started_at: Date.now(), finished_at: Date.now(), rounds_executed: 1,
+        round_1: [], risk_officer: { role: 'risk_officer', veto: false, reason: 'clear', concerns: [] },
+        trader: { role: 'trader', action: 'buy', thesis: 'ok', confidence: 0.7, size_multiplier: 1 },
+        errors: [],
+      },
+    })
+    const submitDecision = vi.fn().mockResolvedValue({
+      client_order_id: 'coid-e2', broker_order_id: 'boid-e2', status: 'placed', approved_size_usd: 150,
+    })
+    const mockClient = { submitDecision, getNav: vi.fn().mockResolvedValue(null), getPositions: vi.fn().mockResolvedValue([]) }
+
+    await autoDispatchPendingSignals(
+      testDb,
+      { send, runCommittee: approve },
+      mockClient as unknown as EngineClient,
+    )
+
+    const payload = submitDecision.mock.calls[0][0]
+    expect(payload.stop_loss).toBeUndefined()
+    expect(payload.take_profit).toBeUndefined()
+    const row = testDb.prepare("SELECT status, stop_loss, take_profit FROM trader_decisions WHERE signal_id='auto-exit-2'").get() as any
+    expect(row.status).toBe('submitted')
+    expect(row.stop_loss).toBeNull()
+    expect(row.take_profit).toBeNull()
+  })
+})
+
+describe('autoDispatchPendingSignals: equity session staleness', () => {
+  let db: Database.Database
+  // Wed 2026-10-21. EDT is UTC-4.
+  const AT_1556_ET = Date.parse('2026-10-21T19:56:00Z')
+  const AT_1601_ET = Date.parse('2026-10-21T20:01:00Z')
+  const NEXT_0935_ET = Date.parse('2026-10-22T13:35:00Z')
+  const AT_1030_ET = Date.parse('2026-10-21T14:30:00Z')
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('./signal-poller.js')>('./signal-poller.js')
+    vi.mocked(isEquityMarketHours).mockImplementation(actual.isEquityMarketHours)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    db = makeDb()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.mocked(isEquityMarketHours).mockImplementation(() => true)
+  })
+
+  function seed(id: string, asset: string, generatedAt: number) {
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, 'momentum-stocks', ?, 'buy', 0.8, 20, ?, 'pending')`).run(id, asset, generatedAt)
+  }
+  const engine = () => ({ submitDecision: vi.fn(), getNav: vi.fn().mockResolvedValue(100000), getPositions: vi.fn().mockResolvedValue([]) }) as any
+  const status = (id: string) => (db.prepare('SELECT status FROM trader_signals WHERE id = ?').get(id) as any).status
+
+  it('marks a 15:56 ET equity signal stale when dispatch first sees it at 16:01 ET', async () => {
+    seed('sig-late', 'XLE', AT_1556_ET)
+    vi.setSystemTime(AT_1601_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(status('sig-late')).toBe('suppressed_stale')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
+  it('marks yesterday-afternoon equity signal stale at the next open, under the 24h age limit', async () => {
+    seed('sig-overnight', 'XLE', AT_1556_ET)
+    vi.setSystemTime(NEXT_0935_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(status('sig-overnight')).toBe('suppressed_stale')
+    expect(runCommittee).not.toHaveBeenCalled()
+  })
+
+  it('dispatches an equity signal inside the session it was generated in', async () => {
+    seed('sig-fresh', 'XLE', AT_1030_ET - 5 * 60_000)
+    vi.setSystemTime(AT_1030_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the 24h rule for crypto: a 17h-old crypto signal still dispatches', async () => {
+    seed('sig-btc', 'BTC/USD', NEXT_0935_ET - 17 * 3_600_000)
+    vi.setSystemTime(NEXT_0935_ET)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, engine())
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('autoDispatchPendingSignals: same-day re-entry block', () => {
+  let db: Database.Database
+  // Wed 2026-10-21. EDT is UTC-4.
+  const EXIT_0935_ET = Date.parse('2026-10-21T13:35:00Z')
+  const SIGNAL_0941_ET = Date.parse('2026-10-21T13:41:00Z')
+  const NEXT_0941_ET = Date.parse('2026-10-22T13:41:00Z')
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    db = makeDb()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  function seedExit(asset: string, fillMs: number, opts: { fill?: boolean; status?: string } = {}) {
+    db.prepare(`INSERT INTO trader_decisions (id, signal_id, parent_decision_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status)
+      VALUES ('dec-exit-' || ?, 'sig-exit', 'dec-entry', 'sell', ?, 200, 'market', 'exit', 1, ?, ?)`).run(asset, asset, fillMs, opts.status ?? DECISION_STATUS.CLOSED)
+    if (opts.fill === false) return
+    db.prepare(`INSERT INTO trader_fills (id, decision_id, client_order_id, asset, side, fill_qty, fill_price, fill_ts_ms, recorded_at)
+      VALUES ('fill-' || ?, 'dec-exit-' || ?, 'c1', ?, 'sell', 1, 100, ?, ?)`).run(asset, asset, asset, fillMs, fillMs)
+  }
+  function seedSignal(id: string, asset: string, generatedAt: number) {
+    db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+      VALUES (?, 'momentum-stocks', ?, 'buy', 0.8, 20, ?, 'pending')`).run(id, asset, generatedAt)
+  }
+  const engine = () => ({ submitDecision: vi.fn(), getNav: vi.fn().mockResolvedValue(100000), getPositions: vi.fn().mockResolvedValue([]) }) as any
+  const status = (id: string) => (db.prepare('SELECT status FROM trader_signals WHERE id = ?').get(id) as any).status
+  async function run(now: number) {
+    vi.setSystemTime(now)
+    const runCommittee = vi.fn(makeAbstainCommittee())
+    const eng = engine()
+    await autoDispatchPendingSignals(db, { send: vi.fn().mockResolvedValue(undefined), runCommittee }, eng)
+    return { runCommittee, eng }
+  }
+
+  it('suppresses an entry on the ET day an exit filled, and submits no order', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee, eng } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).toBe('suppressed_same_day_reentry')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(eng.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('blocks a same-day re-entry after a closed exit with no fill row (decided_at fallback)', async () => {
+    seedExit('XLE', EXIT_0935_ET, { fill: false })
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee, eng } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).toBe('suppressed_same_day_reentry')
+    expect(runCommittee).not.toHaveBeenCalled()
+    expect(eng.submitDecision).not.toHaveBeenCalled()
+  })
+
+  it('does not block re-entry after a failed exit that never filled', async () => {
+    seedExit('XLE', EXIT_0935_ET, { fill: false, status: DECISION_STATUS.FAILED })
+    seedSignal('sig-xle', 'XLE', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xle')).not.toBe('suppressed_same_day_reentry')
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('dispatches the same signal the next day', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xle', 'XLE', NEXT_0941_ET)
+    const { runCommittee } = await run(NEXT_0941_ET)
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not affect a different asset', async () => {
+    seedExit('XLE', EXIT_0935_ET)
+    seedSignal('sig-xlk', 'XLK', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
+    expect(status('sig-xlk')).not.toBe('suppressed_same_day_reentry')
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not affect crypto', async () => {
+    seedExit('BTC/USD', EXIT_0935_ET)
+    seedSignal('sig-btc', 'BTC/USD', SIGNAL_0941_ET)
+    const { runCommittee } = await run(SIGNAL_0941_ET)
+    expect(runCommittee).toHaveBeenCalledTimes(1)
+  })
+})

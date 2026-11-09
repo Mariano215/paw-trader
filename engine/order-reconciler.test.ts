@@ -1,0 +1,172 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import Database from 'better-sqlite3'
+import { initTraderTables } from './db.js'
+import { seedMomentumStrategy } from './strategy-manager.js'
+import { reconcileOpenOrders, RECONCILE_ORPHAN_HORIZON_MS } from './order-reconciler.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
+import { listFillsForDecision } from './audit-log.js'
+import type { EngineClient } from './engine-client.js'
+import type { EngineOrder } from './types.js'
+
+function makeDb() {
+  const db = new Database(':memory:')
+  db.pragma('foreign_keys = OFF')
+  initTraderTables(db)
+  seedMomentumStrategy(db)
+  db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+    VALUES ('s1','momentum-stocks','AAPL','buy',0.7,20,?, 'submitted')`).run(Date.now())
+  return db
+}
+
+function insertDecision(db: Database.Database, status: string, engineOrderId: string | null) {
+  db.prepare(`INSERT INTO trader_decisions
+    (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, engine_order_id)
+    VALUES ('d1','s1','buy','AAPL',150,'market','t',0.7,?, ?, ?)`).run(Date.now(), status, engineOrderId)
+}
+
+function order(over: Partial<EngineOrder>): EngineOrder {
+  return {
+    client_order_id: 'd1', broker_order_id: 'boid-1', asset: 'AAPL', side: 'buy',
+    qty: 1, order_type: 'market', limit_price: null, status: 'new',
+    filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1, ...over,
+  }
+}
+
+describe('reconcileOpenOrders', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it('promotes submitted -> executed on a confirmed fill and caches fill data', async () => {
+    insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-1')
+    const client = { getOrders: vi.fn().mockResolvedValue([order({ status: 'filled', filled_qty: 3, filled_avg_price: 101.5 })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.promotedToFilled).toBe(1)
+    const row = db.prepare("SELECT status, filled_qty, filled_avg_price FROM trader_decisions WHERE id='d1'").get() as any
+    expect(row.status).toBe('executed')
+    expect(row.filled_qty).toBe(3)
+    expect(row.filled_avg_price).toBe(101.5)
+  })
+
+  it('matches on decision_id when the engine minted its own client_order_id (real-world case)', async () => {
+    // Engine assigns a random client_order_id and stores the brain decision id
+    // in decision_id. engine_order_id is null (submit ack lost). The ONLY key
+    // that links this order to decision d1 is decision_id. This is the 0/100
+    // mismatch the fix repairs.
+    insertDecision(db, DECISION_STATUS.SUBMITTED, null)
+    const client = { getOrders: vi.fn().mockResolvedValue([order({
+      client_order_id: 'engine-minted-uuid-9f3a', broker_order_id: 'boid-x',
+      decision_id: 'd1', status: 'filled', filled_qty: 5, filled_avg_price: 200,
+    })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.promotedToFilled).toBe(1)
+    const row = db.prepare("SELECT status, filled_qty FROM trader_decisions WHERE id='d1'").get() as any
+    expect(row.status).toBe('executed')
+    expect(row.filled_qty).toBe(5)
+    expect(listFillsForDecision(db, 'd1')).toHaveLength(1)
+  })
+
+  it('advances submitted -> pending_fill when live but unfilled', async () => {
+    insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-1')
+    const client = { getOrders: vi.fn().mockResolvedValue([order({ status: 'new', filled_qty: 0 })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.promotedToPending).toBe(1)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('pending_fill')
+  })
+
+  it('marks failed on a canceled order', async () => {
+    insertDecision(db, DECISION_STATUS.PENDING_FILL, 'boid-1')
+    const client = { getOrders: vi.fn().mockResolvedValue([order({ status: 'canceled' })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.canceledOrRejected).toBe(1)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('failed')
+  })
+
+  it('does NOT mutate when getOrders throws (engine unreachable)', async () => {
+    insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-1')
+    const client = { getOrders: vi.fn().mockRejectedValue(new Error('Engine API error 503 on /orders')) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.checked).toBe(1)
+    expect(s.promotedToFilled + s.promotedToPending + s.canceledOrRejected).toBe(0)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
+  })
+
+  it('reflects the current engine reality: a placed-only order stays submitted (no fabricated fill)', async () => {
+    // Mirrors the live engine: status='placed', filled_qty=0, filled_avg_price=null forever.
+    insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-1')
+    const client = { getOrders: vi.fn().mockResolvedValue([order({ status: 'placed', filled_qty: 0, filled_avg_price: null })]) }
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.promotedToFilled).toBe(0)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('pending_fill')
+  })
+
+  it('skips a recent submitted order with no broker match (propagation lag, not expired)', async () => {
+    // decided_at = now, well within RECONCILE_ORPHAN_HORIZON_MS -- must stay submitted.
+    const recentAt = Date.now()
+    db.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, engine_order_id)
+      VALUES ('d-recent','s1','buy','AAPL',150,'market','t',0.7,?, ?, 'boid-recent')`).run(recentAt, DECISION_STATUS.SUBMITTED)
+    const client = { getOrders: vi.fn().mockResolvedValue([]) } // empty -- no broker record
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(s.canceledOrRejected).toBe(0)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d-recent'").get() as any).status).toBe('submitted')
+  })
+
+  it('expires an old submitted order with no broker match and sends an alert', async () => {
+    const oldAt = Date.now() - RECONCILE_ORPHAN_HORIZON_MS - 1000
+    db.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, decided_at, status, engine_order_id)
+      VALUES ('d-old','s1','buy','AAPL',150,'market','t',0.7,?, ?, 'boid-old')`).run(oldAt, DECISION_STATUS.SUBMITTED)
+    const sendSpy = vi.fn(async () => {})
+    const client = { getOrders: vi.fn().mockResolvedValue([]) } // empty -- no broker record
+    const s = await reconcileOpenOrders(db, client as unknown as EngineClient, sendSpy)
+    expect(s.expiredOrphans).toBe(1)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d-old'").get() as any).status).toBe('failed')
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+    expect((sendSpy.mock.calls as string[][])[0][0]).toContain('went missing')
+  })
+
+  // I1: confirmed fill must write exactly one trader_fills row, idempotent on re-run.
+  it('I1: writes a trader_fills row on confirmed fill and is idempotent on re-run', async () => {
+    insertDecision(db, DECISION_STATUS.SUBMITTED, 'boid-fill-1')
+    const filledOrder = order({
+      broker_order_id: 'boid-fill-1',
+      status: 'filled',
+      filled_qty: 5,
+      filled_avg_price: 102.0,
+      updated_at: 1_700_000_000_000,
+    })
+    const client = { getOrders: vi.fn().mockResolvedValue([filledOrder]) }
+    // First reconcile -- should write the fill.
+    await reconcileOpenOrders(db, client as unknown as EngineClient)
+    const fills = listFillsForDecision(db, 'd1')
+    expect(fills).toHaveLength(1)
+    expect(fills[0].fill_qty).toBe(5)
+    expect(fills[0].fill_price).toBe(102.0)
+    expect(fills[0].asset).toBe('AAPL')
+    expect(fills[0].side).toBe('buy')
+    // Second reconcile -- same broker_order_id means INSERT OR IGNORE; still exactly one row.
+    await reconcileOpenOrders(db, client as unknown as EngineClient)
+    expect(listFillsForDecision(db, 'd1')).toHaveLength(1)
+  })
+
+  it('keeps an executed partial entry under reconciliation and replaces it with the final cumulative fill', async () => {
+    insertDecision(db, DECISION_STATUS.EXECUTED, 'boid-fill-1')
+    db.prepare("UPDATE trader_decisions SET filled_qty=3, filled_avg_price=100 WHERE id='d1'").run()
+    db.prepare(`INSERT INTO trader_fills
+      (id,decision_id,client_order_id,broker_order_id,asset,side,fill_qty,fill_price,fill_ts_ms,fee_usd,slippage_usd,recorded_at)
+      VALUES ('boid-fill-1:3','d1','d1','boid-fill-1','AAPL','buy',3,100,1000,0,0,1000)`).run()
+    const finalOrder = order({
+      broker_order_id: 'boid-fill-1', decision_id: 'd1', status: 'filled',
+      filled_qty: 6, filled_avg_price: 101, updated_at: 2000,
+    })
+    const client = {getOrders: vi.fn().mockResolvedValue([finalOrder])}
+
+    await reconcileOpenOrders(db, client as unknown as EngineClient)
+
+    expect(db.prepare("SELECT status,filled_qty,filled_avg_price FROM trader_decisions WHERE id='d1'").get())
+      .toEqual({status: 'executed', filled_qty: 6, filled_avg_price: 101})
+    expect(listFillsForDecision(db, 'd1')).toEqual([
+      expect.objectContaining({fill_qty: 6, fill_price: 101}),
+    ])
+  })
+})

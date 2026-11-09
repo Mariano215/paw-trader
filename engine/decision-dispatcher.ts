@@ -1,0 +1,1383 @@
+import { randomUUID } from 'crypto'
+import type Database from 'better-sqlite3'
+import type { EngineClient } from './engine-client.js'
+import type { EnginePosition } from './types.js'
+import { daysToEarnings, earningsBlackoutDays } from './earnings.js'
+import {
+  runCommittee,
+  storeTranscript,
+  CommitteeGatedError,
+  type CommitteeDeps,
+  type CommitteeResult,
+  type CommitteeSignalInput,
+  type CommitteeTranscript,
+} from './committee.js'
+import { DEFAULT_SIZE_USD } from './approval-manager.js'
+import { applySizeWeight } from './size-weight.js'
+import { classifyStrategyTier, type LadderResult } from './autonomy-ladder.js'
+import { recordSignalSuppressionBySignalId } from './suppression-state.js'
+import { isAssetHeld } from './track-record.js'
+import { isEquityMarketHours } from './signal-poller.js'
+import { isTerminalSubmitError, DECISION_STATUS } from './order-lifecycle.js'
+import { logger } from '../logger.js'
+import {
+  TRADER_COMMITTEE_BYPASS,
+  TRADER_BYPASS_TRADE_TARGET,
+  TRADER_DAILY_TRADE_CAP,
+  TRADER_STRATEGY_GATE_ENABLED,
+} from '../config.js'
+import { traderKnob } from './knobs.js'
+
+const dailyTradeCap = (): number => traderKnob('daily_trade_cap', TRADER_DAILY_TRADE_CAP)
+import { decideGatedTrade } from './strategy/gate-decision.js'
+import {
+  countBypassTrades,
+  countTradesToday,
+  invalidateCounters,
+} from './bypass-counter.js'
+import { computeExits } from './exit-calculator.js'
+import {
+  renderAlert,
+  explainOrderRefused,
+  explainUnexpectedFailure,
+} from './plain-english.js'
+import { HARD_CEILING_USD } from './trader-constants.js'
+import { findUnexpectedShortPositions, notifyUnexpectedShortPositions } from './position-safety.js'
+import { COHORT_MAX_CONCURRENT_POSITIONS, countCohortEntriesToday, countCohortOpenPositions, guardRunningCohort } from './evaluation-cohort.js'
+import { skipsMarkovGate } from './backtest-report.js'
+import { recordTraderOperationalEvent } from './operational-events.js'
+import { sweepPendingForPausedStrategy } from './strategy-manager.js'
+
+export interface AutoDispatchResult {
+  signalId:  string
+  asset:     string
+  side:      'buy' | 'sell'
+  action:    'executed' | 'suppressed' | 'skipped'
+  reason:    string
+  sizeUsd?:  number
+  strategy?: string
+}
+
+// Phase 2 hard cap: committee can size up to this via the size_multiplier.
+// Raised from $100 default in Task 9 once paper trades pass QA; lifted to
+// $2500 on 2026-06-11 alongside HARD_CEILING_USD + the engine per-trade cap
+// (operator decision: risk model owns sizing for the paper evaluation).
+const COMMITTEE_MAX_SIZE_USD = 2500
+
+// Phase 5 Task 1 -- per-strategy live cap constants.
+// Absolute ceiling applied on top of every cap source so no single
+// strategy can run away with the book even if config is wrong or NAV
+// is missing. Defined in trader-constants.ts (shared with strategy gate).
+// Fraction of NAV used as the default cap when a strategy has no
+// explicit max_size_usd set (2% of portfolio NAV).
+const RISK_MULTIPLIER = 0.02
+
+interface ParsedReplyRef {
+  action: 'approve' | 'skip' | 'pause'
+  approvalId: string
+  decisionId: string  // this is the signal_id stored in trader_approvals.decision_id
+  override_size?: number
+}
+
+type StrategyGateResult =
+  | { suppressed: true; reason: string }
+  | { suppressed: false; sizeUsd: number }
+
+/**
+ * Shared strategy-gate block: regime filter + risk sizing.
+ * Called from both dispatchApproval and autoDispatchPendingSignals so the
+ * filter is symmetric across both execution paths.
+ *
+ * Uses the already-fetched nav to avoid a second getNav() round-trip (#4).
+ * Records signal suppression when the regime gate fires (#3).
+ * Only applies Math.min shrinkage when gate.sizeUsd is non-null, so a
+ * non-buy pass-through (sizeUsd=null) never zeroes the order (#1).
+ * Returns early (suppressed=true) so the caller can suppress/continue
+ * without submitting. Returns suppressed=false with the (possibly shrunk)
+ * sizeUsd when the gate allows the trade.
+ *
+ * On any fetch failure the gate is skipped and the legacy size is returned
+ * unchanged (fail toward the existing, already-capped path).
+ */
+async function applyStrategyGate(
+  db: Database.Database,
+  engineClient: EngineClient,
+  signalId: string,
+  asset: string,
+  side: 'buy' | 'sell',
+  nav: number | null,
+  currentSizeUsd: number,
+  now: number,
+): Promise<StrategyGateResult> {
+  if (!TRADER_STRATEGY_GATE_ENABLED) {
+    return { suppressed: false, sizeUsd: currentSizeUsd }
+  }
+
+  const toMs = Date.now()
+  const fromMs = toMs - 400 * 24 * 60 * 60 * 1000  // ~400 calendar days -> ~260 bars
+  const gateBars = await engineClient.getPrices(asset, fromMs, toMs).catch(() => [])
+
+  // Use already-fetched nav; skip gate entirely on missing/zero NAV or no bars.
+  if (gateBars.length === 0 || nav == null || nav <= 0) {
+    return { suppressed: false, sizeUsd: currentSizeUsd }
+  }
+
+  const lastClose = gateBars[gateBars.length - 1].close
+  const gate = decideGatedTrade({
+    asset,
+    side,
+    bars: gateBars,
+    entryPrice: lastClose,
+    navUsd: nav,
+    openRiskUsd: 0,  // TODO: real open-risk needs per-position stops; 0 until fills land
+  })
+  logger.info({ signalId, asset, gate }, 'Strategy gate evaluated')
+
+  if (!gate.allow) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_regime' WHERE id=?").run(signalId)
+    recordSignalSuppressionBySignalId(db, signalId, 'regime', now)
+    return { suppressed: true, reason: gate.reason }
+  }
+
+  // Only shrink when the gate produced a size recommendation (non-null = buy path).
+  // A null sizeUsd means non-buy pass-through: leave currentSizeUsd untouched.
+  const sizeUsd = gate.sizeUsd != null
+    ? Math.min(currentSizeUsd, gate.sizeUsd)
+    : currentSizeUsd
+  return { suppressed: false, sizeUsd }
+}
+
+export interface DispatchDeps {
+  /** Injectable committee runner for tests. Defaults to the real runCommittee
+   *  which pulls runAgent from ../agent.js on first call. */
+  runCommittee?: (signal: CommitteeSignalInput, deps: CommitteeDeps) => Promise<CommitteeResult>
+  /** Injectable runAgent for tests. Defaults to a dynamic import of ../agent.js. */
+  runAgent?: CommitteeDeps['runAgent']
+  /** Injectable autonomy ladder classifier. Defaults to classifyStrategyTier
+   *  which reads trader_strategy_track_record + recent thesis grades. Tests
+   *  can stub this to bypass cold-start scaling on synthetic signals. */
+  classifyTier?: (db: Database.Database, strategyId: string) => LadderResult
+}
+
+export async function dispatchApproval(
+  db: Database.Database,
+  parsed: ParsedReplyRef,
+  engineClient?: EngineClient,
+  deps: DispatchDeps = {},
+): Promise<string> {
+  if (parsed.action === 'skip') {
+    return 'Skipped. No trade placed.'
+  }
+
+  if (parsed.action === 'pause') {
+    // Look up the strategy that generated this signal rather than hardcoding the ID
+    const signal = db.prepare(`SELECT strategy_id FROM trader_signals WHERE id = ?`).get(parsed.decisionId) as
+      | { strategy_id: string }
+      | undefined
+    if (signal?.strategy_id) {
+      db.prepare("UPDATE trader_strategies SET status='paused', updated_at=? WHERE id=?")
+        .run(Date.now(), signal.strategy_id)
+      sweepPendingForPausedStrategy(db, signal.strategy_id)
+      return `Strategy '${signal.strategy_id}' paused. No new signals will be sent until you resume it.`
+    }
+    return 'Pause requested but signal not found -- no strategy paused.'
+  }
+
+  // action === 'approve'
+  if (!engineClient) {
+    const { getEngineClient } = await import('./engine-client.js')
+    engineClient = getEngineClient()
+  }
+
+  const signal = db.prepare('SELECT * FROM trader_signals WHERE id = ?').get(parsed.decisionId) as any
+  if (!signal) {
+    return 'Error: signal not found. Trade not placed.'
+  }
+
+  // Once prospective cohort enforcement is enabled, no manual approval may
+  // spend committee budget or reach the broker outside its frozen experiment.
+  const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
+  if (!cohortGuard.ok) {
+    const label = cohortGuard.suppression ?? 'no_running_cohort'
+    db.prepare("UPDATE trader_signals SET status=? WHERE id=?").run(`suppressed_${label}`, signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, label)
+    return `Trade blocked: ${cohortGuard.reason}. No order placed.`
+  }
+  const cohort = cohortGuard.cohort
+  if (cohort && countCohortEntriesToday(db, cohort.id) >= cohort.daily_trade_cap) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_cohort_daily_cap' WHERE id=?").run(signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
+    return `Cohort daily trade cap reached (${cohort.daily_trade_cap}). No order placed.`
+  }
+  if (cohort && countCohortOpenPositions(db, cohort.id) >= COHORT_MAX_CONCURRENT_POSITIONS) {
+    db.prepare("UPDATE trader_signals SET status='suppressed_cohort_max_positions' WHERE id=?").run(signal.id)
+    recordSignalSuppressionBySignalId(db, signal.id, 'cohort_max_positions')
+    return `Cohort holds ${COHORT_MAX_CONCURRENT_POSITIONS} open positions, its slot cap. No order placed.`
+  }
+
+  const decisionId = randomUUID()
+  const now = Date.now()
+
+  // ----- Phase 2 Task 4: Committee pass replaces the Tier-0 raw-score stub -----
+  // Size honors the user's override_size when present; otherwise the committee
+  // decides within [0, COMMITTEE_MAX_SIZE_USD]. If the committee abstains we
+  // still record a 'committee_abstain' decision so the audit trail is complete.
+  const defaultSize = parsed.override_size ?? DEFAULT_SIZE_USD
+  const runCommitteeImpl = deps.runCommittee ?? runCommittee
+  const runAgentImpl = deps.runAgent ?? (await import('./tracked-run-agent.js')).trackedRunAgent
+
+  const committeeInput: CommitteeSignalInput = {
+    id: signal.id,
+    asset: signal.asset,
+    side: signal.side,
+    raw_score: signal.raw_score,
+    horizon_days: signal.horizon_days,
+    enrichment_json: signal.enrichment_json ?? null,
+    strategy_id: signal.strategy_id,
+  }
+
+  // Phase 2 Task 5 -- ReasoningBank retrieval. Returns null until the
+  // Phase 3 verdicts pipeline populates the bank, at which point this
+  // call starts injecting past similar cases into the coordinator
+  // prompt with no further dispatcher changes.
+  let pastCases: string | null = null
+  try {
+    const { retrievePastCases } = await import('./reasoning-bank.js')
+    pastCases = retrievePastCases(db, {
+      asset: signal.asset,
+      strategy: signal.strategy_id,
+      side: signal.side,
+      k: 3,
+    })
+  } catch (err) {
+    logger.warn({ err, signalId: signal.id }, 'ReasoningBank retrieval failed; proceeding without past cases')
+  }
+
+  // Gate 1: daily cap (applies regardless of bypass mode)
+  const dailyCount = countTradesToday(db)
+  if (dailyCount >= dailyTradeCap()) {
+    logger.warn(
+      { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: dailyTradeCap() },
+      'daily cap reached, suppressing',
+    )
+    db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
+    return 'Daily trade cap reached. No trade placed.'
+  }
+
+  // Gate 2: bypass branch (only while under target)
+  const bypass = TRADER_COMMITTEE_BYPASS
+  const bypassCount = bypass ? countBypassTrades(db) : 0
+  const useBypass = bypass && bypassCount < TRADER_BYPASS_TRADE_TARGET
+
+  let committeeResult: CommitteeResult
+  if (useBypass) {
+    const tag = `[BYPASS#${bypassCount + 1}/${TRADER_BYPASS_TRADE_TARGET}]`
+    logger.warn(
+      { event: 'trader.bypass.dispatched', signalId: signal.id, asset: signal.asset, bypassCount: bypassCount + 1, target: TRADER_BYPASS_TRADE_TARGET },
+      `TRADER_COMMITTEE_BYPASS active — ${tag} (paper mode)`,
+    )
+    if (bypassCount + 1 === TRADER_BYPASS_TRADE_TARGET) {
+      logger.warn(
+        { event: 'trader.bypass.target_reached', count: TRADER_BYPASS_TRADE_TARGET },
+        'bypass target reached, next signal will use committee',
+      )
+    }
+    const bypassTs = Date.now()
+    committeeResult = {
+      decision:      'approve',
+      action:        signal.side as 'buy' | 'sell',
+      size_usd:      defaultSize,
+      confidence:    1.0,
+      thesis:        `${tag} Committee skipped via TRADER_COMMITTEE_BYPASS. Paper mode only.`,
+      transcript_id: randomUUID(),
+      transcript: {
+        signal_id:       signal.id,
+        started_at:      bypassTs,
+        finished_at:     bypassTs,
+        rounds_executed: 0,
+        round_1:         [],
+        risk_officer:    { role: 'risk_officer', veto: false, reason: 'bypassed', concerns: [] },
+        trader:          { role: 'trader', action: signal.side as 'buy' | 'sell', thesis: 'bypassed', confidence: 1.0, size_multiplier: 1 },
+        errors:          [],
+      } satisfies CommitteeTranscript,
+    }
+    invalidateCounters()
+  } else {
+    try {
+      committeeResult = await runCommitteeImpl(committeeInput, {
+        runAgent: runAgentImpl,
+        defaultSizeUsd: defaultSize,
+        maxSizeUsd: COMMITTEE_MAX_SIZE_USD,
+        pastCases,
+        db,
+      })
+    } catch (err) {
+      logger.error({ err, signalId: signal.id }, 'Committee run threw; blocking trade')
+      return 'Committee run failed. No trade placed.'
+    }
+
+    // Persist the transcript regardless of approve/abstain for audit.
+    storeTranscript(db, committeeResult)
+  }
+
+  if (committeeResult.decision === 'abstain') {
+    db.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, thesis, confidence, committee_transcript_id, decided_at, status, cohort_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      decisionId, signal.id, 'abstain', signal.asset,
+      0, 'none',
+      committeeResult.thesis,
+      committeeResult.confidence,
+      committeeResult.transcript_id,
+      now, 'committee_abstain', cohort?.id ?? null,
+    )
+    recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', now)
+    db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
+    // Close any other pending signals for the same asset+side: the committee
+    // verdict already covers them and they should not re-queue.
+    closeSiblingPendingSignals(db, signal.id, signal.strategy_id, signal.asset, signal.side, now)
+    return `Committee abstained. ${committeeResult.thesis}`
+  }
+
+  try {
+    const rawSize = committeeResult.size_usd > 0 ? committeeResult.size_usd : defaultSize
+
+    // Phase 3 Task 5 -- autonomy ladder. Apply prudent scale based on
+    // the strategy's track record (cold-start, drawdown, grade trend).
+    // Defaults to classifyStrategyTier; tests inject a stub.
+    const classifyTierImpl = deps.classifyTier ?? classifyStrategyTier
+    const tier = classifyTierImpl(db, signal.strategy_id)
+    const ladderScaled = Math.round(rawSize * tier.scale * 100) / 100
+
+    // Phase 5 Task 1 -- per-strategy live cap.
+    // Priority: explicit max_size_usd > NAV * 2% fallback. A $1000 hard
+    // ceiling applies on top of either so a single strategy cannot run
+    // away with the book even if a bad config or missing NAV sneaks
+    // through. getNav failure falls back to DEFAULT_SIZE_USD rather
+    // than blocking the trade -- the engine still enforces its own
+    // risk rails downstream.
+    //
+    // max_size_usd = 0 is treated as "cap disabled, use the NAV path"
+    // so an operator zeroing the column during reset does not
+    // accidentally submit a $0 order. NULL has the same meaning.
+    // Fetch NAV and positions once; reuse for both the cap calculation and
+    // risk sizing so diverging values cannot cause the sizing to bypass the cap
+    // derived from a different NAV snapshot.
+    const manualNavForSize = await engineClient!.getNav().catch((err) => {
+      logger.warn(
+        { err, strategyId: signal.strategy_id },
+        'NAV fetch failed, falling back to DEFAULT_SIZE_USD cap',
+      )
+      return null
+    })
+    let manualSizePositions: EnginePosition[]
+    try {
+      manualSizePositions = await engineClient!.getPositions()
+    } catch (err) {
+      logger.warn({err}, 'Manual dispatch blocked: broker positions unavailable')
+      return 'Trade blocked: broker positions are unavailable. No order placed.'
+    }
+    const manualShorts = findUnexpectedShortPositions(manualSizePositions)
+    if (manualShorts.length > 0) {
+      return `Trade blocked: unexpected short position ${manualShorts.map(p => `${p.asset} ${p.qty}`).join(', ')}. ` +
+        'Flatten it at the broker and reconcile fills before placing another entry.'
+    }
+
+    const stratRow = db
+      .prepare('SELECT max_size_usd FROM trader_strategies WHERE id = ?')
+      .get(signal.strategy_id) as { max_size_usd: number | null } | undefined
+    let cap: number
+    if (stratRow?.max_size_usd != null && stratRow.max_size_usd > 0) {
+      cap = Math.min(stratRow.max_size_usd, HARD_CEILING_USD)
+    } else {
+      // Treat null OR non-positive NAV as "no usable NAV" so cold-start
+      // engines (no positions, no snapshots -> nav=0) fall back to the
+      // hard default cap instead of zeroing the cap and submitting
+      // size_usd=0, which the engine rejects with 422 position_sizer.
+      const navUsable = manualNavForSize != null && manualNavForSize > 0
+      const navCap = navUsable ? manualNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD
+      cap = Math.min(navCap, HARD_CEILING_USD)
+    }
+    // Vol-targeted strategies shrink the cap by the engine's weight; risk sizing re-clamps to it.
+    cap = applySizeWeight(cap, signal.size_weight)
+    const { computeRiskBasedSize } = await import('./risk-sizing.js')
+    const manualRiskSize = computeRiskBasedSize({
+      nav: manualNavForSize,
+      positions: manualSizePositions,
+      // Keep the autonomy ladder (ladderScaled) as an upper bound so cold-start
+      // strategies are still scaled down relative to the risk-sized amount.
+      capUsd: Math.min(cap, ladderScaled > 0 ? ladderScaled : cap),
+      floorUsd: DEFAULT_SIZE_USD,
+    })
+    if (manualRiskSize.sizeUsd <= 0) {
+      db.prepare("UPDATE trader_signals SET status = 'suppressed_portfolio_heat' WHERE id = ?").run(signal.id)
+      recordSignalSuppressionBySignalId(db, signal.id, 'portfolio_heat', now)
+      return `Trade blocked: ${manualRiskSize.reason}. No order placed.`
+    }
+    const sizeUsd = manualRiskSize.sizeUsd
+
+    // Falls back to the engine's latest close when enrichment carries no
+    // price. A 0 here means computeExits() returns null exits, i.e. a naked
+    // position -- that was 43% of the book before the fallback existed.
+    const { resolveEntryReferencePrice, entryWirePrice } = await import('./entry-reference-price.js')
+    const entryRef = await resolveEntryReferencePrice(
+      engineClient!, signal.asset, signal.enrichment_json, now,
+    )
+    const exits = computeExits({
+      side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
+      entryPrice: entryRef,
+      horizonDays: signal.horizon_days,
+      enrichment: signal.enrichment_json ?? null,
+    })
+
+    logger.info(
+      { signalId: signal.id, strategyId: signal.strategy_id, tier: tier.tier, scale: tier.scale, rawSize, ladderScaled, cap, sizeUsd, reason: tier.reason },
+      'Autonomy ladder + risk sizing applied',
+    )
+
+    // Correlation-cluster exposure gate -- uses already-fetched positions and NAV.
+    // Product decision: TRIM to headroom rather than block. Suppress only when
+    // headroom <= 0 (cluster already at or over cap).
+    let finalSizeUsd = sizeUsd
+    {
+      const { evaluateClusterGate, evaluateSymbolGate } = await import('./correlation-gate.js')
+      const clusterGate = evaluateClusterGate({
+        asset: signal.asset,
+        proposedSizeUsd: sizeUsd,
+        positions: manualSizePositions,
+        nav: manualNavForSize,
+      })
+      if (!clusterGate.allowed) {
+        if (clusterGate.allowedSizeUsd <= 0) {
+          db.prepare("UPDATE trader_signals SET status = 'suppressed_cluster_cap' WHERE id = ?").run(signal.id)
+          recordSignalSuppressionBySignalId(db, signal.id, 'cluster_cap', now)
+          return `Trade blocked: ${clusterGate.reason}. No order placed.`
+        }
+        // Headroom > 0: trim to allowedSizeUsd and proceed.
+        finalSizeUsd = Math.round(clusterGate.allowedSizeUsd * 100) / 100
+        logger.info(
+          { signalId: signal.id, original: sizeUsd, trimmed: finalSizeUsd, cluster: clusterGate.cluster },
+          'cluster cap: trimmed order to headroom',
+        )
+      }
+
+      // Per-symbol re-entry gate -- see the auto-dispatch path for the
+      // full rationale. Same rules apply to an operator-approved signal.
+      {
+        const { evaluateSymbolCooldown, SYMBOL_COOLDOWN_DAYS } = await import('./symbol-cooldown.js')
+        const cooldown = evaluateSymbolCooldown({
+          db,
+          asset: signal.asset,
+          side: signal.side,
+          positions: manualSizePositions,
+          nowMs: now,
+          cooldownDays: traderKnob('symbol_cooldown_days', SYMBOL_COOLDOWN_DAYS),
+        })
+        if (!cooldown.allowed) {
+          db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cooldown' WHERE id = ?").run(signal.id)
+          recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cooldown', now)
+          return `Trade blocked: ${cooldown.reason}. No order placed.`
+        }
+      }
+
+      // Per-symbol gate, tighter than the cluster gate -- stops one ticker
+      // (e.g. a singleton-cluster symbol) from repeatedly absorbing signals
+      // until it alone accounts for most of the book's exposure.
+      const symbolGate = evaluateSymbolGate({
+        asset: signal.asset,
+        proposedSizeUsd: finalSizeUsd,
+        positions: manualSizePositions,
+        nav: manualNavForSize,
+      })
+      if (!symbolGate.allowed) {
+        if (symbolGate.allowedSizeUsd <= 0) {
+          db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cap' WHERE id = ?").run(signal.id)
+          recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cap', now)
+          return `Trade blocked: ${symbolGate.reason}. No order placed.`
+        }
+        finalSizeUsd = Math.round(symbolGate.allowedSizeUsd * 100) / 100
+        logger.info(
+          { signalId: signal.id, trimmed: finalSizeUsd, symbol: symbolGate.cluster },
+          'symbol cap: trimmed order to headroom',
+        )
+      }
+    }
+
+    // Strategy gate (regime filter + fixed-fractional sizing). Shared helper
+    // used by both dispatchApproval and autoDispatchPendingSignals. Reuses the
+    // already-fetched manualNavForSize -- no second getNav() round-trip.
+    {
+      const gateResult = await applyStrategyGate(
+        db, engineClient!, signal.id,
+        signal.asset,
+        (committeeResult.action ?? signal.side) as 'buy' | 'sell',
+        manualNavForSize,
+        finalSizeUsd,
+        now,
+      )
+      if (gateResult.suppressed) {
+        return `Suppressed by strategy gate: ${gateResult.reason}`
+      }
+      finalSizeUsd = gateResult.sizeUsd
+    }
+
+    const result = await engineClient!.submitDecision({
+      decision_id: decisionId,
+      asset: signal.asset,
+      side: committeeResult.action ?? signal.side,
+      size_usd: finalSizeUsd,
+      entry_type: 'limit',
+      entry_price: entryWirePrice(signal.asset, entryRef),
+      ...(exits.stopLoss != null ? { stop_loss: exits.stopLoss } : {}),
+      ...(exits.takeProfit != null ? { take_profit: exits.takeProfit } : {}),
+      strategy: signal.strategy_id.replace(/-stocks$/, ''),
+      confidence: committeeResult.confidence,
+    })
+
+    db.prepare(`
+      INSERT INTO trader_decisions
+        (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status, engine_order_id, cohort_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      decisionId, signal.id,
+      committeeResult.action ?? signal.side,
+      signal.asset,
+      result.approved_size_usd, 'limit',
+      entryRef,
+      exits.stopLoss,
+      exits.takeProfit,
+      committeeResult.thesis,
+      committeeResult.confidence,
+      committeeResult.transcript_id,
+      now, 'submitted',
+      result.broker_order_id ?? null,
+      cohort?.id ?? null,
+    )
+
+    db.prepare("UPDATE trader_signals SET status='decided' WHERE id=?").run(signal.id)
+    recordTraderOperationalEvent(db, {
+      eventId: `submission:${decisionId}`,
+      sourceTs: now,
+      source: 'brain.dispatcher',
+      stage: 'broker',
+      eventType: 'broker.order.submitted',
+      state: 'submitted',
+      asset: signal.asset,
+      strategyId: signal.strategy_id,
+      signalId: signal.id,
+      decisionId,
+      cohortId: cohort?.id ?? null,
+      orderId: result.broker_order_id ?? result.client_order_id,
+      metadata: {
+        side: committeeResult.action ?? signal.side,
+        size_usd: result.approved_size_usd,
+        status: result.status,
+      },
+    })
+    // Close any pending duplicates for the same asset+side -- trade already placed.
+    closeSiblingPendingSignals(db, signal.id, signal.strategy_id, signal.asset, signal.side, now)
+
+    return `Order placed. Asset: ${signal.asset}, Size: $${result.approved_size_usd}, Confidence: ${committeeResult.confidence.toFixed(2)}, Status: ${result.status}, ID: ${result.client_order_id.slice(0, 8)}...`
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return `Trade blocked by engine: ${msg}. No order placed.`
+  }
+}
+
+export interface AutoDispatchDeps {
+  send:           (text: string) => Promise<void>
+  runCommittee?:  (signal: CommitteeSignalInput, deps: CommitteeDeps) => Promise<CommitteeResult>
+  runAgent?:      CommitteeDeps['runAgent']
+  alertOnReject?: boolean
+}
+
+/**
+ * Round a gate-trimmed order size to cents, or return null when the headroom
+ * left is below the minimum order size.
+ *
+ * computeRiskBasedSize applies floorUsd internally (risk-sizing.ts:92-95), but
+ * the cluster and symbol trims below overwrite sizeUsd afterwards and never
+ * re-apply it. That is how $27.31, $8.12, $3.94 and $1.80 TLT lots reached the
+ * broker on 2026-07-31: as NAV ticked up a few dollars each cycle, the symbol
+ * cap reopened a few dollars of headroom and every re-emitted signal was
+ * trimmed to fit it. Sub-minimum lots are noise -- they pollute FIFO lot
+ * matching and each one still writes a full verdict row.
+ */
+function trimToSize(allowedSizeUsd: number): number | null {
+  const trimmed = Math.round(allowedSizeUsd * 100) / 100
+  return trimmed < DEFAULT_SIZE_USD ? null : trimmed
+}
+
+const MAX_PENDING_SIGNAL_AGE_MS = 24 * 3600_000
+const MAX_COMMITTEE_ATTEMPTS = 2
+
+const nyDate = (ms: number): string => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' })
+
+/**
+ * Crypto: older than 24h. Equity: not dispatched inside the regular session it
+ * was generated in. A 15:56 ET signal polled after the close would otherwise
+ * go out at the next open on a stale price and, while pending, block that
+ * day's fresh signal for the same slot.
+ */
+function isStaleSignal(signal: { asset: string; generated_at: number }, nowMs: number): boolean {
+  if (signal.asset.includes('/')) return nowMs - signal.generated_at > MAX_PENDING_SIGNAL_AGE_MS
+  return !isEquityMarketHours(nowMs) || nyDate(nowMs) !== nyDate(signal.generated_at)
+}
+
+/** True when an exit decision for this asset (opposite of the entry side) filled on the ET date of nowMs. */
+function exitFilledToday(db: Database.Database, asset: string, entrySide: string, nowMs: number): boolean {
+  const exitAction = entrySide === 'buy' ? 'sell' : 'buy'
+  const rows = db.prepare(`
+    SELECT COALESCE(MAX(f.fill_ts_ms), CASE WHEN d.status = ? THEN d.decided_at END) AS fill_ms
+    FROM trader_decisions d LEFT JOIN trader_fills f ON f.decision_id = d.id
+    WHERE d.asset = ? AND d.action = ? AND d.parent_decision_id IS NOT NULL
+    GROUP BY d.id`).all(DECISION_STATUS.CLOSED, asset, exitAction) as Array<{ fill_ms: number | null }>
+  const today = nyDate(nowMs)
+  return rows.some((r) => r.fill_ms != null && nyDate(r.fill_ms) === today)
+}
+
+export async function autoDispatchPendingSignals(
+  db: Database.Database,
+  deps: AutoDispatchDeps,
+  engineClient?: EngineClient,
+): Promise<AutoDispatchResult[]> {
+  // ORDER BY raw_score DESC is load-bearing: it makes the daily cap rank-aware
+  // within a tick -- the strongest signals are dispatched first, so when the
+  // cap is hit the suppressed remainder are the weakest, not the latest ones.
+  const pending = db.prepare(
+    "SELECT * FROM trader_signals WHERE status = 'pending' ORDER BY raw_score DESC",
+  ).all() as any[]
+
+  if (pending.length === 0) return []
+
+  const results: AutoDispatchResult[] = []
+
+  // One broker snapshot for the whole sweep. Needed up front by the re-entry
+  // guard: a DB-only guard trusts decision rows, and stale rows (an entry the
+  // close-out watcher could never grade) would block an asset forever. Also
+  // reused for sizing below instead of re-fetching per signal.
+  let brokerPositions: EnginePosition[] | undefined
+  try {
+    if (!engineClient) {
+      const { getEngineClient } = await import('./engine-client.js')
+      engineClient = getEngineClient()
+    }
+    brokerPositions = await engineClient.getPositions()
+  } catch (err) {
+    // Current broker exposure is required before adding risk. Leave pending
+    // signals untouched so they can resume after the position feed recovers.
+    logger.warn({ err }, 'auto-dispatch blocked: broker positions unavailable')
+    return []
+  }
+  const unexpectedShorts = await notifyUnexpectedShortPositions(db, brokerPositions, deps.send)
+  if (unexpectedShorts.length > 0) {
+    logger.error(
+      {shorts: unexpectedShorts.map(p => ({asset: p.asset, qty: p.qty}))},
+      'auto-dispatch blocked: unexpected short position',
+    )
+    return []
+  }
+
+  for (const signal of pending) {
+    // Atomic claim -- if another dispatch already grabbed it, changes === 0
+    const claimed = db.prepare(
+      "UPDATE trader_signals SET status = 'dispatching' WHERE id = ? AND status = 'pending'",
+    ).run(signal.id)
+    if (claimed.changes === 0) continue
+
+    // Gated signals stay pending through an outage; never enter on a price
+    // that is over a day old. The engine re-emits live signals each day.
+    if (isStaleSignal(signal, Date.now())) {
+      db.prepare("UPDATE trader_signals SET status = 'suppressed_stale' WHERE id = ?").run(signal.id)
+      recordSignalSuppressionBySignalId(db, signal.id, 'stale')
+      continue
+    }
+
+    try {
+      const strategy = db.prepare(
+        'SELECT id, name, tier, status FROM trader_strategies WHERE id = ?',
+      ).get(signal.strategy_id) as { id: string; name: string; tier: number; status: string } | undefined
+
+      if (!strategy || strategy.status === 'paused') {
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_strategy_paused' WHERE id = ?")
+          .run(signal.id)
+        continue
+      }
+
+      // Prospective evidence boundary. This runs before every costly or
+      // mutating gate. A config mismatch invalidates the cohort and pauses the
+      // strategy atomically inside guardRunningCohort.
+      const cohortGuard = guardRunningCohort(db, signal.strategy_id, signal.asset)
+      if (!cohortGuard.ok) {
+        const label = cohortGuard.suppression ?? 'no_running_cohort'
+        logger.warn({signalId: signal.id, strategyId: signal.strategy_id, reason: cohortGuard.reason, label},
+          'auto-dispatch blocked by cohort guard')
+        db.prepare("UPDATE trader_signals SET status=? WHERE id=?").run(`suppressed_${label}`, signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, label)
+        continue
+      }
+      const cohort = cohortGuard.cohort
+      if (cohort && countCohortEntriesToday(db, cohort.id) >= cohort.daily_trade_cap) {
+        db.prepare("UPDATE trader_signals SET status='suppressed_cohort_daily_cap' WHERE id=?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'cohort_daily_cap')
+        continue
+      }
+      // Cohort capital is ten positions; more concurrent lots than the backtest's ten slots would be leverage it never had.
+      if (cohort && countCohortOpenPositions(db, cohort.id) >= COHORT_MAX_CONCURRENT_POSITIONS) {
+        db.prepare("UPDATE trader_signals SET status='suppressed_cohort_max_positions' WHERE id=?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'cohort_max_positions')
+        continue
+      }
+
+      // Gate -2: one open order per asset. A decision that is submitted or
+      // waiting for a fill already owns this asset; a second one is how the
+      // 2026-08-25 BTC runaway made 83 pending_fill rows in one night.
+      const openOrder = db
+        .prepare('SELECT id FROM trader_decisions WHERE asset = ? AND status IN (?, ?, ?, ?, ?) LIMIT 1')
+        // retry_pending and engine_down still get resubmitted, so they own the asset too.
+        .get(signal.asset, DECISION_STATUS.SUBMITTING, DECISION_STATUS.SUBMITTED, DECISION_STATUS.PENDING_FILL,
+          DECISION_STATUS.RETRY_PENDING, DECISION_STATUS.ENGINE_DOWN) as { id: string } | undefined
+      if (openOrder) {
+        logger.info({ event: 'trader.gate.pending_order', signalId: signal.id, asset: signal.asset, decisionId: openOrder.id }, 'Signal skipped: an order for this asset is still open')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_pending_order' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'pending_order')
+        continue
+      }
+
+      // Gate -1: re-entry guard. Runs before every other gate because it is
+      // both the cheapest and the one that was missing: the signal dedupe index
+      // only covers pending/dispatching signals, so a re-emitted candidate
+      // would open a second identical lot on the very next tick. Costs one
+      // indexed query and saves the whole committee call.
+      // One position per symbol across ALL strategies: the broker holding the
+      // asset in this direction blocks a new lot even if another strategy
+      // opened it. Two strategies share one broker position, so one
+      // strategy's exit would sell the other's shares.
+      const brokerHolds = brokerPositions?.some(
+        (p) => p.asset === signal.asset && (signal.side === 'buy' ? p.qty > 1e-9 : p.qty < -1e-9),
+      ) ?? false
+      if (brokerHolds || isAssetHeld(db, {
+        asset: signal.asset,
+        side: signal.side,
+        positions: brokerPositions,
+      })) {
+        logger.info(
+          { event: 'trader.gate.already_held', signalId: signal.id, asset: signal.asset, side: signal.side, strategy: strategy.id },
+          'already holding this asset, suppressing re-entry',
+        )
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_already_held' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'already_held')
+        continue
+      }
+
+      // Gate -0.75: no same-day re-entry after an exit fill. The engine backtest
+      // resumes scanning at the exit bar, so its earliest re-entry is the next
+      // bar's open; a same-open round trip only pays slippage twice.
+      if (!signal.asset.includes('/') && exitFilledToday(db, signal.asset, signal.side, Date.now())) {
+        logger.info({ event: 'trader.gate.same_day_reentry', signalId: signal.id, asset: signal.asset }, 'exit filled today, suppressing same-day re-entry')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_same_day_reentry' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'same_day_reentry')
+        continue
+      }
+
+      // Gate -0.5: earnings blackout for single stocks (knob earnings_blackout_days).
+      const earnDays = await daysToEarnings(signal.asset)
+      if (earnDays != null && earnDays <= earningsBlackoutDays()) {
+        logger.info({ event: 'trader.gate.earnings', signalId: signal.id, asset: signal.asset, earnDays }, 'earnings inside blackout window, suppressing entry')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_earnings' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'earnings')
+        continue
+      }
+
+      // Gate 0: Markov regime pre-filter (deterministic, no LLM cost).
+      // Skipped for mean-reversion strategies: a bear/oversold regime is the
+      // entry condition for mean reversion, not a contraindication. The SMA
+      // regime gate and committee still protect those signals downstream.
+      // For all other strategies: suppress if Markov strongly contradicts
+      // the signal direction -- committee would veto anyway, skip LLM cost.
+      // skipsMarkovGate also exempts momentum-vt-crypto (backtest has no regime gate).
+      if (!skipsMarkovGate(strategy.id) && signal.enrichment_json) {
+        try {
+          const enrichment = JSON.parse(signal.enrichment_json) as Record<string, unknown>
+          const regime = enrichment?.markov_regime as { markov_signal?: number } | undefined
+          const markovSignal = typeof regime?.markov_signal === 'number' ? regime.markov_signal : null
+          if (markovSignal !== null) {
+            const isBuy = signal.side === 'buy'
+            // Threshold loosened -0.30 -> -0.15 (2026-06-28) to unfreeze the
+            // ~45% of signals this pre-gate suppressed. MUST stay in sync with
+            // the risk-officer mirror in committee.ts.
+            const regimeConflict = (isBuy && markovSignal <= -0.15) || (!isBuy && markovSignal >= 0.15)
+            if (regimeConflict) {
+              logger.info(
+                { signalId: signal.id, asset: signal.asset, side: signal.side, markovSignal },
+                'Trader: Markov pre-gate suppressed signal',
+              )
+              db.prepare("UPDATE trader_signals SET status = 'suppressed_markov_gate' WHERE id = ?")
+                .run(signal.id)
+              recordSignalSuppressionBySignalId(db, signal.id, 'markov_gate')
+              continue
+            }
+          }
+        } catch {
+          // Malformed enrichment JSON -- skip the gate, let committee decide.
+        }
+      }
+
+      const committeeInput: CommitteeSignalInput = {
+        id:              signal.id,
+        asset:           signal.asset,
+        side:            signal.side,
+        raw_score:       signal.raw_score,
+        horizon_days:    signal.horizon_days,
+        enrichment_json: signal.enrichment_json ?? null,
+        strategy_id:     signal.strategy_id,
+      }
+
+      // Gate 1: daily cap (applies regardless of bypass mode)
+      const dailyCount = countTradesToday(db)
+      if (dailyCount >= dailyTradeCap()) {
+        logger.warn(
+          { event: 'trader.cap.daily_hit', signalId: signal.id, dailyCount, cap: dailyTradeCap() },
+          'daily cap reached, suppressing',
+        )
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_daily_cap' WHERE id = ?").run(signal.id)
+        continue
+      }
+
+      // Gate 2: bypass branch (only while under target)
+      const bypass = TRADER_COMMITTEE_BYPASS
+      const bypassCount = bypass ? countBypassTrades(db) : 0
+      const useBypass = bypass && bypassCount < TRADER_BYPASS_TRADE_TARGET
+
+      const runCommitteeImpl = deps.runCommittee ?? runCommittee
+      const runAgentImpl     = deps.runAgent ?? (await import('./tracked-run-agent.js')).trackedRunAgent
+
+      let committeeResult: CommitteeResult
+      if (useBypass) {
+        const tag = `[BYPASS#${bypassCount + 1}/${TRADER_BYPASS_TRADE_TARGET}]`
+        logger.warn(
+          { event: 'trader.bypass.dispatched', signalId: signal.id, asset: signal.asset, bypassCount: bypassCount + 1, target: TRADER_BYPASS_TRADE_TARGET },
+          `TRADER_COMMITTEE_BYPASS active — ${tag} (paper mode)`,
+        )
+        if (bypassCount + 1 === TRADER_BYPASS_TRADE_TARGET) {
+          logger.warn(
+            { event: 'trader.bypass.target_reached', count: TRADER_BYPASS_TRADE_TARGET },
+            'bypass target reached, next signal will use committee',
+          )
+        }
+        const bypassTs = Date.now()
+        committeeResult = {
+          decision:      'approve',
+          action:        signal.side as 'buy' | 'sell',
+          size_usd:      DEFAULT_SIZE_USD,
+          confidence:    1.0,
+          thesis:        `${tag} Committee skipped via TRADER_COMMITTEE_BYPASS. Paper mode only.`,
+          transcript_id: randomUUID(),
+          transcript: {
+            signal_id:       signal.id,
+            started_at:      bypassTs,
+            finished_at:     bypassTs,
+            rounds_executed: 0,
+            round_1:         [],
+            risk_officer:    { role: 'risk_officer', veto: false, reason: 'bypassed', concerns: [] },
+            trader:          { role: 'trader', action: signal.side as 'buy' | 'sell', thesis: 'bypassed', confidence: 1.0, size_multiplier: 1 },
+            errors:          [],
+          } satisfies CommitteeTranscript,
+        }
+        invalidateCounters()
+      } else {
+        try {
+          committeeResult = await runCommitteeImpl(committeeInput, {
+            runAgent: runAgentImpl,
+            defaultSizeUsd: DEFAULT_SIZE_USD,
+            maxSizeUsd: COMMITTEE_MAX_SIZE_USD,
+            db,
+          })
+        } catch (err) {
+          if (err instanceof CommitteeGatedError) {
+            db.prepare("UPDATE trader_signals SET status = 'pending' WHERE id = ?").run(signal.id)
+            // runAgent REFUSED (kill switch / cost cap). The gate is global:
+            // every remaining signal would refuse identically, so stop the
+            // loop instead of churning through the queue recording bogus
+            // abstains (Jun 8-11 2026: 100% of committee output was gate
+            // refusals mislabeled as parse failures). Signals stay pending
+            // and re-enter on the next tick once the gate clears.
+            logger.warn({ signalId: signal.id, reason: err.message }, 'Committee gated -- halting dispatch loop for this tick')
+            break
+          }
+          // Each committee run is paid. Count failures in the event ledger and
+          // stop after MAX_COMMITTEE_ATTEMPTS instead of rerunning every tick for 24h.
+          const reason = err instanceof Error ? err.message : String(err)
+          // The ledger drops metadata strings with spaces, so store a token-safe slug.
+          const reasonToken = reason.replace(/[^A-Za-z0-9._:/-]+/g, '-').slice(0, 160) || 'unknown'
+          const eventId = recordTraderOperationalEvent(db, {
+            source: 'brain.dispatcher',
+            stage: 'committee',
+            eventType: 'committee.run.failed',
+            state: 'failed',
+            asset: signal.asset,
+            strategyId: signal.strategy_id,
+            signalId: signal.id,
+            metadata: { reason: reasonToken },
+          })
+          const { n: attempts } = db.prepare(
+            "SELECT COUNT(*) AS n FROM trader_operational_events WHERE signal_id = ? AND event_type = 'committee.run.failed'",
+          ).get(signal.id) as { n: number }
+          // If the ledger write failed the count cannot grow, so give up rather than loop on a paid call.
+          const giveUp = eventId === null || attempts >= MAX_COMMITTEE_ATTEMPTS
+          db.prepare('UPDATE trader_signals SET status = ? WHERE id = ?').run(giveUp ? 'failed' : 'pending', signal.id)
+          logger.error(
+            { err, signalId: signal.id, attempts },
+            giveUp
+              ? `Committee failed ${attempts} times for this signal, marking it failed: ${reason}`
+              : 'Committee threw during auto-dispatch, will retry next tick',
+          )
+          continue
+        }
+        storeTranscript(db, committeeResult)
+      }
+
+      if (committeeResult.decision === 'abstain') {
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_committee_abstain' WHERE id = ?")
+          .run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'committee_abstain', Date.now())
+
+        const result: AutoDispatchResult = {
+          signalId: signal.id,
+          asset:    signal.asset,
+          side:     signal.side as 'buy' | 'sell',
+          action:   'suppressed',
+          strategy: strategy.name,
+          reason:   committeeResult.thesis,
+        }
+        results.push(result)
+        if (deps.alertOnReject) {
+          await deps.send(formatRejectionAlert(result))
+        }
+        continue
+      }
+
+      // Committee approved -- submit to engine
+      if (!engineClient) {
+        const { getEngineClient } = await import('./engine-client.js')
+        engineClient = getEngineClient()
+      }
+
+      // Per-strategy cap: explicit max_size_usd > NAV*2% fallback, hard ceiling on top.
+      const autoStratRow = db.prepare('SELECT max_size_usd FROM trader_strategies WHERE id = ?')
+        .get(signal.strategy_id) as { max_size_usd: number | null } | undefined
+      const autoNavForSize = await engineClient.getNav().catch(() => null)
+      const autoNavUsable = autoNavForSize != null && autoNavForSize > 0
+      let autoCapUsd: number
+      if (autoStratRow?.max_size_usd != null && autoStratRow.max_size_usd > 0) {
+        autoCapUsd = Math.min(autoStratRow.max_size_usd, HARD_CEILING_USD)
+      } else {
+        autoCapUsd = Math.min(autoNavUsable ? autoNavForSize * RISK_MULTIPLIER : DEFAULT_SIZE_USD, HARD_CEILING_USD)
+      }
+      autoCapUsd = applySizeWeight(autoCapUsd, signal.size_weight)
+      const decisionId = randomUUID()
+      const now        = Date.now()
+
+      // Resolve an entry reference price so the exit-calculator can size
+      // stop/target off it. entry_price stays 0 on the wire when unknown
+      // (the engine resolves via market price), but exits need a concrete
+      // number: null entry -> null exits -> a position with no stop, which
+      // was 152 of 350 buys over the 60 days to 2026-07-22. Enrichment first,
+      // engine close as fallback. Computed before sizing so the size is set
+      // off the real stop distance, not a flat 8% guess.
+      const { resolveEntryReferencePrice, entryWirePrice } = await import('./entry-reference-price.js')
+      const entryRef = await resolveEntryReferencePrice(
+        engineClient, signal.asset, signal.enrichment_json, now,
+      )
+      const exits = computeExits({
+        side: (committeeResult.action ?? signal.side) as 'buy' | 'sell',
+        entryPrice: entryRef,
+        horizonDays: signal.horizon_days,
+        enrichment: signal.enrichment_json ?? null,
+      })
+
+      const { computeRiskBasedSize, stopDistanceFromExits, DEFAULT_RISK_PCT } = await import('./risk-sizing.js')
+      const autoSizePositions = brokerPositions ?? await engineClient.getPositions().catch(() => [] as EnginePosition[])
+      const autoRiskSize = computeRiskBasedSize({
+        nav: autoNavForSize,
+        // Knob is a percent of NAV (0.5 = 0.5%).
+        riskPct: traderKnob('risk_pct', DEFAULT_RISK_PCT * 100) / 100,
+        stopDistancePct: stopDistanceFromExits(entryRef, exits.stopLoss),
+        positions: autoSizePositions,
+        capUsd: autoCapUsd,
+        floorUsd: DEFAULT_SIZE_USD,
+      })
+      // If risk sizing zeroed the trade (portfolio heat ceiling), suppress.
+      if (autoRiskSize.sizeUsd <= 0) {
+        logger.warn({ event: 'trader.gate.heat_block', signalId: signal.id, reason: autoRiskSize.reason }, 'portfolio heat ceiling reached, suppressing')
+        db.prepare("UPDATE trader_signals SET status = 'suppressed_portfolio_heat' WHERE id = ?").run(signal.id)
+        recordSignalSuppressionBySignalId(db, signal.id, 'portfolio_heat', Date.now())
+        continue
+      }
+      let sizeUsd      = autoRiskSize.sizeUsd
+
+      // Correlation-cluster exposure gate (deterministic, pre-submit). Uses the
+      // already-fetched positions and NAV from the risk-sizing step above.
+      // Product decision: TRIM to headroom rather than block. Suppress only when
+      // headroom <= 0 (cluster already at or over cap).
+      {
+        const { evaluateClusterGate, evaluateSymbolGate } = await import('./correlation-gate.js')
+        const clusterGate = evaluateClusterGate({
+          asset: signal.asset,
+          proposedSizeUsd: sizeUsd,
+          positions: autoSizePositions,
+          nav: autoNavForSize,
+        })
+        if (!clusterGate.allowed) {
+          if (clusterGate.allowedSizeUsd <= 0) {
+            logger.warn(
+              { event: 'trader.gate.cluster_block', signalId: signal.id, cluster: clusterGate.cluster, current: clusterGate.currentExposureUsd, cap: clusterGate.capUsd, proposed: sizeUsd },
+              'correlation cluster cap reached, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_cluster_cap' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'cluster_cap', Date.now())
+            continue
+          }
+          // Headroom > 0: trim to allowedSizeUsd and proceed, unless what is
+          // left is below the minimum order size.
+          const trimmed = trimToSize(clusterGate.allowedSizeUsd)
+          if (trimmed === null) {
+            logger.warn(
+              { event: 'trader.gate.cluster_trim_below_min', signalId: signal.id, cluster: clusterGate.cluster, headroom: clusterGate.allowedSizeUsd, min: DEFAULT_SIZE_USD },
+              'cluster headroom below minimum order size, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_below_min_size' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'below_min_size')
+            continue
+          }
+          logger.info(
+            { event: 'trader.gate.cluster_trim', signalId: signal.id, cluster: clusterGate.cluster, original: sizeUsd, trimmed },
+            'cluster cap: trimmed order to headroom',
+          )
+          sizeUsd = trimmed
+        }
+
+        // Per-symbol re-entry gate. Exposure caps are blind to outcome, so
+        // they let the book buy a symbol that just closed red (EEM, ten
+        // straight losers). Runs before the exposure gates: if the symbol is
+        // benched there is nothing to size.
+        {
+          const { evaluateSymbolCooldown, SYMBOL_COOLDOWN_DAYS } = await import('./symbol-cooldown.js')
+          const cooldown = evaluateSymbolCooldown({
+            db,
+            asset: signal.asset,
+            side: signal.side,
+            positions: autoSizePositions,
+            nowMs: Date.now(),
+            cooldownDays: traderKnob('symbol_cooldown_days', SYMBOL_COOLDOWN_DAYS),
+          })
+          if (!cooldown.allowed) {
+            logger.warn(
+              { event: 'trader.gate.symbol_cooldown', signalId: signal.id, asset: signal.asset, rule: cooldown.rule, reason: cooldown.reason },
+              'symbol cooldown gate blocked entry',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cooldown' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cooldown', Date.now())
+            continue
+          }
+        }
+
+        // Per-symbol gate, tighter than the cluster gate -- stops one ticker
+        // (e.g. a singleton-cluster symbol) from repeatedly absorbing signals
+        // until it alone accounts for most of the book's exposure.
+        const symbolGate = evaluateSymbolGate({
+          asset: signal.asset,
+          proposedSizeUsd: sizeUsd,
+          positions: autoSizePositions,
+          nav: autoNavForSize,
+        })
+        if (!symbolGate.allowed) {
+          if (symbolGate.allowedSizeUsd <= 0) {
+            logger.warn(
+              { event: 'trader.gate.symbol_block', signalId: signal.id, symbol: symbolGate.cluster, current: symbolGate.currentExposureUsd, cap: symbolGate.capUsd, proposed: sizeUsd },
+              'symbol exposure cap reached, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_symbol_cap' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'symbol_cap', Date.now())
+            continue
+          }
+          const trimmed = trimToSize(symbolGate.allowedSizeUsd)
+          if (trimmed === null) {
+            logger.warn(
+              { event: 'trader.gate.symbol_trim_below_min', signalId: signal.id, symbol: symbolGate.cluster, headroom: symbolGate.allowedSizeUsd, min: DEFAULT_SIZE_USD },
+              'symbol headroom below minimum order size, suppressing',
+            )
+            db.prepare("UPDATE trader_signals SET status = 'suppressed_below_min_size' WHERE id = ?").run(signal.id)
+            recordSignalSuppressionBySignalId(db, signal.id, 'below_min_size')
+            continue
+          }
+          logger.info(
+            { event: 'trader.gate.symbol_trim', signalId: signal.id, symbol: symbolGate.cluster, original: sizeUsd, trimmed },
+            'symbol cap: trimmed order to headroom',
+          )
+          sizeUsd = trimmed
+        }
+      }
+
+      // Strategy gate (regime filter + fixed-fractional sizing). Shared helper
+      // used by both dispatchApproval and autoDispatchPendingSignals. Reuses the
+      // already-fetched autoNavForSize -- no second getNav() round-trip.
+      {
+        const gateResult = await applyStrategyGate(
+          db, engineClient, signal.id,
+          signal.asset,
+          (committeeResult.action ?? signal.side) as 'buy' | 'sell',
+          autoNavForSize,
+          sizeUsd,
+          now,
+        )
+        if (gateResult.suppressed) {
+          results.push({
+            signalId: signal.id,
+            asset:    signal.asset,
+            side:     signal.side as 'buy' | 'sell',
+            action:   'suppressed',
+            strategy: strategy.name,
+            reason:   gateResult.reason,
+          })
+          continue
+        }
+        sizeUsd = gateResult.sizeUsd
+      }
+
+      // Audit log so the 422 root cause is visible without re-arming a
+      // monitor. Records what payload we actually sent to the engine.
+      logger.info(
+        {
+          event:       'trader.auto_dispatch.submit',
+          signalId:    signal.id,
+          decisionId,
+          asset:       signal.asset,
+          side:        committeeResult.action ?? signal.side,
+          size_usd:    sizeUsd,
+          confidence:  committeeResult.confidence,
+          strategy:    signal.strategy_id,
+        },
+        'auto-dispatch submitting decision to engine',
+      )
+
+      try {
+        // Duplicate guard: if a decision row for this signal already has an
+        // engine_order_id, the broker already accepted a previous submission.
+        // Skip rather than double-submit.
+        //
+        // CRITICAL: a THROW here (e.g. schema drift -- missing engine_order_id
+        // column) must NOT fall through to a 'pending' reset. A pending reset
+        // re-arms the signal and every subsequent tick re-throws -> infinite
+        // re-dispatch loop. Distinguish "guard ran, no prior order" (continue)
+        // from "guard query errored" (terminal failure + alert).
+        let existing: unknown
+        try {
+          existing = db.prepare(
+            "SELECT id FROM trader_decisions WHERE signal_id = ? AND engine_order_id IS NOT NULL LIMIT 1",
+          ).get(signal.id)
+        } catch (guardErr) {
+          logger.error(
+            { err: guardErr, signalId: signal.id, decisionId },
+            'Duplicate-guard query failed -- marking signal failed (NOT re-queuing) to avoid re-dispatch loop',
+          )
+          db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
+          await deps.send(
+            renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
+          ).catch(() => {/* send errors must not block the continue */})
+          continue
+        }
+        if (existing) {
+          logger.warn({ signalId: signal.id, decisionId }, 'Duplicate guard hit -- skipping re-submission')
+          db.prepare("UPDATE trader_signals SET status = 'executed' WHERE id = ?").run(signal.id)
+          continue
+        }
+
+        // INSERT first so the audit row exists before the broker sees the order.
+        // Status 'submitting' prevents a crash-between-insert-and-submit from
+        // leaving the row in a state that triggers a duplicate next tick.
+        db.prepare(`
+          INSERT INTO trader_decisions
+            (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, committee_transcript_id, decided_at, status, cohort_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          decisionId, signal.id,
+          committeeResult.action ?? signal.side,
+          signal.asset, sizeUsd, 'limit',
+          entryRef,
+          exits.stopLoss,
+          exits.takeProfit,
+          committeeResult.thesis,
+          committeeResult.confidence,
+          committeeResult.transcript_id,
+          now, 'submitting', cohort?.id ?? null,
+        )
+
+        let engineResult: Awaited<ReturnType<EngineClient['submitDecision']>>
+        try {
+          engineResult = await engineClient.submitDecision({
+            decision_id:  decisionId,
+            asset:        signal.asset,
+            side:         committeeResult.action ?? signal.side,
+            size_usd:     sizeUsd,
+            entry_type:   'limit',
+            entry_price:  entryWirePrice(signal.asset, entryRef),
+            ...(exits.stopLoss != null ? { stop_loss: exits.stopLoss } : {}),
+            ...(exits.takeProfit != null ? { take_profit: exits.takeProfit } : {}),
+            strategy:     signal.strategy_id,
+            confidence:   committeeResult.confidence,
+          })
+        } catch (engineErr) {
+          const terminal = isTerminalSubmitError(engineErr)
+          const msg = engineErr instanceof Error ? engineErr.message : String(engineErr)
+          if (terminal) {
+            // 4xx: the engine refused this order (validation). No retry.
+            logger.error({ err: engineErr, signalId: signal.id, decisionId }, 'Engine submit rejected (4xx, terminal)')
+            db.prepare("UPDATE trader_decisions SET status = ? WHERE id = ?").run(DECISION_STATUS.FAILED, decisionId)
+            db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
+            await deps.send(
+              renderAlert(explainOrderRefused(signal.asset, signal.side, msg, false)),
+            ).catch(() => {/* send must not block */})
+            continue
+          }
+          // Network / timeout / 5xx: transient. Park at retry_pending with a
+          // backoff. Critically, we do NOT resend the same order this tick --
+          // a timed-out submit may have reached the broker, so a resend risks
+          // a duplicate order. The reconcile phase (Task 3) checks the broker
+          // first; the retry sweep (Task 5) re-attempts only after confirming
+          // no live order exists.
+          const attempts = 1
+          const backoffMs = 5 * 60 * 1000 // one tick
+          logger.warn({ err: engineErr, signalId: signal.id, decisionId, attempts }, 'Engine submit transient failure, parking retry_pending')
+          db.prepare(
+            "UPDATE trader_decisions SET status = ?, submit_attempts = ?, next_retry_at = ? WHERE id = ?",
+          ).run(DECISION_STATUS.RETRY_PENDING, attempts, Date.now() + backoffMs, decisionId)
+          // Keep the signal out of the fresh-dispatch queue: it now owns a
+          // decision row. Leave it 'dispatching' so the next tick's pending
+          // query skips it; the retry sweep operates on the decision row.
+          continue
+        }
+
+        // Engine ACK ('placed') proves SUBMISSION, not a fill. Land at
+        // 'submitted'; the scheduler reconcile phase promotes to 'executed'
+        // once the engine reports filled_qty>0 covering this order.
+        db.prepare("UPDATE trader_decisions SET status = 'submitted', engine_order_id = ? WHERE id = ?")
+          .run(engineResult.broker_order_id ?? null, decisionId)
+        db.prepare("UPDATE trader_signals SET status = 'submitted' WHERE id = ?").run(signal.id)
+        recordTraderOperationalEvent(db, {
+          eventId: `submission:${decisionId}`,
+          sourceTs: now,
+          source: 'brain.dispatcher',
+          stage: 'broker',
+          eventType: 'broker.order.submitted',
+          state: 'submitted',
+          asset: signal.asset,
+          strategyId: signal.strategy_id,
+          signalId: signal.id,
+          decisionId,
+          cohortId: cohort?.id ?? null,
+          orderId: engineResult.broker_order_id ?? engineResult.client_order_id,
+          metadata: {
+            side: committeeResult.action ?? signal.side,
+            size_usd: sizeUsd,
+            status: engineResult.status,
+          },
+        })
+
+        const result: AutoDispatchResult = {
+          signalId: signal.id,
+          asset:    signal.asset,
+          side:     signal.side as 'buy' | 'sell',
+          action:   'executed',
+          strategy: strategy.name,
+          sizeUsd,
+          reason:   committeeResult.thesis,
+        }
+        results.push(result)
+        await deps.send(formatExecutionAlert(result, signal.raw_score, strategy.tier))
+      } catch (err) {
+        logger.error({ err, signalId: signal.id, decisionId }, 'Unexpected error in auto-dispatch submission block')
+        // Do NOT reset to 'pending' -- that re-arms the signal for the next tick
+        // and, when the cause is deterministic (schema drift), loops forever.
+        // Terminal-fail and alert, consistent with the engine-submit no-retry policy.
+        db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?").run(signal.id)
+        await deps.send(
+          renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
+        ).catch(() => {})
+      }
+
+    } catch (err) {
+      logger.error({ err, signalId: signal.id }, 'Unexpected error in autoDispatch loop')
+      // Same rationale: never silently re-queue. Terminal-fail so a deterministic
+      // fault cannot loop the dispatcher on every tick.
+      db.prepare("UPDATE trader_signals SET status = 'failed' WHERE id = ?")
+        .run(signal.id)
+      // Clean up any decision row that may be stranded in 'submitting' (written
+      // before the throw). No-op if no decision row exists for this signal yet.
+      db.prepare("UPDATE trader_decisions SET status = 'failed' WHERE signal_id = ? AND status = 'submitting'")
+        .run(signal.id)
+      await deps.send(
+        renderAlert(explainUnexpectedFailure(signal.asset, signal.side)),
+      ).catch(() => {})
+    }
+  }
+
+  return results
+}
+
+function formatExecutionAlert(r: AutoDispatchResult, score: number, tier: number): string {
+  const side = r.side.toUpperCase()
+  return [
+    `EXECUTED: ${side} ${r.asset} $${r.sizeUsd} @ market`,
+    `Strategy: ${r.strategy} | Score: ${score.toFixed(2)} | Tier ${tier}`,
+    `Committee: approved`,
+    r.reason,
+  ].join('\n')
+}
+
+function formatRejectionAlert(r: AutoDispatchResult): string {
+  return [
+    `SKIPPED: ${r.side.toUpperCase()} ${r.asset} (committee abstained)`,
+    r.reason,
+    'Suppressed 24h',
+  ].join('\n')
+}
+
+/**
+ * Bulk-close all pending signals for the same strategy+asset+side EXCEPT the
+ * actioned signal itself. Used after a committee verdict (approve or abstain)
+ * so duplicate signals from the same engine cycle don't pile up in the queue.
+ * Records a committee_abstain suppression for each closed sibling so the
+ * 24-hour cooldown prevents immediate re-alerts.
+ */
+function closeSiblingPendingSignals(
+  db: Database.Database,
+  excludeSignalId: string,
+  strategyId: string,
+  asset: string,
+  side: string,
+  now = Date.now(),
+): void {
+  const siblings = db.prepare(`
+    SELECT id FROM trader_signals
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+      AND id != ?
+  `).all(strategyId, asset, side, excludeSignalId) as { id: string }[]
+
+  if (siblings.length === 0) return
+
+  db.prepare(`
+    UPDATE trader_signals
+    SET status = 'decided'
+    WHERE strategy_id = ? AND asset = ? AND side = ? AND status = 'pending'
+      AND id != ?
+  `).run(strategyId, asset, side, excludeSignalId)
+
+  for (const s of siblings) {
+    recordSignalSuppressionBySignalId(db, s.id, 'committee_abstain', now)
+  }
+
+  logger.info({ strategyId, asset, side, count: siblings.length }, 'Closed sibling pending signals after committee verdict')
+}

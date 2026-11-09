@@ -1,0 +1,281 @@
+/** Engine REST API types - mirrors Python Pydantic models. */
+
+export interface HealthResponse {
+  status: string;
+  version: string;
+  alpaca_connected: boolean;
+  alpaca_mode: "paper" | "live" | string;
+  reconciler_halted?: boolean;
+  halt_reason?: string | null;
+  // Phase 5 Task 2c -- crypto-arm visibility.  Optional because older engine
+  // builds predate the field; callers null-coalesce when surfacing on the
+  // dashboard and the monitor treats missing as healthy.
+  coinbase_connected?: boolean;
+  crypto_enabled?: boolean;
+}
+
+export interface EnginePosition {
+  asset: string;
+  qty: number;
+  avg_entry_price: number;
+  market_value: number;
+  unrealized_pnl: number;
+  source: string;
+  updated_at: number;  // ms
+}
+
+export interface AdoptPositionResult {
+  adopted: EnginePosition;
+  reconcile_cleared: boolean;
+}
+
+export interface CoverPaperShortResult {
+  asset: string;
+  prior_qty: number;
+  client_order_id: string | null;
+  broker_order_id: string | null;
+  status: string;
+  submitted: boolean;
+}
+
+export interface EngineOrder {
+  client_order_id: string;
+  broker_order_id: string | null;
+  /** Brain decision id stored by the engine at submit. The reconciler matches
+   *  on this -- client_order_id is an engine-minted uuid that never matches a
+   *  brain decision. Optional for back-compat with older engine builds. */
+  decision_id?: string | null;
+  asset: string;
+  side: "buy" | "sell";
+  qty: number;
+  order_type: "limit" | "market";
+  limit_price: number | null;
+  status: string;
+  filled_qty: number;
+  filled_avg_price: number | null;
+  source: string;
+  created_at: number;  // ms
+  updated_at: number;  // ms
+}
+
+export interface ReconcileResult {
+  id: string;
+  ran_at: number;  // ms
+  drift_detected: boolean;
+  drift_summary: string | null;
+  action_taken: string;
+}
+
+export interface Candidate {
+  id: string;
+  strategy: string;
+  asset: string;
+  side: "buy" | "sell";
+  raw_score: number;
+  horizon_days: number;
+  generated_at: number;  // ms
+  size_weight?: number | null;  // vol-targeting weight in (0, 1]; only momentum-vt-crypto sends it
+}
+
+export interface DecisionRequest {
+  decision_id: string;
+  asset: string;
+  side: "buy" | "sell";
+  size_usd: number;
+  entry_type: "limit" | "market";
+  entry_price: number;
+  stop_loss?: number;
+  take_profit?: number;
+  strategy: string;
+  confidence: number;
+}
+
+export interface DecisionStatus {
+  client_order_id: string;
+  broker_order_id: string | null;
+  status: string;
+  filled_qty: number;
+  filled_avg_price: number | null;
+}
+
+export interface SubmitDecisionResult {
+  client_order_id: string;
+  broker_order_id: string | null;
+  status: string;
+  approved_size_usd: number;
+}
+
+export interface RiskState {
+  tripped: string[];
+  details: Array<{ rule: string; tripped_at: number; reason: string }>;
+}
+
+export type NavPeriod = "day_open" | "day_close" | "week_open";
+
+export interface NavSnapshot {
+  date: string;            // 'YYYY-MM-DD' in America/New_York
+  period: NavPeriod;
+  nav: number;
+  recorded_at: number;     // ms
+}
+
+/**
+ * One daily close bar for an asset. Matches the engine's
+ * GET /prices/{asset}?from_ms=&to_ms= response shape
+ * (src/trader_engine/api/routes/prices.py):
+ *   [{"date": "YYYY-MM-DD", "close": float, "ts_ms": int}, ...]
+ */
+export interface PricePoint {
+  date: string;            // 'YYYY-MM-DD'
+  close: number;
+  ts_ms: number;           // ms
+  /** Present only when the engine /prices route returns them (needed for the IBS exit). */
+  high?: number;
+  low?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Markov regime -- enrichment-fetcher
+// ---------------------------------------------------------------------------
+
+export interface MarkovRegimePayload {
+  source: 'markov_regime';
+  asset: string;
+  as_of: string;                // ISO date
+  n_obs: number;
+  current_state: 'bear' | 'sideways' | 'bull';
+  markov_signal: number;        // in [-1, +1]
+  stationary: { bear: number; sideways: number; bull: number };
+  persistence_diag: [number, number, number];  // [bear->bear, side->side, bull->bull]
+  walk_forward: {
+    sharpe: number | null;
+    max_drawdown: number | null;
+    n_trades: number;
+  };
+  computed_at_ms: number;
+  params: { window: number; threshold: number; backtest: boolean; days: number };
+}
+
+// ---------------------------------------------------------------------------
+// Signal telemetry -- Phase 8C Analyst Paw
+// ---------------------------------------------------------------------------
+
+export interface RegimeBucket {
+  ticks: number;
+  pct: number;
+}
+
+export interface RegimeStrategyStats {
+  scored: number;
+  fired: number;
+  suppressed: number;
+}
+
+export interface StrategyTelemetryStat {
+  strategy: string;
+  total_scored: number;
+  fired: number;
+  suppressed: number;
+  suppression_rate: number;   // 0-1
+  fire_rate: number;          // 0-1
+  by_regime: Record<string, RegimeStrategyStats>;
+}
+
+export interface NearMiss {
+  asset: string;
+  strategy: string;
+  consecutive_near_miss_ticks: number;
+  avg_score: number;
+  effective_threshold: number;
+  avg_gap: number;           // effective_threshold - avg_score
+  regime: string | null;
+  last_seen_ms: number;
+}
+
+export interface SignalTelemetrySummary {
+  window_days: number;
+  since_ms: number;
+  generated_at_ms: number;
+  total_ticks: number;
+  equity_ticks: number;
+  regime_distribution: Record<string, RegimeBucket>;
+  strategy_stats: StrategyTelemetryStat[];
+  near_misses: NearMiss[];
+}
+
+// ---------------------------------------------------------------------------
+// Backtest -- go-live gate degradation criterion
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of the engine's trade-level backtest (GET /backtest/momentum).
+ *
+ * `sharpe` is null when fewer than two trades closed. Callers MUST treat null
+ * as "no answer" and never coerce it to 0: 0 is a verdict that fails the gate,
+ * absence is not.
+ */
+export interface BacktestResult {
+  strategy: string;
+  method: string;
+  start: string;
+  end: string;
+  n_trades: number;
+  sharpe: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
+  expectancy: number | null;
+  total_return: number;
+  slippage_bps: number;
+  fee_bps?: number;
+  min_score: number;
+  sharpe_convention: string;
+  assets: string[];
+  warnings: string[];
+  computed_at_ms: number;
+  elapsed_ms: number;
+}
+
+/** One strategy block of the engine's sweep + walk-forward report (scripts/run_backtest_gate.py). */
+export interface BacktestGateStrategy {
+  live_params: { min_score: number; horizon_days: number };
+  fixed_rule: BacktestResult;
+  sweep: { n_trials: number; sharpe_variance_per_period: number | null; best: unknown; trials: unknown[] };
+  walk_forward: {
+    oos_sharpe: number | null;
+    oos_n_trades: number;
+    oos_expectancy: number | null;
+    oos_max_drawdown: number | null;
+    oos_win_rate: number | null;
+    /** Report v3+: daily-portfolio moments for the backtest DSR. Kurtosis is non-excess. */
+    oos_n_days?: number;
+    oos_daily_skew?: number | null;
+    oos_daily_kurtosis?: number | null;
+    n_signal_days?: number;
+    per_trade_sharpe_unannualized?: number | null;
+    folds: unknown[];
+    train_bars: number;
+    test_bars: number;
+    step: number;
+    method: string;
+  };
+  /** Report v2+: OOS at 2x costs and OOS split by market type (engine regime_stress.py). */
+  stress?: BacktestStress;
+}
+
+export interface BacktestBucket { n: number; expectancy: number; win_rate: number; sharpe: number | null }
+
+export interface BacktestStress {
+  cost_x2: { oos_n_trades: number; oos_sharpe: number | null; oos_expectancy: number | null };
+  vol: Record<string, BacktestBucket>;
+  trend: Record<string, BacktestBucket>;
+}
+
+/** GET /backtest/report. Keys of `strategies` are ClaudePaw strategy ids. */
+export interface BacktestGateReport {
+  version: number;
+  computed_at_ms: number;
+  engine_revision: string | null;
+  days: number;
+  universe: string[];
+  strategies: Record<string, BacktestGateStrategy>;
+}

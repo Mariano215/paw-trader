@@ -1,0 +1,140 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import Database from 'better-sqlite3'
+import { initTraderTables } from './db.js'
+import { seedMomentumStrategy } from './strategy-manager.js'
+import { runRetrySweep } from './order-retry.js'
+import { DECISION_STATUS } from './order-lifecycle.js'
+import type { EngineClient } from './engine-client.js'
+
+function makeDb() {
+  const db = new Database(':memory:')
+  db.pragma('foreign_keys = OFF')
+  initTraderTables(db)
+  seedMomentumStrategy(db)
+  db.prepare(`INSERT INTO trader_signals (id, strategy_id, asset, side, raw_score, horizon_days, generated_at, status)
+    VALUES ('s1','momentum-stocks','AAPL','buy',0.7,20,?, 'dispatching')`).run(1000)
+  return db
+}
+
+function parkRetry(db: Database.Database, id: string, attempts: number, nextRetryAt: number) {
+  db.prepare(`INSERT INTO trader_decisions
+    (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, decided_at, status, submit_attempts, next_retry_at)
+    VALUES (?, 's1','buy','AAPL',150,'limit',100,92,116,'t',0.7,?, ?, ?, ?)`)
+    .run(id, Date.now(), DECISION_STATUS.RETRY_PENDING, attempts, nextRetryAt)
+}
+
+describe('runRetrySweep', () => {
+  let db: ReturnType<typeof makeDb>
+  beforeEach(() => { db = makeDb() })
+
+  it.each(['paused', 'expired', 'future', 'unprotected'])('does not revive a %s entry', async (reason) => {
+    parkRetry(db, 'd1', 1, 0)
+    if (reason === 'paused') db.prepare("UPDATE trader_strategies SET status='paused'").run()
+    if (reason === 'expired') db.prepare('UPDATE trader_signals SET generated_at=-2000000').run()
+    if (reason === 'future') db.prepare('UPDATE trader_signals SET generated_at=6000').run()
+    if (reason === 'unprotected') db.prepare('UPDATE trader_decisions SET stop_loss=NULL').run()
+    const client = { getOrders: vi.fn().mockResolvedValue([]), submitDecision: vi.fn() }
+    await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(client.submitDecision).not.toHaveBeenCalled()
+    expect(db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get()).toEqual({status: 'failed'})
+  })
+
+  it('resubmits a due retry_pending decision when no broker order exists', async () => {
+    parkRetry(db, 'd1', 1, 1000)
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([]),
+      submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'd1', broker_order_id: 'boid-2', status: 'placed', approved_size_usd: 150 }),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(1)
+    const row = db.prepare("SELECT status, engine_order_id, submit_attempts FROM trader_decisions WHERE id='d1'").get() as any
+    expect(row.status).toBe('submitted')
+    expect(row.engine_order_id).toBe('boid-2')
+    expect(row.submit_attempts).toBe(2)
+    expect(client.submitDecision).toHaveBeenCalledWith(expect.objectContaining({
+      entry_price: 0, stop_loss: 92, take_profit: 116, strategy: 'momentum-stocks',
+    }))
+    expect(db.prepare("SELECT event_type, state, decision_id, order_id FROM trader_operational_events WHERE decision_id='d1'").get())
+      .toEqual({ event_type: 'broker.order.retry_submitted', state: 'submitted', decision_id: 'd1', order_id: 'boid-2' })
+  })
+
+  it('does NOT resend when the order already exists at the broker (dedup)', async () => {
+    parkRetry(db, 'd1', 1, 1000)
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([{ client_order_id: 'd1', broker_order_id: 'boid-1', asset: 'AAPL', side: 'buy', qty: 1, order_type: 'market', limit_price: null, status: 'new', filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1 }]),
+      submitDecision: vi.fn(),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(0)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
+  })
+
+  it('does NOT resend when the engine echoes decision_id and mints its own client_order_id', async () => {
+    // The real-world shape, and the one the old guard missed: it compared
+    // client_order_id to the decision id, but the engine mints a random
+    // client_order_id and echoes the brain id in decision_id instead. The
+    // guard therefore never matched and the sweep placed a second real broker
+    // order for a decision that was already live.
+    parkRetry(db, 'd1', 1, 1000)
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([{
+        client_order_id: 'engine-minted-uuid-not-d1', decision_id: 'd1', broker_order_id: 'boid-1',
+        asset: 'AAPL', side: 'buy', qty: 1, order_type: 'market', limit_price: null,
+        status: 'new', filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1,
+      }]),
+      submitDecision: vi.fn(),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(0)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
+  })
+
+  it('does NOT resend when only engine_order_id matches the broker order', async () => {
+    parkRetry(db, 'd1', 1, 1000)
+    db.prepare("UPDATE trader_decisions SET engine_order_id = 'boid-1' WHERE id = 'd1'").run()
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([{
+        client_order_id: 'unrelated', broker_order_id: 'boid-1',
+        asset: 'AAPL', side: 'buy', qty: 1, order_type: 'market', limit_price: null,
+        status: 'new', filled_qty: 0, filled_avg_price: null, source: 't', created_at: 1, updated_at: 1,
+      }]),
+      submitDecision: vi.fn(),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resubmitted).toBe(0)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+  })
+
+  it('terminates exhausted retries instead of endlessly un-parking them', async () => {
+    parkRetry(db, 'd1', 3, 1000) // already at the cap
+    const client = { getOrders: vi.fn().mockResolvedValue([]), submitDecision: vi.fn() }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.parkedEngineDown).toBe(0)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('failed')
+    expect((await runRetrySweep(db, client as unknown as EngineClient, 6000, true)).eligible).toBe(0)
+  })
+
+  it('parks engine_down (no blind resend) when getOrders throws', async () => {
+    parkRetry(db, 'd1', 1, 1000)
+    const client = { getOrders: vi.fn().mockRejectedValue(new Error('Engine API error 503 on /orders')), submitDecision: vi.fn() }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, false)
+    expect(s.parkedEngineDown).toBe(1)
+    expect(vi.mocked(client.submitDecision)).not.toHaveBeenCalled()
+  })
+
+  it('resumes engine_down -> retry_pending when the engine is healthy again', async () => {
+    db.prepare(`INSERT INTO trader_decisions
+      (id, signal_id, action, asset, size_usd, entry_type, entry_price, stop_loss, take_profit, thesis, confidence, decided_at, status, submit_attempts)
+      VALUES ('d1','s1','buy','AAPL',150,'limit',100,92,116,'t',0.7,?, ?, 1)`).run(Date.now(), DECISION_STATUS.ENGINE_DOWN)
+    const client = {
+      getOrders: vi.fn().mockResolvedValue([]),
+      submitDecision: vi.fn().mockResolvedValue({ client_order_id: 'd1', broker_order_id: 'boid-3', status: 'placed', approved_size_usd: 150 }),
+    }
+    const s = await runRetrySweep(db, client as unknown as EngineClient, 5000, true)
+    expect(s.resumedFromEngineDown).toBe(1)
+    // resumed then immediately retried in the same sweep (submit_attempts was 1 < 3)
+    expect((db.prepare("SELECT status FROM trader_decisions WHERE id='d1'").get() as any).status).toBe('submitted')
+  })
+})

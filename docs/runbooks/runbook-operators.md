@@ -1,0 +1,125 @@
+# Runbook: Multi-Operator Alert Routing
+
+_Last updated: 2026-04-23 (full-auto pipeline)_
+
+The Paw Trader broadcasts execution alerts, rejection alerts, and halt
+notices to a configured list of Telegram chat ids. Signals no longer require
+manual approval -- the committee decides automatically and sends an
+informational alert. Operators can still override via Telegram reply (skip/pause)
+on execution alerts, but are never required to act.
+
+This runbook covers the precedence rules, how to add a new operator, and
+what "best-effort" means for the broadcast.
+
+## How the list is resolved
+
+On bot start, `src/index.ts` picks the operator list in this order:
+
+1. `OPERATOR_CHAT_IDS` env var (comma-separated) when it parses to at
+   least one non-empty entry.
+2. The `trader.telegram.allowed_chat_ids` credential (same comma-separated
+   format) when the env var is unset or empty after trim.
+
+If both are empty the trader scheduler does not start and the bot logs
+`Trader scheduler not started: no trader Telegram chat id configured`.
+
+The env var takes priority so an operator can rotate or extend the list
+without touching the credential store. Setting `OPERATOR_CHAT_IDS=,,,`
+(set but empty after trim) produces a warn line and falls through to the
+credential list.
+
+## Adding a new operator
+
+Pick whichever surface is handier. Both require a bot restart to pick up.
+
+### Option A -- env var override
+
+1. Grab the operator's numeric chat id. They can send `/start` to
+   `@userinfobot` on Telegram to look it up.
+2. Edit the bot's `.env` file at `<claudepaw>/.env`:
+
+   ```
+   OPERATOR_CHAT_IDS=111111111,222222222,333333333
+   ```
+
+3. Restart the bot with `npm run restart` from
+   `<claudepaw>`.
+4. Confirm the bot logged the new list:
+
+   ```
+   grep "Trader scheduler wired" /tmp/claudepaw-*.log | tail -1
+   ```
+
+   Expect `operatorCount: 3, maskedIds: ["***1111","***4321","***3333"]`
+   and `source: "OPERATOR_CHAT_IDS"`.
+
+### Option B -- credential edit
+
+Use this when you want the list to persist across env resets, or when
+the env var is deliberately unset.
+
+1. Open the credential store for the trader project. The simplest route
+   is the dashboard Credentials page, but it can also be edited via the
+   `cpaw credentials` CLI.
+2. Update the `trader.telegram.allowed_chat_ids` field to the new
+   comma-separated list.
+3. Restart the bot. Confirm the same `Trader scheduler wired` log line
+   with `source: "credential"`.
+
+## Removing an operator
+
+Drop their id from whichever list they appear on and restart. There is
+no dashboard toggle for a single operator -- the list is the source of
+truth.
+
+## Manual override via Telegram reply
+
+The approval gate is gone. Signals are auto-dispatched to the committee and
+executed or suppressed without operator action. Operators receive plain-text
+alerts after each decision.
+
+Overrides still work on execution alerts:
+- Reply `skip` -- attempts to cancel the order if still open
+- Reply `pause` -- pauses the strategy (no new signals submitted)
+
+The reply handler (`telegram-reply-handler.ts`) matches inbound text against
+open approvals the same way as before; the claim UPDATE is still race-safe
+for the case where multiple operators reply simultaneously.
+
+## Best-effort delivery
+
+The broadcast iterates the operator list serially and calls
+`channelManager.send` / `sendWithKeyboard` per id. A single failing send
+logs a warn line (`Trader operator broadcast failed for one recipient,
+continuing`) and the loop proceeds to the next operator. The returned
+promise resolves once every id has been attempted.
+
+Consequences worth naming:
+
+- If operator A's chat is rate-limited but operator B is fine, B still
+  receives the alert. A misses it for this broadcast; the next tick
+  retries the underlying trigger (halt alert dedup, timeout notice) per
+  its own rules.
+- If every operator fails (e.g. Telegram API is globally down), the
+  scheduler logs N warn lines and continues. No exception propagates up.
+- Serial iteration is deliberate. Channel managers already queue per-chat
+  sends and sequential fan-out keeps log ordering predictable for audit.
+  Operator counts are in the single digits so the wall-time cost is
+  trivial.
+
+## Log masking convention
+
+Chat ids are masked to the last four characters in logs, prefixed with
+`***`. Example: `111111111` becomes `***1111`. Short ids (four or fewer
+chars) are logged unchanged because masking them would still reveal the
+whole id. Use the masked forms when grepping live logs; only the bot
+owner with DB access can map them back to real ids.
+
+## Related source files
+
+- `src/config.ts` -- `OPERATOR_CHAT_IDS` export (raw string, split by callers)
+- `src/index.ts` -- resolution order and scheduler wire-in
+- `src/trader/operator-broadcast.ts` -- `parseOperatorChatIds`, `maskChatId`, `makeOperatorSend`
+- `src/trader/operator-broadcast.test.ts` -- unit tests for the helper
+- `src/trader/telegram-reply-handler.ts` -- first-tap-wins claim logic
+- `src/channels/telegram.ts` -- bot-wide allowlist that gates incoming replies

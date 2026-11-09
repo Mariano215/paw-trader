@@ -1,0 +1,305 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import Database from 'better-sqlite3'
+
+// Pin the score thresholds. signal-poller.ts captures
+// TRADER_SIGNAL_SCORE_THRESHOLD into a module-level const at import time, so
+// without this the suite reads whatever the operator has in .env. It currently
+// holds 0.01, which silently broke the "filters signals below threshold" case:
+// a 0.01 candidate clears a 0.01 floor. A test that changes result when someone
+// tunes a live env var is not testing the poller.
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
+  TRADER_SIGNAL_SCORE_THRESHOLD: 0.02,
+  TRADER_BLIND_SIGNAL_SCORE_THRESHOLD: 0.10,
+}))
+
+import { initTraderTables } from './db.js'
+import { seedAllStrategies, seedMomentumStrategy } from './strategy-manager.js'
+
+// Tuesday 2026-04-21 10:00 ET = 14:00 UTC — always within NYSE market hours
+const MARKET_HOURS_TS = new Date('2026-04-21T14:00:00Z').getTime()
+import {
+  pollAndStoreSignals,
+  getPendingSignals,
+  resolveStrategyId,
+  isEquityMarketHours,
+  isNyseHoliday,
+} from './signal-poller.js'
+import type { EngineClient } from './engine-client.js'
+
+function makeDb() {
+  const db = new Database(':memory:')
+  initTraderTables(db)
+  seedAllStrategies(db)
+  return db
+}
+
+const makeCandidate = (
+  asset: string,
+  score: number,
+  strategy = 'momentum',
+  horizon = 20,
+) => ({
+  id: `sig-${asset}-${strategy}`,
+  strategy,
+  asset,
+  side: 'buy' as const,
+  raw_score: score,
+  horizon_days: horizon,
+  generated_at: MARKET_HOURS_TS,
+})
+
+describe('signal-poller', () => {
+  let db: ReturnType<typeof makeDb>
+  let mockClient: Partial<EngineClient>
+
+  beforeEach(() => {
+    db = makeDb()
+    mockClient = { getSignals: vi.fn() }
+  })
+
+  it('stores the engine size_weight and leaves it NULL when absent', async () => {
+    // Crypto pairs only: no market-hours filter. momentum-crypto is seeded already
+    // (momentum-vt-crypto's row arrives in Task 7).
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([
+      { ...makeCandidate('BTC/USD', 0.4, 'momentum-crypto', 14), size_weight: 0.6 },
+      makeCandidate('ETH/USD', 0.4, 'momentum-crypto', 14),
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const rows = db.prepare('SELECT asset, size_weight FROM trader_signals ORDER BY asset').all()
+    expect(rows).toEqual([{ asset: 'BTC/USD', size_weight: 0.6 }, { asset: 'ETH/USD', size_weight: null }])
+  })
+
+  it('stores signals above threshold', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('AAPL', 0.72)])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].asset).toBe('AAPL')
+  })
+
+  it('filters signals below threshold (abs < 0.02)', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.01)])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    expect(getPendingSignals(db)).toHaveLength(0)
+  })
+
+  it('stores mild momentum signals that clear the engine-aligned floor', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([makeCandidate('MSFT', 0.3)])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].asset).toBe('MSFT')
+  })
+
+  it('does not duplicate already-stored signal ids', async () => {
+    const candidate = makeCandidate('AAPL', 0.72)
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([candidate])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    expect(getPendingSignals(db)).toHaveLength(1)
+  })
+
+  it('handles engine client errors gracefully', async () => {
+    vi.mocked(mockClient.getSignals!).mockRejectedValue(new Error('network'))
+    await expect(pollAndStoreSignals(db, mockClient as EngineClient)).resolves.not.toThrow()
+  })
+
+  it('routes crypto pair candidates to the momentum-crypto strategy', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([
+      makeCandidate('BTC/USD', 0.7, 'momentum-crypto', 14),
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].asset).toBe('BTC/USD')
+    expect(pending[0].strategy_id).toBe('momentum-crypto')
+  })
+
+  it('routes mean-reversion equity candidates to mean-reversion-stocks', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([
+      makeCandidate('AAPL', 0.8, 'mean-reversion', 10),
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].strategy_id).toBe('mean-reversion-stocks')
+  })
+
+  it('stores equity momentum candidates as momentum-stocks (back-compat)', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValue([
+      makeCandidate('MSFT', 0.9, 'momentum', 20),
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const pending = getPendingSignals(db)
+    expect(pending).toHaveLength(1)
+    expect(pending[0].strategy_id).toBe('momentum-stocks')
+  })
+
+  it('deduplicates same asset+side+strategy in one batch but keeps other strategies', async () => {
+    const candidates = [
+      { id: 'a1', strategy: 'momentum-stocks',    asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a1b', strategy: 'momentum',          asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a2', strategy: 'mean-reversion',     asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'a3', strategy: 'rsi2',               asset: 'AAPL', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+    ]
+    vi.mocked(mockClient.getSignals!).mockResolvedValue(candidates)
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const rows = db.prepare("SELECT strategy_id FROM trader_signals WHERE asset='AAPL' AND side='buy' ORDER BY strategy_id").all()
+    expect(rows).toEqual([{strategy_id: 'mean-reversion-stocks'}, {strategy_id: 'momentum-stocks'}, {strategy_id: 'rsi2-stocks'}])
+  })
+
+  it('a pending signal of one strategy does not block another strategy on the same asset', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
+      { id: 'b1', strategy: 'momentum', asset: 'DBC', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+
+    vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
+      { id: 'b1b', strategy: 'momentum', asset: 'DBC', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'b2', strategy: 'ibs', asset: 'DBC', side: 'buy' as const, raw_score: 0.9, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+
+    const rows = db.prepare("SELECT id FROM trader_signals WHERE asset='DBC' AND side='buy' ORDER BY id").all()
+    expect(rows).toEqual([{id: 'b1'}, {id: 'b2'}])
+  })
+
+  it('stores a valid rsi2 or ibs entry even when its score is below the threshold', async () => {
+    vi.mocked(mockClient.getSignals!).mockResolvedValueOnce([
+      { id: 'r1', strategy: 'rsi2', asset: 'SPY', side: 'buy' as const, raw_score: 0.005, horizon_days: 10, generated_at: MARKET_HOURS_TS },
+      { id: 'i1', strategy: 'ibs', asset: 'QQQ', side: 'buy' as const, raw_score: 0.001, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'i0', strategy: 'ibs', asset: 'IWM', side: 'buy' as const, raw_score: 0, horizon_days: 3, generated_at: MARKET_HOURS_TS },
+      { id: 'm1', strategy: 'mean-reversion', asset: 'VTI', side: 'buy' as const, raw_score: 0.005, horizon_days: 10, generated_at: MARKET_HOURS_TS },
+    ])
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const ids = (db.prepare('SELECT id FROM trader_signals ORDER BY id').all() as Array<{id: string}>).map(r => r.id)
+    expect(ids).toEqual(['i1', 'r1'])
+  })
+
+  it('the pending unique index is per strategy', () => {
+    const add = db.prepare(`INSERT INTO trader_signals (id,strategy_id,asset,side,raw_score,horizon_days,enrichment_json,generated_at,status)
+      VALUES (?,?,'SPY','buy',0.9,3,NULL,1,'pending')`)
+    add.run('x1', 'rsi2-stocks')
+    add.run('x2', 'ibs-stocks')
+    expect(() => add.run('x3', 'rsi2-stocks')).toThrow(/UNIQUE/)
+  })
+
+  it('drops equity signals outside market hours but passes crypto', async () => {
+    const saturdayMs = new Date('2026-04-18T15:00:00Z').getTime()
+    const candidates: Parameters<typeof pollAndStoreSignals>[1]['getSignals'] extends (...args: any[]) => Promise<infer T> ? T : never = [
+      { id: 'eq1', strategy: 'momentum', asset: 'NVDA', side: 'buy' as const, raw_score: 0.8, horizon_days: 3, generated_at: saturdayMs },
+      { id: 'cr1', strategy: 'momentum', asset: 'BTC/USD', side: 'buy' as const, raw_score: 0.8, horizon_days: 1, generated_at: saturdayMs },
+    ]
+    vi.mocked(mockClient.getSignals!).mockResolvedValue(candidates)
+    await pollAndStoreSignals(db, mockClient as EngineClient)
+    const equity = db.prepare("SELECT * FROM trader_signals WHERE asset='NVDA'").all()
+    const crypto = db.prepare("SELECT * FROM trader_signals WHERE asset='BTC/USD'").all()
+    expect(equity).toHaveLength(0)
+    expect(crypto).toHaveLength(1)
+  })
+})
+
+describe('isEquityMarketHours', () => {
+  it('returns true for 10:00 ET on a Tuesday', () => {
+    // 2026-04-21 (Tuesday) 10:00 ET = 14:00 UTC
+    const ts = new Date('2026-04-21T14:00:00Z').getTime()
+    expect(isEquityMarketHours(ts)).toBe(true)
+  })
+  it('returns false for 08:00 ET before open', () => {
+    const ts = new Date('2026-04-21T12:00:00Z').getTime()
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false for Saturday', () => {
+    const ts = new Date('2026-04-18T15:00:00Z').getTime()
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns true for exactly 09:30 ET (inclusive open)', () => {
+    // 2026-04-21 09:30 ET = 13:30 UTC
+    const ts = new Date('2026-04-21T13:30:00Z').getTime()
+    expect(isEquityMarketHours(ts)).toBe(true)
+  })
+  it('returns false for exactly 16:00 ET (exclusive close)', () => {
+    // 2026-04-21 16:00 ET = 20:00 UTC
+    const ts = new Date('2026-04-21T20:00:00Z').getTime()
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+
+  // NYSE holiday cases
+  it('returns false on Memorial Day 2026 (Mon May 25 10:00 ET)', () => {
+    const ts = new Date('2026-05-25T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Good Friday 2026 (Fri Apr 3 10:00 ET)', () => {
+    const ts = new Date('2026-04-03T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Christmas 2026 (Fri Dec 25 10:00 ET)', () => {
+    const ts = new Date('2026-12-25T15:00:00Z').getTime()  // EST = UTC-5
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Thanksgiving 2026 (Thu Nov 26 10:00 ET)', () => {
+    const ts = new Date('2026-11-26T15:00:00Z').getTime()  // EST = UTC-5
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Independence Day 2025 (Fri Jul 4 10:00 ET)', () => {
+    const ts = new Date('2025-07-04T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns false on Juneteenth 2026 (Fri Jun 19 10:00 ET)', () => {
+    const ts = new Date('2026-06-19T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(false)
+  })
+  it('returns true on the day after Memorial Day (Tue May 26 10:00 ET)', () => {
+    const ts = new Date('2026-05-26T14:00:00Z').getTime()  // EDT = UTC-4
+    expect(isEquityMarketHours(ts)).toBe(true)
+  })
+})
+
+describe('isNyseHoliday', () => {
+  it('Memorial Day 2026 — last Mon in May', () => {
+    expect(isNyseHoliday(2026, 5, 25)).toBe(true)
+  })
+  it('Good Friday 2026 — Apr 3 (2 days before Easter Apr 5)', () => {
+    expect(isNyseHoliday(2026, 4, 3)).toBe(true)
+  })
+  it('New Year\'s Day 2026 — Jan 1 (Thursday, no shift)', () => {
+    expect(isNyseHoliday(2026, 1, 1)).toBe(true)
+  })
+  it('Christmas 2026 — Dec 25 (Friday, no shift)', () => {
+    expect(isNyseHoliday(2026, 12, 25)).toBe(true)
+  })
+  it('Juneteenth 2026 — Jun 19 (Friday)', () => {
+    expect(isNyseHoliday(2026, 6, 19)).toBe(true)
+  })
+  it('Labor Day 2026 — 1st Mon in Sep (Sep 7)', () => {
+    expect(isNyseHoliday(2026, 9, 7)).toBe(true)
+  })
+  it('Thanksgiving 2026 — 4th Thu in Nov (Nov 26)', () => {
+    expect(isNyseHoliday(2026, 11, 26)).toBe(true)
+  })
+  it('regular trading day is not a holiday', () => {
+    expect(isNyseHoliday(2026, 4, 21)).toBe(false)  // Tuesday Apr 21
+  })
+  it('Christmas observed Mon when Dec 25 falls on Sun (2022)', () => {
+    // Dec 25, 2022 = Sunday → observed Mon Dec 26
+    expect(isNyseHoliday(2022, 12, 25)).toBe(false)
+    expect(isNyseHoliday(2022, 12, 26)).toBe(true)
+  })
+})
+
+describe('resolveStrategyId', () => {
+  it('appends -stocks for bare equity strategies', () => {
+    expect(resolveStrategyId('momentum', 'AAPL')).toBe('momentum-stocks')
+    expect(resolveStrategyId('mean-reversion', 'SPY')).toBe('mean-reversion-stocks')
+  })
+
+  it('appends -crypto for bare strategies with a pair asset', () => {
+    expect(resolveStrategyId('momentum', 'BTC/USD')).toBe('momentum-crypto')
+  })
+
+  it('passes through strategies that already encode an asset class', () => {
+    expect(resolveStrategyId('momentum-crypto', 'BTC/USD')).toBe('momentum-crypto')
+    expect(resolveStrategyId('mean-reversion-stocks', 'AAPL')).toBe('mean-reversion-stocks')
+  })
+})
